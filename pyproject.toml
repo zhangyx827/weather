@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mazu-saudi"
+version = "0.1.0"
+description = "Runnable MVP for MAZU Saudi multi-hazard early warning agent algorithms."
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.7",
+  "numpy>=1.26",
+  "rdflib>=7.0",
+  "fastapi>=0.111",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+forecast = ["xarray>=2024.1", "zarr>=2.18", "netCDF4>=1.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

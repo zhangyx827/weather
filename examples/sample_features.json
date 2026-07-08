@@ -1,0 +1,25 @@
+{
+  "grid": {
+    "id": "jeddah_coast_demo",
+    "lat": 21.4858,
+    "lon": 39.1925,
+    "elevation_m": 12,
+    "region": "Jeddah coastal corridor"
+  },
+  "valid_time": "2026-07-08T09:00:00+00:00",
+  "temp_c": 43.5,
+  "rh_percent": 62.0,
+  "dewpoint_c": 34.5,
+  "precip_1h_mm": 18.0,
+  "precip_6h_mm": 72.0,
+  "precip_24h_mm": 96.0,
+  "wind_speed_mps": 13.0,
+  "wind_gust_mps": 21.0,
+  "soil_moisture_frac": 0.11,
+  "slope_deg": 8.0,
+  "impervious_frac": 0.42,
+  "vegetation_index": 0.12,
+  "pressure_hpa": 1005.0,
+  "visibility_km": 6.0,
+  "coastal_distance_km": 8.0
+}
