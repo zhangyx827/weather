@@ -7,7 +7,9 @@ engine without changing callers.
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from mazu_saudi.indicators import (
@@ -21,6 +23,8 @@ from mazu_saudi.indicators import (
 )
 from mazu_saudi.schemas import HazardRisk, MeteorologicalFeatures
 from mazu_saudi.utils.math import clamp, is_missing
+from .levels import RiskThresholdConfig, probability_to_level
+from .ml import OptionalMLAdapter, create_ml_adapter
 
 
 class BaseRiskModel(ABC):
@@ -28,28 +32,113 @@ class BaseRiskModel(ABC):
 
     hazard_type: str
     model_name = "rule_screening_v1"
+    model_version = "v1"
+
+    def __init__(
+        self,
+        threshold_config: RiskThresholdConfig | dict[str, Any] | None = None,
+        model_version: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.threshold_config = (
+            threshold_config
+            if isinstance(threshold_config, RiskThresholdConfig)
+            else RiskThresholdConfig.from_mapping(threshold_config)
+        )
+        if model_version is not None:
+            self.model_version = model_version
+        self.metadata = metadata or {}
 
     @abstractmethod
     def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
         """Predict one hazard risk."""
 
+    def predict_one(self, features: MeteorologicalFeatures | dict[str, Any]) -> HazardRisk:
+        """Predict one hazard risk with dict/dataclass input compatibility."""
+
+        normalized = MeteorologicalFeatures.from_dict(features) if isinstance(features, dict) else features
+        return self.predict(normalized)
+
+    def predict_batch(self, features_list: list[MeteorologicalFeatures | dict[str, Any]]) -> list[HazardRisk]:
+        """Predict a list of feature records."""
+
+        return [self.predict_one(features) for features in features_list]
+
+    def explain(self, features: MeteorologicalFeatures | dict[str, Any]) -> dict[str, Any]:
+        """Return contributing factors and model metadata for one prediction."""
+
+        risk = self.predict_one(features)
+        return {
+            "hazard_type": self.hazard_type,
+            "risk_probability": risk.risk_probability,
+            "risk_level": risk.risk_level.value,
+            "contributing_factors": risk.contributing_factors,
+            "model_version": self.model_version,
+            "metadata": dict(self.metadata),
+        }
+
+    def load_threshold_config(self, path: str | Path) -> None:
+        """Load threshold config from JSON or simple YAML."""
+
+        payload = _load_config_mapping(path)
+        self.threshold_config = RiskThresholdConfig.from_mapping(payload.get("risk_thresholds", payload))
+
     def _risk(self, features: MeteorologicalFeatures, probability: float, factors: list[str], evidence: dict[str, Any]) -> HazardRisk:
         p = clamp(probability)
-        from mazu_saudi.risk.levels import probability_to_level
 
         return HazardRisk(
             hazard_type=self.hazard_type,
             risk_probability=p,
-            risk_level=probability_to_level(p),
+            risk_level=probability_to_level(p, self.threshold_config),
             contributing_factors=factors or ["未触发显著阈值"],
             grid=features.grid,
             valid_time=features.valid_time,
             model_name=self.model_name,
-            evidence=evidence,
+            model_version=self.model_version,
+            metadata={"threshold_config": self.threshold_config.to_dict(), **self.metadata},
+            evidence={"model_version": self.model_version, **evidence},
         )
 
 
-class FlashFloodRiskModel(BaseRiskModel):
+class RuleBasedRiskModel(BaseRiskModel):
+    """Base class for deterministic threshold/rule models."""
+
+
+class MLBackedRiskModel(BaseRiskModel):
+    """Placeholder ML-backed risk model using an optional adapter."""
+
+    hazard_type = "ml_backed_hazard"
+    model_name = "ml_backed_placeholder"
+
+    def __init__(self, adapter: OptionalMLAdapter | None = None, backend: str = "fallback", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.adapter = adapter or create_ml_adapter(backend)
+        self.metadata.update({"backend": self.adapter.backend})
+
+    def train(self, dataset: Any) -> dict[str, Any]:
+        return self.adapter.train(dataset)
+
+    def save_model(self, path: str | Path) -> None:
+        self.adapter.save_model(path)
+
+    def load_model(self, path: str | Path) -> "MLBackedRiskModel":
+        self.adapter.load_model(path)
+        return self
+
+    def predict_proba(self, features: MeteorologicalFeatures | dict[str, Any]) -> float:
+        return clamp(self.adapter.predict_proba(features))
+
+    def shap_explain(self, features: MeteorologicalFeatures | dict[str, Any]) -> dict[str, Any]:
+        return self.adapter.shap_explain(features)
+
+    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
+        probability = self.predict_proba(features)
+        explanation = self.shap_explain(features)
+        factors = ["ML模型占位接口已执行"] if not explanation.get("values") else list(explanation["values"].keys())
+        return self._risk(features, probability, factors, {"shap": explanation})
+
+
+class FlashFloodRiskModel(RuleBasedRiskModel):
     """Flash-flood and heavy-rain screening for wadis and urban drainage."""
 
     hazard_type = "flash_flood"
@@ -75,7 +164,7 @@ class FlashFloodRiskModel(BaseRiskModel):
         return self._risk(features, score, factors, {"screening_score": score})
 
 
-class ExtremeHeatRiskModel(BaseRiskModel):
+class ExtremeHeatRiskModel(RuleBasedRiskModel):
     """Extreme heat and heat-health screening."""
 
     hazard_type = "extreme_heat"
@@ -97,7 +186,7 @@ class ExtremeHeatRiskModel(BaseRiskModel):
         return self._risk(features, probability, factors, {"heat_index_c": hi_value, "temp_c": temp})
 
 
-class DryHeatStressRiskModel(BaseRiskModel):
+class DryHeatStressRiskModel(RuleBasedRiskModel):
     """Agricultural dry-heat stress screening."""
 
     hazard_type = "dry_heat_agriculture"
@@ -120,7 +209,7 @@ class DryHeatStressRiskModel(BaseRiskModel):
         return self._risk(features, score, factors, {"vpd_kpa": None if is_missing(vpd) else float(vpd), "screening_score": score})
 
 
-class DustPotentialRiskModel(BaseRiskModel):
+class DustPotentialRiskModel(RuleBasedRiskModel):
     """Strong-wind dust emission potential screening."""
 
     hazard_type = "dust_potential"
@@ -145,7 +234,7 @@ class DustPotentialRiskModel(BaseRiskModel):
         return self._risk(features, score, factors, {"screening_score": score})
 
 
-class CoastalHumidHeatRiskModel(BaseRiskModel):
+class CoastalHumidHeatRiskModel(RuleBasedRiskModel):
     """Coastal humid heat and vapor-transport screening."""
 
     hazard_type = "coastal_humid_heat"
@@ -183,3 +272,39 @@ def all_default_models() -> list[BaseRiskModel]:
         DustPotentialRiskModel(),
         CoastalHumidHeatRiskModel(),
     ]
+
+
+def _load_config_mapping(path: str | Path) -> dict[str, Any]:
+    file_path = Path(path)
+    text = file_path.read_text(encoding="utf-8")
+    if file_path.suffix.lower() == ".json":
+        return json.loads(text)
+    try:
+        import yaml
+    except Exception:
+        return _parse_simple_yaml(text)
+    payload = yaml.safe_load(text)
+    return payload or {}
+
+
+def _parse_simple_yaml(text: str) -> dict[str, Any]:
+    """Parse the simple threshold YAML shape used by examples/tests."""
+
+    result: dict[str, Any] = {}
+    current: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line:
+            continue
+        if not line.startswith(" ") and line.endswith(":"):
+            current = line[:-1].strip()
+            result[current] = {}
+            continue
+        if current and ":" in line:
+            key, value = line.strip().split(":", 1)
+            value = value.strip()
+            if value.startswith("[") and value.endswith("]"):
+                result[current][key] = [float(item.strip()) for item in value.strip("[]").split(",")]
+            else:
+                result[current][key] = float(value) if value.replace(".", "", 1).isdigit() else value
+    return result

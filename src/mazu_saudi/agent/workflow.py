@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mazu_saudi.data import check_missing_values, read_json_features
 from mazu_saudi.agent.briefing import build_warning_product
 from mazu_saudi.forecast import MockForecastProvider
 from mazu_saudi.indicators import (
@@ -21,6 +24,43 @@ from mazu_saudi.risk import all_default_models
 from mazu_saudi.schemas import MeteorologicalFeatures
 from mazu_saudi.utils.math import is_missing
 
+try:
+    from pydantic import BaseModel, ConfigDict, Field
+except Exception:  # pragma: no cover - pydantic optional in minimal env
+    BaseModel = None
+
+
+if BaseModel is not None:
+    class WorkflowContext(BaseModel):
+        """Pydantic workflow context for API/runtime validation."""
+
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+        features: MeteorologicalFeatures | dict[str, Any]
+        trace: list[str] = Field(default_factory=list)
+        node_trace: list[dict[str, Any]] = Field(default_factory=list)
+        errors: list[dict[str, Any]] = Field(default_factory=list)
+        data: dict[str, Any] = Field(default_factory=dict)
+else:
+    @dataclass
+    class WorkflowContext:
+        """Fallback context with the same public fields when pydantic is absent."""
+
+        features: MeteorologicalFeatures | dict[str, Any]
+        trace: list[str] = field(default_factory=list)
+        node_trace: list[dict[str, Any]] = field(default_factory=list)
+        errors: list[dict[str, Any]] = field(default_factory=list)
+        data: dict[str, Any] = field(default_factory=dict)
+
+        def model_dump(self) -> dict[str, Any]:
+            return {
+                "features": self.features,
+                "trace": self.trace,
+                "node_trace": self.node_trace,
+                "errors": self.errors,
+                "data": self.data,
+            }
+
+
 Context = dict[str, Any]
 
 
@@ -32,6 +72,17 @@ class WorkflowNode(ABC):
     @abstractmethod
     def run(self, context: Context) -> Context:
         """Run node and return context."""
+
+    def input_summary(self, context: Context) -> dict[str, Any]:
+        return {"keys": sorted(context.keys())}
+
+    def output_summary(self, context: Context) -> dict[str, Any]:
+        summary = {"keys": sorted(context.keys())}
+        if "risks" in context:
+            summary["risk_count"] = len(context["risks"])
+        if "indicators" in context:
+            summary["indicator_count"] = len(context["indicators"])
+        return summary
 
 
 class DataCheckNode(WorkflowNode):
@@ -46,6 +97,7 @@ class DataCheckNode(WorkflowNode):
         if not isinstance(features, MeteorologicalFeatures):
             raise ValueError("context['features'] must be MeteorologicalFeatures or dict")
         context["features"] = features
+        context["data_quality"] = check_missing_values(features)
         context.setdefault("trace", []).append(self.name)
         return context
 
@@ -71,10 +123,9 @@ class ForecastNode(WorkflowNode):
 
     def run(self, context: Context) -> Context:
         features: MeteorologicalFeatures = context["features"]
-        context["forecast_fields"] = {
-            variable: self.provider.fetch(variable, valid_time=features.valid_time).to_dict()
-            for variable in ["temp_c", "rh_percent", "wind_speed_mps", "precip_1h_mm"]
-        }
+        forecast = self.provider.get_forecast(features.valid_time, lead_hours=0)
+        context["forecast_fields"] = {key: field.to_dict() for key, field in forecast.items()}
+        context["forecast_confidence"] = {"status": "unavailable", "provider": self.provider.name}
         context.setdefault("trace", []).append(self.name)
         return context
 
@@ -141,8 +192,25 @@ class EvidenceCheckNode(WorkflowNode):
     name = "evidence_check"
 
     def run(self, context: Context) -> Context:
+        required_indicators = ["vpd_kpa", "heat_index_c", "pwat_mm", "ivt_kg_m_s", "cape_j_kg"]
+        indicators = context.get("indicators", {})
+        indicator_status = {
+            name: (name in indicators and not is_missing(indicators.get(name)))
+            for name in required_indicators
+        }
+        risk_status = {}
+        for risk in context["risks"]:
+            high_risk = risk.risk_level.value in {"high", "extreme"}
+            risk_status[risk.hazard_type] = {
+                "has_model_version": bool(risk.model_version or risk.evidence.get("model_version")),
+                "has_contributing_factors": bool(risk.contributing_factors),
+                "high_risk_requires_factors_ok": (not high_risk) or bool(risk.contributing_factors),
+            }
         context["evidence_status"] = {
-            risk.hazard_type: bool(risk.contributing_factors and risk.evidence) for risk in context["risks"]
+            "physical_indicators_complete": all(indicator_status.values()),
+            "indicator_status": indicator_status,
+            "risk_status": risk_status,
+            "gencast_confidence": context.get("forecast_confidence", {"status": "unavailable"}),
         }
         context.setdefault("trace", []).append(self.name)
         return context
@@ -162,12 +230,13 @@ class BriefingNode(WorkflowNode):
 
 
 class HumanReviewNode(WorkflowNode):
-    """Mark the draft as requiring human review."""
+    """Mark high/extreme risk drafts as requiring human review."""
 
     name = "human_review"
 
     def run(self, context: Context) -> Context:
-        context["human_review"] = {"required": True, "status": "pending"}
+        required = any(risk.risk_level.value in {"high", "extreme"} for risk in context.get("risks", []))
+        context["human_review"] = {"required": required, "human_review_required": required, "status": "pending" if required else "not_required"}
         context.setdefault("trace", []).append(self.name)
         return context
 
@@ -204,9 +273,33 @@ class SaudiWarningPipeline:
     def run(self, features: MeteorologicalFeatures | dict[str, Any]) -> Context:
         """Run all workflow nodes."""
 
-        context: Context = {"features": features}
+        workflow_context = WorkflowContext(features=features)
+        context: Context = workflow_context.model_dump()
         for node in self.nodes:
-            context = node.run(context)
+            start = time.perf_counter()
+            record = {
+                "node": node.name,
+                "status": "running",
+                "input_summary": node.input_summary(context),
+                "output_summary": {},
+                "duration_ms": 0.0,
+                "error": None,
+            }
+            try:
+                context = node.run(context)
+                record["status"] = "ok"
+                record["output_summary"] = node.output_summary(context)
+            except Exception as exc:
+                record["status"] = "error"
+                record["error"] = {"type": exc.__class__.__name__, "message": str(exc)}
+                context.setdefault("errors", []).append({"node": node.name, **record["error"]})
+                context.setdefault("trace", []).append(node.name)
+                context["failed"] = True
+                record["output_summary"] = node.output_summary(context)
+                break
+            finally:
+                record["duration_ms"] = round((time.perf_counter() - start) * 1000.0, 3)
+                context.setdefault("node_trace", []).append(record)
         return context
 
 
@@ -214,7 +307,8 @@ def load_sample_features() -> dict[str, Any]:
     """Load bundled demo feature payload."""
 
     path = Path(__file__).resolve().parents[3] / "examples" / "sample_features.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    features = read_json_features(path)
+    return features.to_dict() if hasattr(features, "to_dict") else json.loads(path.read_text(encoding="utf-8"))
 
 
 def run_demo_pipeline() -> dict[str, Any]:
@@ -223,6 +317,9 @@ def run_demo_pipeline() -> dict[str, Any]:
     context = SaudiWarningPipeline().run(load_sample_features())
     return {
         "trace": context["trace"],
+        "pipeline_trace": context["node_trace"],
+        "errors": context.get("errors", []),
+        "data_quality": context.get("data_quality", {}),
         "features": context["features"].to_dict(),
         "indicators": context["indicators"],
         "risks": [risk.to_dict() for risk in context["risks"]],

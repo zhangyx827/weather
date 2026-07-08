@@ -2,7 +2,7 @@
 
 import unittest
 
-from mazu_saudi.risk import all_default_models, probability_to_level
+from mazu_saudi.risk import MLBackedRiskModel, all_default_models, probability_to_level
 from mazu_saudi.schemas import GridCell, MeteorologicalFeatures, RiskLevel
 
 
@@ -28,9 +28,9 @@ def sample_features():
 class RiskModelTests(unittest.TestCase):
     def test_probability_to_level(self):
         self.assertEqual(probability_to_level(0.1), RiskLevel.LOW)
-        self.assertEqual(probability_to_level(0.4), RiskLevel.MEDIUM)
-        self.assertEqual(probability_to_level(0.7), RiskLevel.HIGH)
-        self.assertEqual(probability_to_level(0.9), RiskLevel.EXTREME)
+        self.assertEqual(probability_to_level(0.25), RiskLevel.MEDIUM)
+        self.assertEqual(probability_to_level(0.5), RiskLevel.HIGH)
+        self.assertEqual(probability_to_level(0.75), RiskLevel.EXTREME)
 
     def test_all_models_output_range(self):
         features = sample_features()
@@ -41,6 +41,21 @@ class RiskModelTests(unittest.TestCase):
             self.assertLessEqual(risk.risk_probability, 1.0)
             self.assertIn(risk.risk_level, list(RiskLevel))
             self.assertTrue(risk.contributing_factors)
+            self.assertTrue(risk.model_version)
+
+    def test_batch_prediction_and_explain(self):
+        model = all_default_models()[0]
+        features = sample_features()
+        self.assertEqual(len(model.predict_batch([features, features])), 2)
+        explanation = model.explain(features)
+        self.assertIn("contributing_factors", explanation)
+        self.assertTrue(explanation["model_version"])
+
+    def test_ml_fallback_interface(self):
+        model = MLBackedRiskModel()
+        self.assertEqual(model.train([sample_features()])["status"], "trained_stub")
+        self.assertEqual(model.predict_proba(sample_features()), 0.0)
+        self.assertFalse(model.shap_explain(sample_features())["available"])
 
 
 if __name__ == "__main__":

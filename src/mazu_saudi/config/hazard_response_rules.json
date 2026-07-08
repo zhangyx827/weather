@@ -1,0 +1,37 @@
+{
+  "flash_flood": {
+    "label": "山洪暴雨风险",
+    "exposures": ["wadi_communities", "urban_drainage", "roads"],
+    "actions": ["activate_flood_watch", "inspect_drainage", "avoid_wadi_crossing"],
+    "departments": ["meteorology", "emergency", "transport"],
+    "warning_products": ["flash_flood_watch", "urban_drainage_advisory"]
+  },
+  "extreme_heat": {
+    "label": "极端高温与热健康风险",
+    "exposures": ["outdoor_workers", "elderly_population", "power_grid"],
+    "actions": ["open_cooling_centers", "adjust_work_hours", "issue_heat_health_advice"],
+    "departments": ["public_health", "emergency", "meteorology"],
+    "warning_products": ["heat_health_warning", "outdoor_work_advisory"]
+  },
+  "dry_heat_agriculture": {
+    "label": "干热农业胁迫风险",
+    "exposures": ["date_palm_farms", "greenhouses", "irrigation_systems"],
+    "actions": ["increase_irrigation_monitoring", "shade_sensitive_crops", "monitor_vpd"],
+    "departments": ["agriculture", "meteorology"],
+    "warning_products": ["agriculture_heat_stress_bulletin"]
+  },
+  "dust_potential": {
+    "label": "强风沙尘起沙潜势",
+    "exposures": ["highways", "airports", "construction_sites"],
+    "actions": ["issue_visibility_warning", "secure_loose_material", "prepare_traffic_controls"],
+    "departments": ["transport", "emergency", "meteorology"],
+    "warning_products": ["dust_visibility_warning", "road_visibility_advisory"]
+  },
+  "coastal_humid_heat": {
+    "label": "沿海湿热与水汽输送风险",
+    "exposures": ["ports", "coastal_workers", "desalination_plants"],
+    "actions": ["monitor_port_operations", "reduce_heat_exposure", "track_moisture_transport"],
+    "departments": ["port", "public_health", "meteorology"],
+    "warning_products": ["coastal_humid_heat_advisory", "port_heat_operations_notice"]
+  }
+}

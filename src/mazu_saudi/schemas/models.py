@@ -26,11 +26,11 @@ class RiskLevel(str, Enum):
         """Map a 0-1 probability-like score to a risk level."""
 
         p = max(0.0, min(1.0, float(probability)))
-        if p >= 0.8:
+        if p >= 0.75:
             return cls.EXTREME
-        if p >= 0.6:
+        if p >= 0.5:
             return cls.HIGH
-        if p >= 0.35:
+        if p >= 0.25:
             return cls.MEDIUM
         return cls.LOW
 
@@ -133,6 +133,8 @@ class HazardRisk:
     grid: GridCell | None = None
     valid_time: datetime | None = None
     model_name: str = "rule_screening"
+    model_version: str = "v1"
+    metadata: dict[str, Any] = field(default_factory=dict)
     evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

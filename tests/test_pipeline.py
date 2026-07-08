@@ -11,6 +11,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(result["risks"]), 5)
         self.assertEqual(len(result["warning_product"]["briefings"]), 6)
         self.assertIn("kg_reasoning", result["trace"])
+        self.assertIn("pipeline_trace", result)
+        self.assertTrue(all("duration_ms" in item for item in result["pipeline_trace"]))
         self.assertGreater(result["kg_explanation"]["triple_count"], 0)
 
 

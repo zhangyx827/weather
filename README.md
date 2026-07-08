@@ -17,6 +17,14 @@ Run demo:
 python3 examples/demo_saudi_warning.py
 ```
 
+Run the other examples:
+
+```bash
+python3 examples/run_batch_risk_scan.py
+python3 examples/run_api_client_demo.py
+python3 examples/export_kg_ttl.py
+```
+
 Run tests:
 
 ```bash
@@ -28,4 +36,10 @@ Run API after installing dependencies:
 ```bash
 python3 -m pip install -r requirements.txt
 uvicorn mazu_saudi.api.app:app --app-dir src --reload
+```
+
+API checks:
+
+```bash
+PYTHONPATH=src python3 -m pytest -q tests/test_api.py
 ```

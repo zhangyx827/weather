@@ -94,6 +94,110 @@ def compute_cape_placeholder(temp_c: Any, rh_percent: Any) -> Any:
     return map_values(scalar, temp_c, rh_percent)
 
 
+def compute_relative_humidity_from_dewpoint(temp_c: Any, dewpoint_c: Any) -> Any:
+    """Compute relative humidity percent from air temperature and dewpoint."""
+
+    def scalar(t, td):
+        if is_missing(t) or is_missing(td):
+            return _nan()
+        es = 0.6108 * math.exp((17.27 * float(t)) / (float(t) + 237.3))
+        e = 0.6108 * math.exp((17.27 * float(td)) / (float(td) + 237.3))
+        return clamp(100.0 * e / es, 0.0, 100.0)
+
+    return map_values(scalar, temp_c, dewpoint_c)
+
+
+def compute_dewpoint_depression(temp_c: Any, dewpoint_c: Any) -> Any:
+    """Return temperature minus dewpoint in degrees Celsius."""
+
+    def scalar(t, td):
+        if is_missing(t) or is_missing(td):
+            return _nan()
+        return float(t) - float(td)
+
+    return map_values(scalar, temp_c, dewpoint_c)
+
+
+def compute_precip_anomaly(observed_mm: Any, climatology_mm: Any) -> Any:
+    """Compute precipitation anomaly as observed minus climatology in mm."""
+
+    def scalar(obs, clim):
+        if is_missing(obs) or is_missing(clim):
+            return _nan()
+        return float(obs) - float(clim)
+
+    return map_values(scalar, observed_mm, climatology_mm)
+
+
+def compute_extreme_precip_flags(
+    precip_mm: Any,
+    heavy_threshold_mm: float = 25.0,
+    extreme_threshold_mm: float = 50.0,
+) -> Any:
+    """Flag heavy/extreme precipitation using stable numeric categories.
+
+    Returns 0 for below heavy threshold, 1 for heavy, and 2 for extreme. NaN is
+    propagated for missing inputs.
+    """
+
+    def scalar(value):
+        if is_missing(value):
+            return _nan()
+        amount = float(value)
+        if amount >= extreme_threshold_mm:
+            return 2.0
+        if amount >= heavy_threshold_mm:
+            return 1.0
+        return 0.0
+
+    return map_values(scalar, precip_mm)
+
+
+def compute_wind_shear(upper_wind_mps: Any, lower_wind_mps: Any) -> Any:
+    """Compute vertical wind-speed shear magnitude in m/s."""
+
+    def scalar(upper, lower):
+        if is_missing(upper) or is_missing(lower):
+            return _nan()
+        return abs(float(upper) - float(lower))
+
+    return map_values(scalar, upper_wind_mps, lower_wind_mps)
+
+
+def compute_bowen_ratio_placeholder(temp_c: Any, rh_percent: Any) -> Any:
+    """Estimate Bowen ratio placeholder from dry heat and humidity.
+
+    Contract: returns a non-negative scalar/array proxy. Replace with
+    sensible/latent heat flux ratio when surface flux data are available.
+    """
+
+    def scalar(t, rh):
+        if is_missing(t) or is_missing(rh):
+            return _nan()
+        dry_component = 1.0 - clamp(float(rh) / 100.0)
+        heat_component = clamp((float(t) - 25.0) / 25.0, 0.0, 1.5)
+        return max(0.0, 0.3 + 2.2 * dry_component + heat_component)
+
+    return map_values(scalar, temp_c, rh_percent)
+
+
+def compute_net_radiation_placeholder(shortwave_w_m2: Any, longwave_w_m2: Any | None = None, albedo: float = 0.23) -> Any:
+    """Estimate net radiation placeholder in W/m2.
+
+    Contract: ``shortwave_w_m2`` is incoming shortwave radiation. Optional
+    ``longwave_w_m2`` is net longwave radiation; if absent, a dry-region
+    placeholder loss of -80 W/m2 is used.
+    """
+
+    def scalar(sw, lw):
+        if is_missing(sw):
+            return _nan()
+        longwave = -80.0 if is_missing(lw) else float(lw)
+        return (1.0 - albedo) * float(sw) + longwave
+
+    return map_values(scalar, shortwave_w_m2, -80.0 if longwave_w_m2 is None else longwave_w_m2)
+
+
 def compute_flash_flood_screening_score(
     precip_1h_mm: float | None,
     precip_6h_mm: float | None,

@@ -27,8 +27,12 @@ def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
 
 
 def map_values(func, *args):
-    """Apply a scalar function to scalars, lists, tuples, or NumPy arrays."""
+    """Apply a scalar function to scalars, lists, tuples, NumPy arrays, or xarray DataArrays."""
 
+    if any(_is_xarray_dataarray(arg) for arg in args):
+        import xarray as xr
+
+        return xr.apply_ufunc(func, *args, vectorize=True, output_dtypes=[float])
     if any(_is_numpy_array(arg) for arg in args):
         import numpy as np
 
@@ -45,6 +49,10 @@ def map_values(func, *args):
 
 def _is_numpy_array(value: Any) -> bool:
     return value.__class__.__module__.startswith("numpy")
+
+
+def _is_xarray_dataarray(value: Any) -> bool:
+    return value.__class__.__module__.startswith("xarray") and value.__class__.__name__ == "DataArray"
 
 
 def mean_present(values: Iterable[float | None], default: float = 0.0) -> float:
