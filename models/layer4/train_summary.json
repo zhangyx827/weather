@@ -1,0 +1,21 @@
+{
+  "source": "data/raw/era5_saudi_20250616.nc",
+  "samples": 277680,
+  "feature_names": [
+    "temp_c",
+    "vpd_kpa",
+    "heat_index_c",
+    "wind_speed_mps",
+    "relative_humidity_percent"
+  ],
+  "models": {
+    "extreme_heat": {
+      "path": "models/layer4/extreme_heat.txt",
+      "valid_rmse": 0.0036273362555989323
+    },
+    "dry_heat_stress": {
+      "path": "models/layer4/dry_heat_stress.txt",
+      "valid_rmse": 0.001786065687134001
+    }
+  }
+}

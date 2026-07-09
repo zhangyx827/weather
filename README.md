@@ -31,6 +31,12 @@ Run tests:
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
+Inspect current repo capabilities:
+
+```bash
+python3 scripts/capability_report.py
+```
+
 Run API after installing dependencies:
 
 ```bash

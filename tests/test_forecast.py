@@ -2,8 +2,9 @@
 
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
-from mazu_saudi.forecast import GenCastForecastProvider, MockForecastProvider
+from mazu_saudi.forecast import ERA5MSWEPForecastProvider, GenCastForecastProvider, MockForecastProvider
 
 
 class ForecastTests(unittest.TestCase):
@@ -23,6 +24,30 @@ class ForecastTests(unittest.TestCase):
         probs = provider.exceedance_probability(field, threshold=40.0, variable="temp_c")
         self.assertEqual(len(probs), len(field.values))
         self.assertTrue(all(0.0 <= value <= 1.0 for value in probs))
+
+    @unittest.skipUnless(Path("era5_single_levels_2025").exists() and Path("precip").exists(), "real forecast data not available")
+    def test_era5_mswep_provider_reads_real_fields(self):
+        provider = ERA5MSWEPForecastProvider()
+        try:
+            valid = datetime(2025, 1, 1, tzinfo=timezone.utc)
+            bbox = (24.5, 46.5, 24.9, 46.9)
+
+            temp = provider.fetch("temp_c", valid_time=valid, bbox=bbox)
+            precip = provider.fetch("precip_24h_mm", valid_time=valid, bbox=bbox)
+            fields = provider.get_forecast(valid, 0, bbox=bbox)
+
+            self.assertEqual(temp.provider, "era5_mswep")
+            self.assertEqual(temp.units, "degC")
+            self.assertTrue(temp.values)
+            self.assertEqual(precip.metadata["source"], "MSWEP")
+            self.assertEqual(precip.units, "mm")
+            self.assertTrue(precip.values)
+            self.assertIn("temp_c:+0h", fields)
+            self.assertIn("rh_percent:+0h", fields)
+            self.assertIn("wind_speed_mps:+0h", fields)
+            self.assertIn("precip_1h_mm:+0h", fields)
+        finally:
+            provider.close()
 
 
 if __name__ == "__main__":

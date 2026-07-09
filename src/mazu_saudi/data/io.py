@@ -9,12 +9,23 @@ from __future__ import annotations
 
 import json
 import math
+import tempfile
+import zipfile
 from dataclasses import is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from mazu_saudi.schemas import ForecastField, GridCell, MeteorologicalFeatures
+from mazu_saudi.indicators import (
+    compute_dewpoint_depression,
+    compute_extreme_precip_flags,
+    compute_heat_index_c,
+    compute_ivt_placeholder,
+    compute_pwat_placeholder,
+    compute_relative_humidity_from_dewpoint,
+    compute_vpd_kpa,
+)
 
 SAUDI_BBOX = (16.0, 34.0, 32.0, 56.0)
 STANDARD_GRID_RESOLUTION_DEG = 0.1
@@ -70,7 +81,68 @@ def read_netcdf_dataset(path: str | Path) -> Any:
         import xarray as xr
     except Exception as exc:  # pragma: no cover - depends on optional package
         raise RuntimeError("NetCDF reading requires optional dependency: xarray") from exc
-    return xr.open_dataset(path)
+
+    path_obj = Path(path)
+    engines = ("netcdf4", "h5netcdf", "scipy")
+    if zipfile.is_zipfile(path_obj):
+        return _read_zipped_netcdf_dataset(path_obj, engines)
+    last_error: Exception | None = None
+
+    for engine in engines:
+        try:
+            return xr.open_dataset(path_obj, engine=engine)
+        except Exception as exc:  # pragma: no cover - backend availability varies by env
+            last_error = exc
+
+    raise RuntimeError(
+        f"Unable to read NetCDF file {path_obj}; tried engines {engines}. "
+        f"Last error: {last_error}"
+    ) from last_error
+
+
+def _read_zipped_netcdf_dataset(path_obj: Path, engines: tuple[str, ...]) -> Any:
+    """Read a CDS ZIP response containing one or more NetCDF members."""
+
+    try:
+        import xarray as xr
+    except Exception as exc:  # pragma: no cover - depends on optional package
+        raise RuntimeError("NetCDF reading requires optional dependency: xarray") from exc
+
+    last_error: Exception | None = None
+    datasets = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extracted_paths: list[Path] = []
+        with zipfile.ZipFile(path_obj) as archive:
+            member_names = [name for name in archive.namelist() if not name.endswith("/")]
+            if not member_names:
+                raise RuntimeError(f"ZIP archive {path_obj} does not contain any files")
+            for member_name in member_names:
+                target_path = Path(tmpdir) / Path(member_name).name
+                target_path.write_bytes(archive.read(member_name))
+                extracted_paths.append(target_path)
+
+        for extracted_path in extracted_paths:
+            for engine in engines:
+                try:
+                    dataset = xr.open_dataset(extracted_path, engine=engine)
+                    datasets.append(dataset.load())
+                    dataset.close()
+                    break
+                except Exception as exc:  # pragma: no cover - backend availability varies by env
+                    last_error = exc
+            else:
+                continue
+
+        if not datasets:
+            raise RuntimeError(
+                f"Unable to read NetCDF members from ZIP archive {path_obj}; tried engines {engines}. "
+                f"Last error: {last_error}"
+            ) from last_error
+
+        if len(datasets) == 1:
+            return datasets[0]
+        return xr.merge(datasets, compat="override")
 
 
 def write_netcdf_dataset(path: str | Path, dataset: Any) -> None:
@@ -125,7 +197,9 @@ def crop_to_bbox(obj: Any, bbox: tuple[float, float, float, float] = SAUDI_BBOX)
     if _is_xarray_like(obj):
         lat_name = "lat" if "lat" in obj.coords else "latitude"
         lon_name = "lon" if "lon" in obj.coords else "longitude"
-        return obj.sel({lat_name: slice(min_lat, max_lat), lon_name: slice(min_lon, max_lon)})
+        lat_slice = _coord_slice(obj.coords[lat_name], min_lat, max_lat)
+        lon_slice = _coord_slice(obj.coords[lon_name], min_lon, max_lon)
+        return obj.sel({lat_name: lat_slice, lon_name: lon_slice})
     raise TypeError(f"Unsupported bbox crop object: {type(obj)!r}")
 
 
@@ -133,6 +207,95 @@ def crop_to_saudi(obj: Any) -> Any:
     """Crop supported objects to the Saudi operating domain."""
 
     return crop_to_bbox(obj, SAUDI_BBOX)
+
+
+def compute_daily_precipitation_statistics(
+    dataset: Any,
+    precip_var: str = "precipitation",
+    heavy_threshold_mm: float = 25.0,
+    extreme_threshold_mm: float = 50.0,
+    daily_freq: str = "1D",
+) -> Any:
+    """Aggregate sub-daily precipitation to daily totals and threshold flags.
+
+    Contract: ``dataset`` is an xarray Dataset or DataArray with a ``time``
+    coordinate. The precipitation variable is expected in millimetres per time
+    step unless its units metadata is metres, in which case it is converted.
+    """
+
+    data_array = _xarray_dataarray(dataset, precip_var)
+    if "time" not in getattr(data_array, "coords", {}):
+        raise ValueError("Daily precipitation statistics require a time coordinate")
+
+    precip_mm = _precip_to_mm(data_array)
+    daily_total = precip_mm.resample(time=daily_freq).sum(skipna=True)
+    daily_max = precip_mm.resample(time=daily_freq).max(skipna=True)
+    heavy_flag = compute_extreme_precip_flags(
+        daily_total,
+        heavy_threshold_mm=heavy_threshold_mm,
+        extreme_threshold_mm=extreme_threshold_mm,
+    )
+
+    return _xarray_dataset(
+        {
+            "daily_precip_total_mm": daily_total,
+            "daily_precip_max_step_mm": daily_max,
+            "daily_precip_extreme_flag": heavy_flag,
+        }
+    )
+
+
+def derive_xarray_physical_indicators(
+    dataset: Any,
+    variable_map: dict[str, str] | None = None,
+) -> Any:
+    """Derive common physical indicators from an xarray Dataset.
+
+    Available outputs depend on source variables:
+    ``rh_percent``, ``dewpoint_depression_c``, ``vpd_kpa``, ``heat_index_c``,
+    ``pwat_mm`` and ``ivt_kg_m_s``.
+    """
+
+    if not hasattr(dataset, "data_vars"):
+        raise TypeError("Physical indicator derivation expects an xarray.Dataset-like object")
+
+    names = {
+        "temp_c": "temp_c",
+        "dewpoint_c": "dewpoint_c",
+        "rh_percent": "rh_percent",
+        "pressure_hpa": "pressure_hpa",
+        "wind_speed_mps": "wind_speed_mps",
+        "u_wind_mps": "u_wind_mps",
+        "v_wind_mps": "v_wind_mps",
+    }
+    if variable_map:
+        names.update(variable_map)
+
+    outputs: dict[str, Any] = {}
+    temp = _optional_data_var(dataset, names["temp_c"])
+    dewpoint = _optional_data_var(dataset, names["dewpoint_c"])
+    rh = _optional_data_var(dataset, names["rh_percent"])
+    pressure = _optional_data_var(dataset, names["pressure_hpa"])
+    wind = _optional_data_var(dataset, names["wind_speed_mps"])
+    u_wind = _optional_data_var(dataset, names["u_wind_mps"])
+    v_wind = _optional_data_var(dataset, names["v_wind_mps"])
+
+    if rh is None and temp is not None and dewpoint is not None:
+        rh = compute_relative_humidity_from_dewpoint(temp, dewpoint)
+        outputs["rh_percent"] = rh
+    if temp is not None and dewpoint is not None:
+        outputs["dewpoint_depression_c"] = compute_dewpoint_depression(temp, dewpoint)
+    if temp is not None and rh is not None:
+        outputs["vpd_kpa"] = compute_vpd_kpa(temp, rh)
+        outputs["heat_index_c"] = compute_heat_index_c(temp, rh)
+        outputs["pwat_mm"] = compute_pwat_placeholder(temp, rh, pressure)
+    if wind is None and u_wind is not None and v_wind is not None:
+        wind = (u_wind**2 + v_wind**2) ** 0.5
+        outputs["wind_speed_mps"] = wind
+    if wind is not None and "pwat_mm" in outputs:
+        outputs["ivt_kg_m_s"] = compute_ivt_placeholder(wind, outputs["pwat_mm"])
+
+    return _xarray_dataset(outputs)
 
 
 def generate_standard_grid(
@@ -214,3 +377,45 @@ def _is_missing(value: Any) -> bool:
 
 def _is_xarray_like(obj: Any) -> bool:
     return hasattr(obj, "coords") and hasattr(obj, "sel") and not is_dataclass(obj)
+
+
+def _coord_slice(coord: Any, start: float, stop: float) -> slice:
+    values = getattr(coord, "values", coord)
+    if len(values) == 0:
+        return slice(start, stop)
+    first = float(values[0])
+    last = float(values[-1])
+    if first > last:
+        return slice(stop, start)
+    return slice(start, stop)
+
+
+def _xarray_dataarray(dataset: Any, variable: str) -> Any:
+    if hasattr(dataset, "data_vars"):
+        if variable not in dataset:
+            raise KeyError(f"Variable {variable!r} not found in dataset")
+        return dataset[variable]
+    if dataset.__class__.__name__ == "DataArray":
+        return dataset
+    raise TypeError("Expected an xarray.Dataset or xarray.DataArray")
+
+
+def _xarray_dataset(data_vars: dict[str, Any]) -> Any:
+    try:
+        import xarray as xr
+    except Exception as exc:  # pragma: no cover - depends on optional package
+        raise RuntimeError("xarray.Dataset creation requires optional dependency: xarray") from exc
+    return xr.Dataset(data_vars)
+
+
+def _optional_data_var(dataset: Any, name: str) -> Any | None:
+    return dataset[name] if name in dataset else None
+
+
+def _precip_to_mm(data_array: Any) -> Any:
+    units = str(getattr(data_array, "attrs", {}).get("units", "")).lower()
+    if units in {"m", "meter", "meters", "metre", "metres"}:
+        converted = data_array * 1000.0
+        converted.attrs["units"] = "mm"
+        return converted
+    return data_array
