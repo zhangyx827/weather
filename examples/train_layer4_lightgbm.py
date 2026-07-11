@@ -27,17 +27,11 @@ import numpy as np
 
 from mazu_saudi.data import read_netcdf_dataset
 from mazu_saudi.indicators.physical import compute_dry_heat_stress_score
-
-FEATURE_NAMES = (
-    "temp_c",
-    "vpd_kpa",
-    "heat_index_c",
-    "wind_speed_mps",
-    "relative_humidity_percent",
-)
+from mazu_saudi.risk.layer4_features import LAYER4_FEATURE_NAMES, feature_matrix_from_dataset, prepare_feature_frame
 
 DEFAULT_SOURCE = ROOT / "data" / "raw" / "era5_saudi_20250616.nc"
 DEFAULT_MODEL_DIR = ROOT / "models" / "layer4"
+SOURCE_FORMATS = ("auto", "era5", "indicator-netcdf", "indicator-parquet")
 
 
 def normalize_dataset(dataset):
@@ -102,33 +96,11 @@ def compute_wind_speed_mps(u10, v10):
     return np.sqrt(np.asarray(u10) ** 2 + np.asarray(v10) ** 2)
 
 
-def build_training_table(dataset):
-    ds = normalize_dataset(dataset)
-    if not any(dim not in {"latitude", "longitude"} for dim in ds["t2m"].dims):
-        raise RuntimeError("Expected a temporal dimension in the ERA5 sample")
-
-    t2m_c = to_celsius(ds["t2m"].values)
-    d2m_c = to_celsius(ds["d2m"].values)
-    rh = relative_humidity_from_dewpoint(t2m_c, d2m_c)
-    vpd = compute_vpd_kpa(t2m_c, d2m_c)
-    hi = compute_heat_index_c(t2m_c, rh)
-    wind = compute_wind_speed_mps(ds["u10"].values, ds["v10"].values)
-
-    features = np.stack(
-        [
-            np.asarray(t2m_c, dtype=np.float32).reshape(-1),
-            np.asarray(vpd, dtype=np.float32).reshape(-1),
-            np.asarray(hi, dtype=np.float32).reshape(-1),
-            np.asarray(wind, dtype=np.float32).reshape(-1),
-            np.asarray(rh, dtype=np.float32).reshape(-1),
-        ],
-        axis=1,
-    )
-
-    temp = np.asarray(t2m_c, dtype=np.float32).reshape(-1)
-    hi_flat = np.asarray(hi, dtype=np.float32).reshape(-1)
-    rh_flat = np.asarray(rh, dtype=np.float32).reshape(-1)
-    wind_flat = np.asarray(wind, dtype=np.float32).reshape(-1)
+def build_targets_from_features(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    temp = features[:, 0]
+    hi_flat = features[:, 2]
+    rh_flat = features[:, 4]
+    wind_flat = features[:, 3]
 
     extreme_heat = np.maximum((temp - 38.0) / 12.0, (hi_flat - 41.0) / 12.0)
     extreme_heat = np.where(temp >= 45.0, extreme_heat + 0.2, extreme_heat)
@@ -138,7 +110,45 @@ def build_training_table(dataset):
         [compute_dry_heat_stress_score(t, rh_value, wind_value) for t, rh_value, wind_value in zip(temp, rh_flat, wind_flat)],
         dtype=np.float32,
     )
+    return extreme_heat, dry_heat
 
+
+def build_training_table(dataset):
+    ds = normalize_dataset(dataset)
+    if "t2m" in ds.data_vars:
+        if not any(dim not in {"latitude", "longitude"} for dim in ds["t2m"].dims):
+            raise RuntimeError("Expected a temporal dimension in the ERA5 sample")
+        t2m_c = to_celsius(ds["t2m"].values)
+        d2m_c = to_celsius(ds["d2m"].values)
+        rh = relative_humidity_from_dewpoint(t2m_c, d2m_c)
+        vpd = compute_vpd_kpa(t2m_c, d2m_c)
+        hi = compute_heat_index_c(t2m_c, rh)
+        wind = compute_wind_speed_mps(ds["u10"].values, ds["v10"].values)
+        features = np.stack(
+            [
+                np.asarray(t2m_c, dtype=np.float32).reshape(-1),
+                np.asarray(vpd, dtype=np.float32).reshape(-1),
+                np.asarray(hi, dtype=np.float32).reshape(-1),
+                np.asarray(wind, dtype=np.float32).reshape(-1),
+                np.asarray(rh, dtype=np.float32).reshape(-1),
+            ],
+            axis=1,
+        )
+    else:
+        features, _ = feature_matrix_from_dataset(ds)
+
+    valid_mask = np.all(np.isfinite(features), axis=1)
+    features = features[valid_mask]
+    if features.size == 0:
+        raise RuntimeError("No valid training features available after sanitization")
+    extreme_heat, dry_heat = build_targets_from_features(features)
+    return features, extreme_heat, dry_heat
+
+
+def build_training_table_from_frame(table):
+    frame = prepare_feature_frame(table)
+    features = frame.loc[:, list(LAYER4_FEATURE_NAMES)].to_numpy(dtype=np.float32)
+    extreme_heat, dry_heat = build_targets_from_features(features)
     return features, extreme_heat, dry_heat
 
 
@@ -153,8 +163,8 @@ def train_booster(features, target, seed=42):
     train_idx = indices[:split]
     valid_idx = indices[split:]
 
-    train_set = lgb.Dataset(features[train_idx], label=target[train_idx], feature_name=list(FEATURE_NAMES), free_raw_data=False)
-    valid_set = lgb.Dataset(features[valid_idx], label=target[valid_idx], feature_name=list(FEATURE_NAMES), free_raw_data=False)
+    train_set = lgb.Dataset(features[train_idx], label=target[train_idx], feature_name=list(LAYER4_FEATURE_NAMES), free_raw_data=False)
+    valid_set = lgb.Dataset(features[valid_idx], label=target[valid_idx], feature_name=list(LAYER4_FEATURE_NAMES), free_raw_data=False)
 
     params = {
         "boosting_type": "gbdt",
@@ -198,8 +208,27 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Layer-4 LightGBM boosters from ERA5 data.")
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE, help="NetCDF or CDS ZIP bundle to train from.")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Directory for saved booster files.")
+    parser.add_argument("--source-format", choices=SOURCE_FORMATS, default="auto", help="Input format: ERA5 sample, daily indicator NetCDF, or indicator Parquet.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for train/valid split and LightGBM.")
     return parser.parse_args()
+
+
+def infer_source_format(path: Path) -> str:
+    suffixes = path.suffixes
+    if ".parquet" in suffixes:
+        return "indicator-parquet"
+    return "era5" if "era5" in path.name else "indicator-netcdf"
+
+
+def load_training_source(path: Path, source_format: str):
+    normalized = infer_source_format(path) if source_format == "auto" else source_format
+    if normalized not in SOURCE_FORMATS[1:]:
+        raise ValueError(f"Unsupported source format: {normalized}")
+    if normalized == "indicator-parquet":
+        import pandas as pd
+
+        return pd.read_parquet(path), normalized
+    return read_netcdf_dataset(path), normalized
 
 
 def main() -> int:
@@ -208,8 +237,11 @@ def main() -> int:
     model_dir = args.model_dir
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = read_netcdf_dataset(source)
-    features, extreme_heat_target, dry_heat_target = build_training_table(dataset)
+    dataset, resolved_source_format = load_training_source(source, args.source_format)
+    if resolved_source_format == "indicator-parquet":
+        features, extreme_heat_target, dry_heat_target = build_training_table_from_frame(dataset)
+    else:
+        features, extreme_heat_target, dry_heat_target = build_training_table(dataset)
 
     heat_model, heat_rmse = train_booster(features, extreme_heat_target, seed=args.seed)
     dry_model, dry_rmse = train_booster(features, dry_heat_target, seed=args.seed + 1)
@@ -221,8 +253,9 @@ def main() -> int:
 
     summary = {
         "source": display_path(source),
+        "source_format": resolved_source_format,
         "samples": int(features.shape[0]),
-        "feature_names": list(FEATURE_NAMES),
+        "feature_names": list(LAYER4_FEATURE_NAMES),
         "models": {
             "extreme_heat": {"path": display_path(heat_path), "valid_rmse": heat_rmse},
             "dry_heat_stress": {"path": display_path(dry_path), "valid_rmse": dry_rmse},

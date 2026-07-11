@@ -19,6 +19,11 @@ from .io import (
     write_netcdf_dataset,
     write_zarr_dataset,
 )
+from .srtm import (
+    SRTMElevationIndex,
+    discover_srtm_tiles,
+    enrich_features_with_elevation,
+)
 
 __all__ = [
     "FEATURE_UNITS",
@@ -38,4 +43,7 @@ __all__ = [
     "write_json_features",
     "write_netcdf_dataset",
     "write_zarr_dataset",
+    "SRTMElevationIndex",
+    "discover_srtm_tiles",
+    "enrich_features_with_elevation",
 ]

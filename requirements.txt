@@ -11,3 +11,5 @@ gdown>=6.1.0
 xarray>=2024.1
 zarr>=2.18
 netCDF4>=1.6
+pandas>=2.2
+pyarrow>=17.0

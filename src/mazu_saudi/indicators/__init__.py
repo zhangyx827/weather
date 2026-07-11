@@ -1,5 +1,6 @@
 """Physical indicator calculations."""
 
+from .build_inputs import RawInputBuilder
 from .physical import (
     compute_cape_placeholder,
     compute_bowen_ratio_placeholder,
@@ -19,6 +20,7 @@ from .physical import (
 )
 
 __all__ = [
+    "RawInputBuilder",
     "compute_bowen_ratio_placeholder",
     "compute_cape_placeholder",
     "compute_dewpoint_depression",

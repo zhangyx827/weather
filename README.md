@@ -25,6 +25,12 @@ python3 examples/run_api_client_demo.py
 python3 examples/export_kg_ttl.py
 ```
 
+Convert the bundled NIS SRTM elevation tiles into a model-ready Saudi grid:
+
+```bash
+python3 scripts/convert_nis_srtm.py data/raw/nis data/output/nis
+```
+
 Run tests:
 
 ```bash

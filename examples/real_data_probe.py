@@ -38,6 +38,7 @@ except Exception:  # pragma: no cover - environment dependent
     xr = None
 
 from mazu_saudi.data import read_netcdf_dataset
+from mazu_saudi.risk.layer4_features import LAYER4_FEATURE_NAMES, feature_matrix_from_dataset
 
 TARGET_NETCDF = ROOT / "data" / "raw" / "era5_saudi_20250616.nc"
 TARGET_JSON = ROOT / "data" / "output" / "risk_probe_result.json"
@@ -408,13 +409,7 @@ def _levels_from_probability(probability: Any) -> Any:
 class LightGBMLayer4Model:
     """Real Layer-4 inference backed by trained LightGBM booster files."""
 
-    feature_names = (
-        "temp_c",
-        "vpd_kpa",
-        "heat_index_c",
-        "wind_speed_mps",
-        "relative_humidity_percent",
-    )
+    feature_names = LAYER4_FEATURE_NAMES
 
     def __init__(
         self,
@@ -470,26 +465,7 @@ class LightGBMLayer4Model:
             return str(path)
 
     def _feature_matrix(self, ds: "xr.Dataset") -> tuple[np.ndarray, tuple[int, ...]]:
-        required = ("t2m", "vpd_kpa", "heat_index_c", "wind_speed_mps", "relative_humidity_percent")
-        missing = [name for name in required if name not in ds.data_vars]
-        if missing:
-            raise ValueError(f"Layer-4 input dataset is missing required variables: {', '.join(missing)}")
-
-        temp_c = np.asarray(_to_celsius(ds["t2m"]))
-        shape = temp_c.shape
-        fields = {
-            "temp_c": temp_c,
-            "vpd_kpa": np.asarray(ds["vpd_kpa"]),
-            "heat_index_c": np.asarray(ds["heat_index_c"]),
-            "wind_speed_mps": np.asarray(ds["wind_speed_mps"]),
-            "relative_humidity_percent": np.asarray(ds["relative_humidity_percent"]),
-        }
-        for name, values in fields.items():
-            if values.shape != shape:
-                raise ValueError(f"Layer-4 feature {name!r} has shape {values.shape}, expected {shape}")
-
-        matrix = np.column_stack([fields[name].reshape(-1) for name in self.feature_names]).astype(np.float32)
-        return matrix, shape
+        return feature_matrix_from_dataset(ds)
 
     @staticmethod
     def _predict_probability(model: Any, features: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
