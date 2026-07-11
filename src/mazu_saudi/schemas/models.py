@@ -119,6 +119,7 @@ class IndicatorFieldSet:
     values: dict[str, float | int | None] = field(default_factory=dict)
     units: dict[str, str] = field(default_factory=dict)
     source: str | None = None
+    source_metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "IndicatorFieldSet":
@@ -135,6 +136,7 @@ class IndicatorFieldSet:
             values=dict(payload.get("values", {})),
             units=dict(payload.get("units", {})),
             source=payload.get("source"),
+            source_metadata=dict(payload.get("source_metadata", {})),
         )
 
     def get(self, name: str, default: Any = None) -> Any:

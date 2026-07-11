@@ -6,6 +6,7 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import json
 
 from mazu_saudi.data.io import read_netcdf_dataset
 from mazu_saudi.schemas import GridCell, IndicatorFieldSet
@@ -15,6 +16,16 @@ def read_indicator_dataset(path: str | Path) -> Any:
     """Read a processed indicator NetCDF dataset."""
 
     return read_netcdf_dataset(path)
+
+
+def _dataset_source_metadata(dataset: Any) -> dict[str, Any]:
+    payload = getattr(dataset, "attrs", {}).get("source_metadata_json")
+    if not payload:
+        return {}
+    try:
+        return json.loads(payload)
+    except Exception:
+        return {}
 
 
 def indicator_point_from_dataset(
@@ -63,6 +74,7 @@ def indicator_point_from_dataset(
         values=values,
         units=units,
         source=source,
+        source_metadata=_dataset_source_metadata(dataset),
     )
 
 

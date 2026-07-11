@@ -347,21 +347,132 @@ class BuildManifestEntry:
     identifier: str
     status: str
     detail: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class BuildResult:
     entries: list[BuildManifestEntry] = field(default_factory=list)
 
-    def add(self, kind: str, identifier: str, status: str, detail: str = "") -> None:
-        self.entries.append(BuildManifestEntry(kind=kind, identifier=identifier, status=status, detail=detail))
+    def add(
+        self,
+        kind: str,
+        identifier: str,
+        status: str,
+        detail: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.entries.append(
+            BuildManifestEntry(
+                kind=kind,
+                identifier=identifier,
+                status=status,
+                detail=detail,
+                metadata={} if metadata is None else metadata,
+            )
+        )
 
     def write(self, path: Path) -> None:
         payload = [
-            {"kind": entry.kind, "identifier": entry.identifier, "status": entry.status, "detail": entry.detail}
+            {
+                "kind": entry.kind,
+                "identifier": entry.identifier,
+                "status": entry.status,
+                "detail": entry.detail,
+                "metadata": entry.metadata,
+            }
             for entry in self.entries
         ]
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class VariableSourceConfig:
+    dataset_id: str
+    variable_family: str
+    role: str
+    path_pattern: str
+    variable_names: tuple[str, ...]
+    coord_mapping: dict[str, str] = field(default_factory=dict)
+    unit_transform: str = "identity"
+    temporal_select_policy: str = "nearest"
+    spatial_interp_method: str = "nearest"
+    quality_rank: int = 100
+
+
+@dataclass
+class ResolvedVariable:
+    data: xr.DataArray
+    metadata: dict[str, Any]
+
+
+@dataclass
+class ResolvedDataset:
+    data: xr.Dataset
+    metadata: dict[str, Any]
+
+
+SST_SOURCE_REGISTRY: tuple[VariableSourceConfig, ...] = (
+    VariableSourceConfig(
+        dataset_id="oisst",
+        variable_family="sst",
+        role="primary",
+        path_pattern="oisst.day.mean.{year}.nc",
+        variable_names=("sst",),
+        unit_transform="to_celsius",
+        spatial_interp_method="nearest",
+        quality_rank=1,
+    ),
+    VariableSourceConfig(
+        dataset_id="jpl_mur",
+        variable_family="sst",
+        role="secondary",
+        path_pattern="jplMURSST41_72e4_84a7_e7ac.nc",
+        variable_names=("analysed_sst", "sst"),
+        unit_transform="to_celsius",
+        spatial_interp_method="nearest",
+        quality_rank=2,
+    ),
+)
+
+
+DUST_SOURCE_REGISTRY: tuple[VariableSourceConfig, ...] = (
+    VariableSourceConfig(
+        dataset_id="merra2_dust",
+        variable_family="dust",
+        role="primary",
+        path_pattern="MERRA2_{year}{month}{day}.nc4",
+        variable_names=("DUEXTTAU", "DUCMASS", "DUSMASS"),
+        spatial_interp_method="linear",
+        quality_rank=1,
+    ),
+)
+
+
+PRECIP_DAILY_SOURCE_REGISTRY: tuple[VariableSourceConfig, ...] = (
+    VariableSourceConfig(
+        dataset_id="gpm_imerg_daily",
+        variable_family="precip_daily",
+        role="primary",
+        path_pattern="GPM_3IMERGDF_{year}{month}{day}.nc4",
+        variable_names=("precipitation",),
+        spatial_interp_method="nearest",
+        quality_rank=1,
+    ),
+)
+
+
+PRECIP_MONTHLY_SOURCE_REGISTRY: tuple[VariableSourceConfig, ...] = (
+    VariableSourceConfig(
+        dataset_id="chirps_monthly",
+        variable_family="precip_monthly",
+        role="primary",
+        path_pattern="chirps-v3.0.{year}.monthly.nc",
+        variable_names=("precip",),
+        spatial_interp_method="nearest",
+        quality_rank=1,
+    ),
+)
 
 
 @dataclass
@@ -381,27 +492,24 @@ class RawInputBuilder:
         self.nis_path = self.raw_root.parent / "output" / "nis" / "nis_elevation_grid.nc"
         self._single_cache: dict[tuple[int, int, str], xr.Dataset] = {}
         self._pressure_cache: dict[tuple[int, int, str], xr.Dataset] = {}
-        self._dust_cache: dict[date, xr.Dataset] = {}
-        self._gpm_cache: dict[date, xr.Dataset] = {}
-        self._sst_cache: dict[str, xr.Dataset] = {}
-        self._chirps_cache: xr.Dataset | None = None
+        self._registered_source_cache: dict[tuple[str, str], xr.Dataset] = {}
         self._static_cache: xr.Dataset | None = None
         self._elevation_cache: xr.Dataset | None = None
         self._daily_precip_cache: dict[date, xr.DataArray] = {}
+        self._source_registry: dict[str, tuple[VariableSourceConfig, ...]] = {
+            "sst": SST_SOURCE_REGISTRY,
+            "dust": DUST_SOURCE_REGISTRY,
+            "precip_daily": PRECIP_DAILY_SOURCE_REGISTRY,
+            "precip_monthly": PRECIP_MONTHLY_SOURCE_REGISTRY,
+        }
 
     def close(self) -> None:
         for dataset in self._single_cache.values():
             dataset.close()
         for dataset in self._pressure_cache.values():
             dataset.close()
-        for dataset in self._dust_cache.values():
+        for dataset in self._registered_source_cache.values():
             dataset.close()
-        for dataset in self._gpm_cache.values():
-            dataset.close()
-        for dataset in self._sst_cache.values():
-            dataset.close()
-        if self._chirps_cache is not None:
-            self._chirps_cache.close()
         if self._static_cache is not None:
             self._static_cache.close()
         if self._elevation_cache is not None:
@@ -420,7 +528,13 @@ class RawInputBuilder:
                 daily = self.build_daily_indicators(current)
                 nc_path = self.indicator_nc_out / f"saudi_indicators_{current:%Y%m%d}.nc"
                 daily.to_netcdf(nc_path)
-                result.add("indicator_nc", current.isoformat(), "ok", str(nc_path))
+                result.add(
+                    "indicator_nc",
+                    current.isoformat(),
+                    "ok",
+                    str(nc_path),
+                    metadata=self._dataset_manifest_metadata(daily),
+                )
                 indicator_frames.append(self._daily_to_frame(daily, current))
             except Exception as exc:
                 result.add("indicator_nc", current.isoformat(), "error", str(exc))
@@ -609,10 +723,10 @@ class RawInputBuilder:
         low_level_jet_flag = _flag(wind850, 12.0).rename("low_level_jet_flag")
         strong_shear_flag = _flag(shear_850_200, 20.0).rename("strong_shear_flag")
 
-        sst_da = sst.rename("sst_celsius")
-        dust_aod = dust["DUEXTTAU"].rename("dust_aod")
-        dust_column = dust["DUCMASS"].rename("dust_column_mass")
-        dust_surface = dust["DUSMASS"].rename("dust_surface_mass")
+        sst_da = sst.data.rename("sst_celsius")
+        dust_aod = dust.data["DUEXTTAU"].rename("dust_aod")
+        dust_column = dust.data["DUCMASS"].rename("dust_column_mass")
+        dust_surface = dust.data["DUSMASS"].rename("dust_surface_mass")
         dust_risk = (
             xr.where(wind10.isel(time=0, drop=True) >= 8.0, 0.4, 0.0)
             + xr.where(dust_aod >= 0.3, 0.3, 0.0)
@@ -621,7 +735,7 @@ class RawInputBuilder:
         strong_wind_flag = _flag(wind10.isel(time=0, drop=True), 10.0).rename("strong_wind_flag")
         dust_emission_flag = (_flag(wind10.isel(time=0, drop=True), 8.0) * _flag(dust_surface, 5.0e-4)).astype("int8").rename("dust_emission_flag")
 
-        gpm_daily = gpm["precipitation"].rename("gpm_daily_precip")
+        gpm_daily = gpm.data["precipitation"].rename("gpm_daily_precip")
         gpm_diff = (gpm_daily - daily_total.isel(time=0, drop=True)).rename("gpm_era5_precip_diff")
         gpm_ratio = _safe_ratio(gpm_daily, daily_total.isel(time=0, drop=True).where(daily_total.isel(time=0, drop=True) > 0.1)).rename("gpm_era5_precip_ratio")
         heavy_rain_flag = _flag(daily_total.isel(time=0, drop=True), 25.0).rename("heavy_rain_flag")
@@ -646,8 +760,21 @@ class RawInputBuilder:
         monthly_chirps_precip_mmday = None
         if chirps_monthly is not None:
             days_in_month = float((date(day.year + (day.month == 12), 1 if day.month == 12 else day.month + 1, 1) - date(day.year, day.month, 1)).days)
-            monthly_chirps_precip_total = chirps_monthly.rename("monthly_chirps_precip_total")
-            monthly_chirps_precip_mmday = (chirps_monthly / days_in_month).rename("monthly_chirps_precip_mmday")
+            monthly_chirps_precip_total = chirps_monthly.data.rename("monthly_chirps_precip_total")
+            monthly_chirps_precip_mmday = (chirps_monthly.data / days_in_month).rename("monthly_chirps_precip_mmday")
+
+        precip_daily_metadata = dict(gpm.metadata)
+        precip_daily_metadata["comparison_summary"] = [
+            self._compare_arrays_against_reference(
+                primary_data=daily_total.isel(time=0, drop=True),
+                secondary_data=gpm_daily,
+                primary_source="era5",
+                secondary_source=precip_daily_metadata["resolved_source"],
+                secondary_role=precip_daily_metadata["resolved_role"],
+            )
+        ]
+        precip_daily_metadata["secondary_sources"] = ["era5"]
+        precip_daily_metadata["validation_status"] = "compared"
         daily_time = daily_total["time"]
         dust_aod = _promote_2d_to_time(dust_aod, daily_time)
         dust_column = _promote_2d_to_time(dust_column, daily_time)
@@ -750,8 +877,28 @@ class RawInputBuilder:
             attrs={
                 "title": "Saudi daily multi-hazard indicators",
                 "valid_date": day.isoformat(),
-                "source": "ERA5 + GPM + MERRA2 + OISST + SRTM",
+                "source": "ERA5 + SRTM + registry-managed external sources",
                 "missing_indicator_groups": ", ".join(MISSING_INDICATOR_GROUPS),
+                "source_metadata_json": json.dumps(
+                    {
+                        "resolved_sources": {
+                            "sst": sst.metadata,
+                            "dust": dust.metadata,
+                            "precip_daily": precip_daily_metadata,
+                            "precip_monthly": chirps_monthly.metadata if chirps_monthly is not None else self._missing_family_metadata("precip_monthly", day),
+                        },
+                        "validation_status": {
+                            "sst": sst.metadata.get("validation_status", "not_run"),
+                            "dust": dust.metadata.get("validation_status", "not_run"),
+                            "precip_daily": precip_daily_metadata.get("validation_status", "not_run"),
+                            "precip_monthly": chirps_monthly.metadata.get("validation_status", "not_run")
+                            if chirps_monthly is not None
+                            else "missing",
+                        },
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             },
         )
         if monthly_chirps_precip_total is not None and monthly_chirps_precip_mmday is not None:
@@ -842,12 +989,111 @@ class RawInputBuilder:
             raise ValueError("no pressure-level data for requested day")
         return subset
 
-    def _daily_gpm(self, day: date) -> xr.Dataset:
-        if day not in self._gpm_cache:
-            path = self.precip_dir / f"GPM_3IMERGDF_{day:%Y%m%d}.nc4"
-            if not path.exists():
-                raise FileNotFoundError(path)
+    def _daily_gpm(self, day: date) -> ResolvedDataset:
+        return self._resolve_dataset_family("precip_daily", day)
+
+    def _daily_dust(self, day: date) -> ResolvedDataset:
+        return self._resolve_dataset_family("dust", day)
+
+    def _daily_sst(self, day: date) -> ResolvedVariable:
+        return self._resolve_variable_family("sst", day)
+
+    def _resolve_dataset_family(self, variable_family: str, day: date) -> ResolvedDataset:
+        resolved = self._resolve_registered_source(variable_family, day)
+        selected = self._select_registered_dataset(resolved["dataset"], resolved["config"], day)
+        return ResolvedDataset(data=selected, metadata=resolved["metadata"])
+
+    def _resolve_variable_family(self, variable_family: str, day: date) -> ResolvedVariable:
+        resolved = self._resolve_registered_source(variable_family, day)
+        primary_config = resolved["config"]
+        primary_data = self._select_registered_variable(resolved["dataset"], primary_config, day)
+        metadata = dict(resolved["metadata"])
+        if metadata["secondary_sources"]:
+            comparison_summary = []
+            for dataset_id in metadata["secondary_sources"]:
+                secondary_config = next(config for config in self._source_registry[variable_family] if config.dataset_id == dataset_id)
+                secondary_dataset = self._select_registered_variable(
+                    self._open_registered_source(secondary_config, self._resolve_source_path(secondary_config, day)),
+                    secondary_config,
+                    day,
+                )
+                comparison_summary.append(self._compare_source_fields(primary_data, secondary_dataset, primary_config, secondary_config))
+            metadata["comparison_summary"] = comparison_summary
+            metadata["validation_status"] = "compared"
+        if primary_config.unit_transform == "to_celsius":
+            primary_data.attrs["units"] = "degC"
+        primary_data.attrs["resolved_source"] = primary_config.dataset_id
+        return ResolvedVariable(data=primary_data, metadata=metadata)
+
+    def _resolve_registered_source(self, variable_family: str, day: date) -> dict[str, Any]:
+        configs = self._source_registry.get(variable_family, ())
+        if not configs:
+            raise KeyError(f"no source registry configured for {variable_family}")
+
+        attempted: list[dict[str, Any]] = []
+        available: list[tuple[VariableSourceConfig, xr.Dataset, dict[str, Any]]] = []
+        for config in sorted(configs, key=lambda item: (item.quality_rank, item.dataset_id)):
+            candidate_path = self._resolve_source_path(config, day)
+            record = {
+                "dataset_id": config.dataset_id,
+                "role": config.role,
+                "path": str(candidate_path),
+                "status": "missing",
+            }
+            if not candidate_path.exists():
+                attempted.append(record)
+                continue
+            dataset = self._open_registered_source(config, candidate_path)
+            record["status"] = "available"
+            attempted.append(record)
+            available.append((config, dataset, record))
+
+        if not available:
+            searched = [item["path"] for item in attempted]
+            raise FileNotFoundError(f"no available {variable_family} sources; searched {searched}")
+
+        available.sort(key=lambda item: (0 if item[0].role == "primary" else 1, item[0].quality_rank, item[0].dataset_id))
+        primary_config, primary_dataset, primary_record = available[0]
+        return {
+            "config": primary_config,
+            "dataset": primary_dataset,
+            "metadata": {
+                "variable_family": variable_family,
+                "resolved_source": primary_config.dataset_id,
+                "resolved_role": primary_config.role,
+                "resolved_path": primary_record["path"],
+                "fallback_chain": attempted,
+                "comparison_summary": [],
+                "secondary_sources": [config.dataset_id for config, _, _ in available[1:]],
+                "validation_status": "primary_only",
+            },
+        }
+
+    def _resolve_source_path(self, config: VariableSourceConfig, day: date) -> Path:
+        return self._source_root_for_family(config.variable_family) / config.path_pattern.format(
+            year=day.year,
+            month=f"{day.month:02d}",
+            day=f"{day.day:02d}",
+        )
+
+    def _source_root_for_family(self, variable_family: str) -> Path:
+        if variable_family == "sst":
+            return self.sst_dir
+        if variable_family == "dust":
+            return self.dust_dir
+        if variable_family in {"precip_daily", "precip_monthly"}:
+            return self.precip_dir
+        raise KeyError(f"no source root configured for {variable_family}")
+
+    def _open_registered_source(self, config: VariableSourceConfig, path: Path) -> xr.Dataset:
+        key = (config.variable_family, config.dataset_id)
+        if key not in self._registered_source_cache:
             ds = xr.open_dataset(path, engine="netcdf4")
+            self._registered_source_cache[key] = self._prepare_registered_source_dataset(ds, config)
+        return self._registered_source_cache[key]
+
+    def _prepare_registered_source_dataset(self, ds: xr.Dataset, config: VariableSourceConfig) -> xr.Dataset:
+        if config.variable_family == "precip_daily":
             ds = ds.rename({"lat": "latitude", "lon": "longitude"})
             if "longitude" in ds.coords and "latitude" in ds.coords:
                 lon_min = float(ds["longitude"].min())
@@ -857,48 +1103,129 @@ class RawInputBuilder:
                 if lon_max <= SAUDI_BBOX[2] + 5.0 and lat_min >= SAUDI_BBOX[1] - 5.0:
                     ds = ds.rename({"longitude": "_tmp_longitude", "latitude": "longitude"})
                     ds = ds.rename({"_tmp_longitude": "latitude"})
-            ds = _align_to_standard_grid(ds, method="nearest")
-            if "time" in ds.dims:
-                ds = ds.isel(time=0, drop=True)
-            self._gpm_cache[day] = ds
-        return self._gpm_cache[day]
+            return _align_to_standard_grid(ds, method=config.spatial_interp_method)
+        if config.variable_family == "dust":
+            return _align_to_standard_grid(ds, method=config.spatial_interp_method).resample(time="1D").mean(skipna=True)
+        return _align_to_standard_grid(ds, method=config.spatial_interp_method)
 
-    def _daily_dust(self, day: date) -> xr.Dataset:
-        if day not in self._dust_cache:
-            path = self.dust_dir / f"MERRA2_{day:%Y%m%d}.nc4"
-            if not path.exists():
-                raise FileNotFoundError(path)
-            ds = xr.open_dataset(path, engine="netcdf4")
-            ds = _align_to_standard_grid(ds, method="linear")
-            ds = ds.resample(time="1D").mean(skipna=True).isel(time=0, drop=True)
-            self._dust_cache[day] = ds
-        return self._dust_cache[day]
-
-    def _daily_sst(self, day: date) -> xr.DataArray:
-        key = "oisst.day.mean.2025.nc"
-        if key not in self._sst_cache:
-            path = self.sst_dir / key
-            if not path.exists():
-                path = self.sst_dir / "jplMURSST41_72e4_84a7_e7ac.nc"
-            ds = xr.open_dataset(path, engine="netcdf4")
-            self._sst_cache[key] = _align_to_standard_grid(ds, method="nearest")
-        ds = self._sst_cache[key]
-        da_name = "sst" if "sst" in ds.data_vars else "analysed_sst"
-        selected = ds[da_name].sel(time=np.datetime64(day.isoformat()), method="nearest").drop_vars("time", errors="ignore")
-        selected.attrs["units"] = "degC"
+    def _select_registered_variable(self, ds: xr.Dataset, config: VariableSourceConfig, day: date) -> xr.DataArray:
+        da_name = next((name for name in config.variable_names if name in ds.data_vars), None)
+        if da_name is None:
+            raise KeyError(f"{config.dataset_id} missing expected variables {config.variable_names}")
+        target_time = np.datetime64(day.replace(day=1).isoformat()) if config.variable_family == "precip_monthly" else np.datetime64(day.isoformat())
+        selected = ds[da_name].sel(time=target_time, method=config.temporal_select_policy).drop_vars("time", errors="ignore")
+        if config.unit_transform == "to_celsius":
+            selected = _to_celsius(selected)
+        elif config.variable_family == "precip_monthly":
+            selected.attrs["units"] = "mm/month"
         return selected
 
-    def _monthly_chirps(self, day: date) -> xr.DataArray | None:
-        path = self.precip_dir / "chirps-v3.0.2025.monthly.nc"
-        if not path.exists():
+    def _select_registered_dataset(self, ds: xr.Dataset, config: VariableSourceConfig, day: date) -> xr.Dataset:
+        target_time = np.datetime64(day.isoformat())
+        if config.variable_family == "dust":
+            return ds.sel(time=target_time, method=config.temporal_select_policy).drop_vars("time", errors="ignore")
+        if config.variable_family == "precip_daily" and "time" in ds.dims:
+            return ds.sel(time=target_time, method=config.temporal_select_policy).drop_vars("time", errors="ignore")
+        return ds
+
+    def _compare_source_fields(
+        self,
+        primary_data: xr.DataArray,
+        secondary_data: xr.DataArray,
+        primary_config: VariableSourceConfig,
+        secondary_config: VariableSourceConfig,
+    ) -> dict[str, Any]:
+        primary_aligned, secondary_aligned = xr.align(primary_data, secondary_data, join="inner")
+        diff = secondary_aligned - primary_aligned
+        valid_mask = np.isfinite(primary_aligned.values) & np.isfinite(secondary_aligned.values)
+        if valid_mask.any():
+            abs_diff = np.abs(diff.values[valid_mask])
+            mean_abs_diff = float(abs_diff.mean())
+            max_abs_diff = float(abs_diff.max())
+            bias = float(diff.values[valid_mask].mean())
+            overlap_fraction = float(valid_mask.sum() / valid_mask.size)
+        else:
+            mean_abs_diff = float("nan")
+            max_abs_diff = float("nan")
+            bias = float("nan")
+            overlap_fraction = 0.0
+        return {
+            "against_source": primary_config.dataset_id,
+            "dataset_id": secondary_config.dataset_id,
+            "role": secondary_config.role,
+            "mean_abs_diff": mean_abs_diff,
+            "max_abs_diff": max_abs_diff,
+            "mean_bias": bias,
+            "overlap_fraction": overlap_fraction,
+        }
+
+    def _compare_arrays_against_reference(
+        self,
+        primary_data: xr.DataArray,
+        secondary_data: xr.DataArray,
+        primary_source: str,
+        secondary_source: str,
+        secondary_role: str,
+    ) -> dict[str, Any]:
+        primary_aligned, secondary_aligned = xr.align(primary_data, secondary_data, join="inner")
+        diff = secondary_aligned - primary_aligned
+        valid_mask = np.isfinite(primary_aligned.values) & np.isfinite(secondary_aligned.values)
+        if valid_mask.any():
+            abs_diff = np.abs(diff.values[valid_mask])
+            mean_abs_diff = float(abs_diff.mean())
+            max_abs_diff = float(abs_diff.max())
+            bias = float(diff.values[valid_mask].mean())
+            overlap_fraction = float(valid_mask.sum() / valid_mask.size)
+        else:
+            mean_abs_diff = float("nan")
+            max_abs_diff = float("nan")
+            bias = float("nan")
+            overlap_fraction = 0.0
+        return {
+            "against_source": primary_source,
+            "dataset_id": secondary_source,
+            "role": secondary_role,
+            "mean_abs_diff": mean_abs_diff,
+            "max_abs_diff": max_abs_diff,
+            "mean_bias": bias,
+            "overlap_fraction": overlap_fraction,
+        }
+
+    def _dataset_manifest_metadata(self, dataset: xr.Dataset) -> dict[str, Any]:
+        payload = dataset.attrs.get("source_metadata_json")
+        if not payload:
+            return {}
+        try:
+            return json.loads(payload)
+        except Exception:
+            return {}
+
+    def _missing_family_metadata(self, variable_family: str, day: date) -> dict[str, Any]:
+        attempted = [
+            {
+                "dataset_id": config.dataset_id,
+                "role": config.role,
+                "path": str(self._resolve_source_path(config, day)),
+                "status": "missing",
+            }
+            for config in sorted(self._source_registry.get(variable_family, ()), key=lambda item: (item.quality_rank, item.dataset_id))
+        ]
+        return {
+            "variable_family": variable_family,
+            "resolved_source": None,
+            "resolved_role": None,
+            "resolved_path": None,
+            "fallback_chain": attempted,
+            "comparison_summary": [],
+            "secondary_sources": [],
+            "validation_status": "missing",
+        }
+
+    def _monthly_chirps(self, day: date) -> ResolvedVariable | None:
+        try:
+            return self._resolve_variable_family("precip_monthly", day)
+        except FileNotFoundError:
             return None
-        if self._chirps_cache is None:
-            self._chirps_cache = _align_to_standard_grid(xr.open_dataset(path, engine="netcdf4"), method="nearest")
-        ds = self._chirps_cache
-        var_name = "precip" if "precip" in ds.data_vars else list(ds.data_vars)[0]
-        selected = ds[var_name].sel(time=np.datetime64(day.replace(day=1).isoformat()), method="nearest").drop_vars("time", errors="ignore")
-        selected.attrs["units"] = "mm/month"
-        return selected
 
     def _elevation(self) -> xr.Dataset:
         if self._elevation_cache is None:

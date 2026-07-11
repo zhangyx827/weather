@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import zipfile
 from datetime import date, datetime, timezone
@@ -16,7 +17,14 @@ def _write_dataset(path: Path, ds: xr.Dataset) -> None:
     ds.to_netcdf(path)
 
 
-def _build_fake_raw_tree(root: Path) -> Path:
+def _build_fake_raw_tree(
+    root: Path,
+    *,
+    include_oisst: bool = True,
+    include_jpl_mur: bool = False,
+    oisst_value_c: float = 25.0,
+    jpl_value_c: float = 27.0,
+) -> Path:
     raw_root = root / "data" / "raw"
     single_dir = raw_root / "era5_single_levels_2025"
     pressure_dir = raw_root / "era5_pressure_levels_2025"
@@ -143,11 +151,24 @@ def _build_fake_raw_tree(root: Path) -> Path:
     )
     _write_dataset(dust_dir / "MERRA2_20250101.nc4", dust)
 
-    sst = xr.Dataset(
-        {"sst": (("time", "lat", "lon"), np.full((1, len(lats), len(lons)), 25.0, dtype=np.float32), {"units": "degC"})},
-        coords={"time": np.array(["2025-01-01"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
-    )
-    _write_dataset(sst_dir / "oisst.day.mean.2025.nc", sst)
+    if include_oisst:
+        sst = xr.Dataset(
+            {"sst": (("time", "lat", "lon"), np.full((1, len(lats), len(lons)), oisst_value_c, dtype=np.float32), {"units": "degC"})},
+            coords={"time": np.array(["2025-01-01"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
+        )
+        _write_dataset(sst_dir / "oisst.day.mean.2025.nc", sst)
+    if include_jpl_mur:
+        jpl = xr.Dataset(
+            {
+                "analysed_sst": (
+                    ("time", "lat", "lon"),
+                    np.full((1, len(lats), len(lons)), jpl_value_c, dtype=np.float32),
+                    {"units": "degC"},
+                )
+            },
+            coords={"time": np.array(["2025-01-01"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
+        )
+        _write_dataset(sst_dir / "jplMURSST41_72e4_84a7_e7ac.nc", jpl)
 
     chirps = xr.Dataset(
         {"precip": (("time", "latitude", "longitude"), np.full((1, len(lats), len(lons)), 31.0, dtype=np.float32), {"units": "mm/month"})},
@@ -193,6 +214,15 @@ class TestBuildInputs:
         assert float(ds["daily_precip_total"].min()) >= 0.0
         assert not np.isinf(ds["convective_precip_ratio"].values).any()
         assert not np.isinf(ds["gpm_era5_precip_ratio"].values).any()
+        source_metadata = json.loads(ds.attrs["source_metadata_json"])
+        assert source_metadata["resolved_sources"]["sst"]["resolved_source"] == "oisst"
+        assert source_metadata["validation_status"]["sst"] == "primary_only"
+        assert source_metadata["resolved_sources"]["dust"]["resolved_source"] == "merra2_dust"
+        assert source_metadata["validation_status"]["dust"] == "primary_only"
+        assert source_metadata["resolved_sources"]["precip_daily"]["resolved_source"] == "gpm_imerg_daily"
+        assert source_metadata["validation_status"]["precip_daily"] == "compared"
+        assert source_metadata["resolved_sources"]["precip_monthly"]["resolved_source"] == "chirps_monthly"
+        assert source_metadata["validation_status"]["precip_monthly"] == "primary_only"
 
     def test_build_aurora_input_uses_namespaced_variables(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,3 +245,83 @@ class TestBuildInputs:
         assert ds["surf_2t"].dims == ("time", "lat", "lon")
         assert ds["atmos_q"].dims == ("time", "level", "lat", "lon")
         assert list(ds["level"].values) == list(PRESSURE_LEVELS)
+
+    def test_build_daily_indicators_uses_primary_sst_and_compares_secondary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = _build_fake_raw_tree(
+                Path(tmp),
+                include_oisst=True,
+                include_jpl_mur=True,
+                oisst_value_c=25.0,
+                jpl_value_c=27.0,
+            )
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=Path(tmp) / "aurora",
+                indicator_nc_out=Path(tmp) / "nc",
+                indicator_parquet_out=Path(tmp) / "pq",
+            )
+            try:
+                ds = builder.build_daily_indicators(date(2025, 1, 1))
+            finally:
+                builder.close()
+
+        assert float(ds["sst_celsius"].isel(time=0, latitude=0, longitude=0)) == 25.0
+        source_metadata = json.loads(ds.attrs["source_metadata_json"])
+        sst_meta = source_metadata["resolved_sources"]["sst"]
+        assert sst_meta["resolved_source"] == "oisst"
+        assert sst_meta["secondary_sources"] == ["jpl_mur"]
+        assert sst_meta["comparison_summary"][0]["dataset_id"] == "jpl_mur"
+        assert sst_meta["comparison_summary"][0]["mean_abs_diff"] == 2.0
+        assert source_metadata["validation_status"]["sst"] == "compared"
+        precip_meta = source_metadata["resolved_sources"]["precip_daily"]
+        assert precip_meta["comparison_summary"][0]["against_source"] == "era5"
+        assert np.isclose(precip_meta["comparison_summary"][0]["mean_abs_diff"], 9.0)
+
+    def test_build_daily_indicators_falls_back_to_secondary_sst(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = _build_fake_raw_tree(
+                Path(tmp),
+                include_oisst=False,
+                include_jpl_mur=True,
+                jpl_value_c=27.0,
+            )
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=Path(tmp) / "aurora",
+                indicator_nc_out=Path(tmp) / "nc",
+                indicator_parquet_out=Path(tmp) / "pq",
+            )
+            try:
+                ds = builder.build_daily_indicators(date(2025, 1, 1))
+            finally:
+                builder.close()
+
+        assert float(ds["sst_celsius"].isel(time=0, latitude=0, longitude=0)) == 27.0
+        source_metadata = json.loads(ds.attrs["source_metadata_json"])
+        sst_meta = source_metadata["resolved_sources"]["sst"]
+        assert sst_meta["resolved_source"] == "jpl_mur"
+        assert sst_meta["fallback_chain"][0]["status"] == "missing"
+        assert sst_meta["fallback_chain"][1]["status"] == "available"
+
+    def test_build_manifest_includes_source_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_root = _build_fake_raw_tree(root, include_oisst=True, include_jpl_mur=True)
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=root / "aurora",
+                indicator_nc_out=root / "nc",
+                indicator_parquet_out=root / "pq",
+            )
+            try:
+                builder.build(date(2025, 1, 1), date(2025, 1, 1))
+            finally:
+                builder.close()
+
+            manifest = json.loads((root / "build_manifest.json").read_text(encoding="utf-8"))
+
+        indicator_entry = next(entry for entry in manifest if entry["kind"] == "indicator_nc")
+        assert indicator_entry["metadata"]["resolved_sources"]["sst"]["resolved_source"] == "oisst"
+        assert indicator_entry["metadata"]["resolved_sources"]["dust"]["resolved_source"] == "merra2_dust"
+        assert indicator_entry["metadata"]["resolved_sources"]["precip_daily"]["resolved_source"] == "gpm_imerg_daily"
