@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from mazu_saudi.data import check_missing_values, read_json_features
+from mazu_saudi.data import check_missing_values, indicator_point_from_netcdf, read_json_features
 from mazu_saudi.agent.briefing import build_warning_product
 from mazu_saudi.forecast import MockForecastProvider
 from mazu_saudi.indicators import (
@@ -21,7 +21,7 @@ from mazu_saudi.indicators import (
 )
 from mazu_saudi.kg import HazardKnowledgeGraph
 from mazu_saudi.risk import all_default_models
-from mazu_saudi.schemas import MeteorologicalFeatures
+from mazu_saudi.schemas import IndicatorFieldSet, MeteorologicalFeatures
 from mazu_saudi.utils.math import is_missing
 
 try:
@@ -35,7 +35,7 @@ if BaseModel is not None:
         """Pydantic workflow context for API/runtime validation."""
 
         model_config = ConfigDict(arbitrary_types_allowed=True)
-        features: MeteorologicalFeatures | dict[str, Any]
+        features: IndicatorFieldSet | MeteorologicalFeatures | dict[str, Any]
         trace: list[str] = Field(default_factory=list)
         node_trace: list[dict[str, Any]] = Field(default_factory=list)
         errors: list[dict[str, Any]] = Field(default_factory=list)
@@ -45,7 +45,7 @@ else:
     class WorkflowContext:
         """Fallback context with the same public fields when pydantic is absent."""
 
-        features: MeteorologicalFeatures | dict[str, Any]
+        features: IndicatorFieldSet | MeteorologicalFeatures | dict[str, Any]
         trace: list[str] = field(default_factory=list)
         node_trace: list[dict[str, Any]] = field(default_factory=list)
         errors: list[dict[str, Any]] = field(default_factory=list)
@@ -93,11 +93,21 @@ class DataCheckNode(WorkflowNode):
     def run(self, context: Context) -> Context:
         features = context.get("features")
         if isinstance(features, dict):
-            features = MeteorologicalFeatures.from_dict(features)
-        if not isinstance(features, MeteorologicalFeatures):
-            raise ValueError("context['features'] must be MeteorologicalFeatures or dict")
+            features = IndicatorFieldSet.from_dict(features) if "values" in features else MeteorologicalFeatures.from_dict(features)
+        if not isinstance(features, (IndicatorFieldSet, MeteorologicalFeatures)):
+            raise ValueError("context['features'] must be IndicatorFieldSet, MeteorologicalFeatures, or dict")
         context["features"] = features
-        context["data_quality"] = check_missing_values(features)
+        context["input_contract"] = "indicator_field_set" if isinstance(features, IndicatorFieldSet) else "meteorological_features"
+        if isinstance(features, IndicatorFieldSet):
+            missing = [
+                name
+                for name in ("t2m_c", "rh2m", "vpd_kpa", "heat_index_c", "wind10_speed")
+                if features.values.get(name) is None
+            ]
+            context["data_quality"] = {"ok": not missing, "missing_count": len(missing), "missing": missing}
+            context["indicators"] = dict(features.values)
+        else:
+            context["data_quality"] = check_missing_values(features)
         context.setdefault("trace", []).append(self.name)
         return context
 
@@ -122,6 +132,11 @@ class ForecastNode(WorkflowNode):
         self.provider = provider or MockForecastProvider()
 
     def run(self, context: Context) -> Context:
+        if isinstance(context["features"], IndicatorFieldSet):
+            context["forecast_fields"] = {}
+            context["forecast_confidence"] = {"status": "not_required", "provider": "processed_indicator_dataset"}
+            context.setdefault("trace", []).append(self.name)
+            return context
         features: MeteorologicalFeatures = context["features"]
         forecast = self.provider.get_forecast(features.valid_time, lead_hours=0)
         context["forecast_fields"] = {key: field.to_dict() for key, field in forecast.items()}
@@ -136,6 +151,15 @@ class IndicatorDeriveNode(WorkflowNode):
     name = "indicator_derive"
 
     def run(self, context: Context) -> Context:
+        if isinstance(context["features"], IndicatorFieldSet):
+            indicators = context["features"].values
+            required = ("t2m_c", "rh2m", "vpd_kpa", "heat_index_c", "wind10_speed")
+            context["indicator_status"] = {
+                name: (name in indicators and not is_missing(indicators.get(name)))
+                for name in required
+            }
+            context.setdefault("trace", []).append(self.name)
+            return context
         features: MeteorologicalFeatures = context["features"]
         pwat = features.pwat_mm if not is_missing(features.pwat_mm) else compute_pwat_placeholder(features.temp_c, features.rh_percent, features.pressure_hpa)
         ivt = features.ivt_kg_m_s if not is_missing(features.ivt_kg_m_s) else compute_ivt_placeholder(features.wind_speed_mps or 0.0, pwat)
@@ -163,7 +187,7 @@ class ModelInferenceNode(WorkflowNode):
         self.models = models or all_default_models()
 
     def run(self, context: Context) -> Context:
-        features: MeteorologicalFeatures = context["features"]
+        features = context["features"]
         context["risks"] = [model.predict(features) for model in self.models]
         context.setdefault("trace", []).append(self.name)
         return context
@@ -193,6 +217,8 @@ class EvidenceCheckNode(WorkflowNode):
 
     def run(self, context: Context) -> Context:
         required_indicators = ["vpd_kpa", "heat_index_c", "pwat_mm", "ivt_kg_m_s", "cape_j_kg"]
+        if isinstance(context["features"], IndicatorFieldSet):
+            required_indicators = ["vpd_kpa", "heat_index_c", "pwat", "ivt", "cape"]
         indicators = context.get("indicators", {})
         indicator_status = {
             name: (name in indicators and not is_missing(indicators.get(name)))
@@ -204,6 +230,7 @@ class EvidenceCheckNode(WorkflowNode):
             risk_status[risk.hazard_type] = {
                 "has_model_version": bool(risk.model_version or risk.evidence.get("model_version")),
                 "has_contributing_factors": bool(risk.contributing_factors),
+                "has_indicator_evidence": bool(risk.indicator_evidence),
                 "high_risk_requires_factors_ok": (not high_risk) or bool(risk.contributing_factors),
             }
         context["evidence_status"] = {
@@ -222,7 +249,7 @@ class BriefingNode(WorkflowNode):
     name = "briefing"
 
     def run(self, context: Context) -> Context:
-        features: MeteorologicalFeatures = context["features"]
+        features = context["features"]
         area = features.grid.region or features.grid.id
         context["warning_product"] = build_warning_product(area, context["risks"], context["kg_explanation"])
         context.setdefault("trace", []).append(self.name)
@@ -270,7 +297,7 @@ class SaudiWarningPipeline:
             PublishNode(),
         ]
 
-    def run(self, features: MeteorologicalFeatures | dict[str, Any]) -> Context:
+    def run(self, features: IndicatorFieldSet | MeteorologicalFeatures | dict[str, Any]) -> Context:
         """Run all workflow nodes."""
 
         workflow_context = WorkflowContext(features=features)
@@ -327,4 +354,25 @@ def run_demo_pipeline() -> dict[str, Any]:
         "evidence_status": context["evidence_status"],
         "human_review": context["human_review"],
         "warning_product": context["publish_payload"],
+    }
+
+
+def run_indicator_netcdf_pipeline(path: str | Path, latitude: float, longitude: float, region: str | None = None) -> dict[str, Any]:
+    """Run the agent against one point selected from a processed indicator NetCDF."""
+
+    features = indicator_point_from_netcdf(path, latitude, longitude, region=region)
+    context = SaudiWarningPipeline().run(features)
+    return {
+        "trace": context["trace"],
+        "pipeline_trace": context["node_trace"],
+        "errors": context.get("errors", []),
+        "input_contract": context.get("input_contract"),
+        "data_quality": context.get("data_quality", {}),
+        "features": context["features"].to_dict(),
+        "indicators": context.get("indicators", {}),
+        "risks": [risk.to_dict() for risk in context.get("risks", [])],
+        "kg_explanation": context.get("kg_explanation", {}),
+        "evidence_status": context.get("evidence_status", {}),
+        "human_review": context.get("human_review", {}),
+        "warning_product": context.get("publish_payload", {}),
     }

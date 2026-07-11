@@ -36,6 +36,22 @@ class APITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("pipeline_trace", response.json())
 
+    def test_indicator_netcdf_warning_endpoint(self):
+        response = self._request(
+            "POST",
+            "/warning/generate-from-netcdf",
+            json={
+                "path": "data/processed/lightgbm_indicators_nc/saudi_indicators_20250101.nc",
+                "latitude": 24.7,
+                "longitude": 46.7,
+                "region": "Riyadh",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["input_contract"], "indicator_field_set")
+        self.assertEqual(len(payload["risks"]), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

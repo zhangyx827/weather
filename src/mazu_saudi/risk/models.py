@@ -21,10 +21,41 @@ from mazu_saudi.indicators import (
     compute_pwat_placeholder,
     compute_vpd_kpa,
 )
-from mazu_saudi.schemas import HazardRisk, MeteorologicalFeatures
+from mazu_saudi.schemas import HazardRisk, IndicatorFieldSet, MeteorologicalFeatures
 from mazu_saudi.utils.math import clamp, is_missing
 from .levels import RiskThresholdConfig, probability_to_level
 from .ml import OptionalMLAdapter, create_ml_adapter
+
+
+RiskInput = IndicatorFieldSet | MeteorologicalFeatures
+
+
+def _value(record: RiskInput, *indicator_names: str, legacy: str | None = None, default: Any = None) -> Any:
+    if isinstance(record, IndicatorFieldSet):
+        for name in indicator_names:
+            if name in record.values:
+                return record.values.get(name)
+        return default
+    if legacy is not None:
+        return getattr(record, legacy, default)
+    for name in indicator_names:
+        if hasattr(record, name):
+            return getattr(record, name)
+    return default
+
+
+def _indicator_evidence(record: RiskInput, names: list[str]) -> dict[str, Any]:
+    if not isinstance(record, IndicatorFieldSet):
+        return {}
+    return {name: record.values.get(name) for name in names if name in record.values}
+
+
+def _input_grid(record: RiskInput):
+    return record.grid
+
+
+def _input_valid_time(record: RiskInput):
+    return record.valid_time
 
 
 class BaseRiskModel(ABC):
@@ -50,21 +81,24 @@ class BaseRiskModel(ABC):
         self.metadata = metadata or {}
 
     @abstractmethod
-    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
+    def predict(self, features: RiskInput) -> HazardRisk:
         """Predict one hazard risk."""
 
-    def predict_one(self, features: MeteorologicalFeatures | dict[str, Any]) -> HazardRisk:
+    def predict_one(self, features: RiskInput | dict[str, Any]) -> HazardRisk:
         """Predict one hazard risk with dict/dataclass input compatibility."""
 
-        normalized = MeteorologicalFeatures.from_dict(features) if isinstance(features, dict) else features
+        if isinstance(features, dict):
+            normalized = IndicatorFieldSet.from_dict(features) if "values" in features else MeteorologicalFeatures.from_dict(features)
+        else:
+            normalized = features
         return self.predict(normalized)
 
-    def predict_batch(self, features_list: list[MeteorologicalFeatures | dict[str, Any]]) -> list[HazardRisk]:
+    def predict_batch(self, features_list: list[RiskInput | dict[str, Any]]) -> list[HazardRisk]:
         """Predict a list of feature records."""
 
         return [self.predict_one(features) for features in features_list]
 
-    def explain(self, features: MeteorologicalFeatures | dict[str, Any]) -> dict[str, Any]:
+    def explain(self, features: RiskInput | dict[str, Any]) -> dict[str, Any]:
         """Return contributing factors and model metadata for one prediction."""
 
         risk = self.predict_one(features)
@@ -83,20 +117,22 @@ class BaseRiskModel(ABC):
         payload = _load_config_mapping(path)
         self.threshold_config = RiskThresholdConfig.from_mapping(payload.get("risk_thresholds", payload))
 
-    def _risk(self, features: MeteorologicalFeatures, probability: float, factors: list[str], evidence: dict[str, Any]) -> HazardRisk:
+    def _risk(self, features: RiskInput, probability: float, factors: list[str], evidence: dict[str, Any]) -> HazardRisk:
         p = clamp(probability)
+        indicator_evidence = dict(evidence.pop("indicator_evidence", {}))
 
         return HazardRisk(
             hazard_type=self.hazard_type,
             risk_probability=p,
             risk_level=probability_to_level(p, self.threshold_config),
             contributing_factors=factors or ["未触发显著阈值"],
-            grid=features.grid,
-            valid_time=features.valid_time,
+            grid=_input_grid(features),
+            valid_time=_input_valid_time(features),
             model_name=self.model_name,
             model_version=self.model_version,
             metadata={"threshold_config": self.threshold_config.to_dict(), **self.metadata},
             evidence={"model_version": self.model_version, **evidence},
+            indicator_evidence=indicator_evidence,
         )
 
 
@@ -125,13 +161,13 @@ class MLBackedRiskModel(BaseRiskModel):
         self.adapter.load_model(path)
         return self
 
-    def predict_proba(self, features: MeteorologicalFeatures | dict[str, Any]) -> float:
+    def predict_proba(self, features: RiskInput | dict[str, Any]) -> float:
         return clamp(self.adapter.predict_proba(features))
 
-    def shap_explain(self, features: MeteorologicalFeatures | dict[str, Any]) -> dict[str, Any]:
+    def shap_explain(self, features: RiskInput | dict[str, Any]) -> dict[str, Any]:
         return self.adapter.shap_explain(features)
 
-    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
+    def predict(self, features: RiskInput) -> HazardRisk:
         probability = self.predict_proba(features)
         explanation = self.shap_explain(features)
         factors = ["ML模型占位接口已执行"] if not explanation.get("values") else list(explanation["values"].keys())
@@ -143,25 +179,32 @@ class FlashFloodRiskModel(RuleBasedRiskModel):
 
     hazard_type = "flash_flood"
 
-    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
+    def predict(self, features: RiskInput) -> HazardRisk:
+        p1 = _value(features, "ds10_max_1h", legacy="precip_1h_mm")
+        p6 = _value(features, "ds10_max_6h", "precip_6h", legacy="precip_6h_mm")
+        p24 = _value(features, "daily_precip_total", "gpm_daily_precip", legacy="precip_24h_mm")
+        slope = _value(features, "slope_deg", legacy="slope_deg")
+        soil = _value(features, "soil_moisture_frac", legacy="soil_moisture_frac")
+        impervious = _value(features, "impervious_frac", legacy="impervious_frac")
         score = compute_flash_flood_screening_score(
-            features.precip_1h_mm,
-            features.precip_6h_mm,
-            features.precip_24h_mm,
-            features.slope_deg,
-            features.soil_moisture_frac,
-            features.impervious_frac,
+            p1,
+            p6,
+            p24,
+            slope,
+            soil,
+            impervious,
         )
         factors = []
-        if (features.precip_1h_mm or 0) >= 25:
+        if (p1 or 0) >= 25:
             factors.append("1小时强降水超过山洪初筛阈值")
-        if (features.precip_6h_mm or 0) >= 60:
+        if (p6 or 0) >= 60:
             factors.append("6小时累计降水偏高")
-        if (features.slope_deg or 0) >= 12:
+        if (slope or 0) >= 12:
             factors.append("地形坡度提高汇流速度")
-        if (features.impervious_frac or 0) >= 0.35:
+        if (impervious or 0) >= 0.35:
             factors.append("不透水面比例较高")
-        return self._risk(features, score, factors, {"screening_score": score})
+        evidence_names = ["ds10_max_1h", "ds10_max_6h", "daily_precip_total", "gpm_daily_precip", "slope_deg"]
+        return self._risk(features, score, factors, {"screening_score": score, "indicator_evidence": _indicator_evidence(features, evidence_names)})
 
 
 class ExtremeHeatRiskModel(RuleBasedRiskModel):
@@ -169,9 +212,13 @@ class ExtremeHeatRiskModel(RuleBasedRiskModel):
 
     hazard_type = "extreme_heat"
 
-    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
-        hi = compute_heat_index_c(features.temp_c, features.rh_percent)
-        temp = 0.0 if is_missing(features.temp_c) else float(features.temp_c)
+    def predict(self, features: RiskInput) -> HazardRisk:
+        temp_raw = _value(features, "t2m_c", legacy="temp_c")
+        rh_raw = _value(features, "rh2m", legacy="rh_percent")
+        hi = _value(features, "heat_index_c")
+        if is_missing(hi):
+            hi = compute_heat_index_c(temp_raw, rh_raw)
+        temp = 0.0 if is_missing(temp_raw) else float(temp_raw)
         hi_value = temp if is_missing(hi) else float(hi)
         probability = max((temp - 38.0) / 12.0, (hi_value - 41.0) / 12.0)
         if temp >= 45:
@@ -181,9 +228,10 @@ class ExtremeHeatRiskModel(RuleBasedRiskModel):
             factors.append("气温达到极端高温关注阈值")
         if hi_value >= 45:
             factors.append("热指数显示人体热负荷显著升高")
-        if (features.rh_percent or 0) >= 55:
+        if (rh_raw or 0) >= 55:
             factors.append("湿度提高体感热风险")
-        return self._risk(features, probability, factors, {"heat_index_c": hi_value, "temp_c": temp})
+        evidence_names = ["t2m_c", "rh2m", "heat_index_c", "tmax_c", "hot_day_flag", "hot_night_flag"]
+        return self._risk(features, probability, factors, {"heat_index_c": hi_value, "t2m_c": temp, "indicator_evidence": _indicator_evidence(features, evidence_names)})
 
 
 class DryHeatStressRiskModel(RuleBasedRiskModel):
@@ -191,22 +239,29 @@ class DryHeatStressRiskModel(RuleBasedRiskModel):
 
     hazard_type = "dry_heat_agriculture"
 
-    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
+    def predict(self, features: RiskInput) -> HazardRisk:
+        temp = _value(features, "t2m_c", legacy="temp_c")
+        rh = _value(features, "rh2m", legacy="rh_percent")
+        wind = _value(features, "wind10_speed", legacy="wind_speed_mps")
+        vegetation = _value(features, "vegetation_index", legacy="vegetation_index")
         score = compute_dry_heat_stress_score(
-            features.temp_c,
-            features.rh_percent,
-            features.wind_speed_mps,
-            features.vegetation_index,
+            temp,
+            rh,
+            wind,
+            vegetation,
         )
-        vpd = compute_vpd_kpa(features.temp_c, features.rh_percent)
+        vpd = _value(features, "vpd_kpa")
+        if is_missing(vpd):
+            vpd = compute_vpd_kpa(temp, rh)
         factors = []
         if not is_missing(vpd) and float(vpd) >= 4:
             factors.append("VPD偏高，作物蒸散胁迫增强")
-        if (features.temp_c or 0) >= 40:
+        if (temp or 0) >= 40:
             factors.append("高温增加干热胁迫")
-        if (features.wind_speed_mps or 0) >= 8:
+        if (wind or 0) >= 8:
             factors.append("较大风速增强蒸发")
-        return self._risk(features, score, factors, {"vpd_kpa": None if is_missing(vpd) else float(vpd), "screening_score": score})
+        evidence_names = ["t2m_c", "rh2m", "vpd_kpa", "wind10_speed", "bowen_ratio"]
+        return self._risk(features, score, factors, {"vpd_kpa": None if is_missing(vpd) else float(vpd), "screening_score": score, "indicator_evidence": _indicator_evidence(features, evidence_names)})
 
 
 class DustPotentialRiskModel(RuleBasedRiskModel):
@@ -214,24 +269,33 @@ class DustPotentialRiskModel(RuleBasedRiskModel):
 
     hazard_type = "dust_potential"
 
-    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
+    def predict(self, features: RiskInput) -> HazardRisk:
+        wind = _value(features, "wind10_speed", legacy="wind_speed_mps")
+        gust = _value(features, "wind_gust_mps", legacy="wind_gust_mps")
+        soil = _value(features, "soil_moisture_frac", legacy="soil_moisture_frac")
+        vegetation = _value(features, "vegetation_index", legacy="vegetation_index")
+        visibility = _value(features, "visibility_km", legacy="visibility_km")
         score = compute_dust_potential_score(
-            features.wind_speed_mps,
-            features.wind_gust_mps,
-            features.soil_moisture_frac,
-            features.vegetation_index,
-            features.visibility_km,
+            wind,
+            gust,
+            soil,
+            vegetation,
+            visibility,
         )
+        dust_risk = _value(features, "dust_risk_proxy")
+        if not is_missing(dust_risk):
+            score = max(score, float(dust_risk))
         factors = []
-        if (features.wind_speed_mps or 0) >= 12:
+        if (wind or 0) >= 12:
             factors.append("近地面风速达到起沙关注阈值")
-        if (features.wind_gust_mps or 0) >= 18:
+        if (gust or 0) >= 18:
             factors.append("阵风增强扬沙潜势")
-        if (features.soil_moisture_frac or 1) <= 0.12:
+        if (soil or 1) <= 0.12:
             factors.append("土壤干燥利于起沙")
-        if (features.visibility_km or 99) <= 5:
+        if (visibility or 99) <= 5:
             factors.append("能见度下降提示沙尘影响")
-        return self._risk(features, score, factors, {"screening_score": score})
+        evidence_names = ["wind10_speed", "strong_wind_flag", "dust_aod", "dust_surface_mass", "dust_risk_proxy"]
+        return self._risk(features, score, factors, {"screening_score": score, "indicator_evidence": _indicator_evidence(features, evidence_names)})
 
 
 class CoastalHumidHeatRiskModel(RuleBasedRiskModel):
@@ -239,27 +303,37 @@ class CoastalHumidHeatRiskModel(RuleBasedRiskModel):
 
     hazard_type = "coastal_humid_heat"
 
-    def predict(self, features: MeteorologicalFeatures) -> HazardRisk:
-        pwat = features.pwat_mm
+    def predict(self, features: RiskInput) -> HazardRisk:
+        temp = _value(features, "t2m_c", legacy="temp_c")
+        rh = _value(features, "rh2m", legacy="rh_percent")
+        wind = _value(features, "wind10_speed", legacy="wind_speed_mps", default=0.0)
+        pressure_hpa = _value(features, "surface_pressure", legacy="pressure_hpa")
+        if not is_missing(pressure_hpa) and pressure_hpa and pressure_hpa > 2000:
+            pressure_hpa = float(pressure_hpa) / 100.0
+        pwat = _value(features, "pwat", legacy="pwat_mm")
         if is_missing(pwat):
-            pwat = compute_pwat_placeholder(features.temp_c, features.rh_percent, features.pressure_hpa)
-        ivt = features.ivt_kg_m_s
+            pwat = compute_pwat_placeholder(temp, rh, pressure_hpa)
+        ivt = _value(features, "ivt", legacy="ivt_kg_m_s")
         if is_missing(ivt):
-            ivt = compute_ivt_placeholder(features.wind_speed_mps or 0.0, pwat)
-        hi = compute_heat_index_c(features.temp_c, features.rh_percent)
-        coastal_factor = 1.0 - clamp(((features.coastal_distance_km if features.coastal_distance_km is not None else 120.0) - 20.0) / 180.0)
-        probability = 0.35 * clamp(((features.rh_percent or 0) - 55.0) / 35.0)
+            ivt = compute_ivt_placeholder(wind or 0.0, pwat)
+        hi = _value(features, "heat_index_c")
+        if is_missing(hi):
+            hi = compute_heat_index_c(temp, rh)
+        coastal_distance = _value(features, "coastal_distance_km", legacy="coastal_distance_km", default=120.0)
+        coastal_factor = 1.0 - clamp(((coastal_distance if coastal_distance is not None else 120.0) - 20.0) / 180.0)
+        probability = 0.35 * clamp(((rh or 0) - 55.0) / 35.0)
         probability += 0.30 * clamp((float(hi) - 38.0) / 12.0) if not is_missing(hi) else 0.0
         probability += 0.20 * clamp((float(pwat) - 35.0) / 25.0) if not is_missing(pwat) else 0.0
         probability += 0.15 * coastal_factor
         factors = []
-        if (features.coastal_distance_km or 999) <= 80:
+        if (coastal_distance or 999) <= 80:
             factors.append("靠近红海或海湾沿岸，湿热暴露较高")
-        if (features.rh_percent or 0) >= 65:
+        if (rh or 0) >= 65:
             factors.append("相对湿度较高")
         if not is_missing(ivt) and float(ivt) >= 250:
             factors.append("水汽输送占位指标偏强")
-        return self._risk(features, probability, factors, {"pwat_mm": None if is_missing(pwat) else float(pwat), "ivt_kg_m_s": None if is_missing(ivt) else float(ivt)})
+        evidence_names = ["rh2m", "heat_index_c", "pwat", "ivt", "sst_celsius"]
+        return self._risk(features, probability, factors, {"pwat": None if is_missing(pwat) else float(pwat), "ivt": None if is_missing(ivt) else float(ivt), "indicator_evidence": _indicator_evidence(features, evidence_names)})
 
 
 def all_default_models() -> list[BaseRiskModel]:

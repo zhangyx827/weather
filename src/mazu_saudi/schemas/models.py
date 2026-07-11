@@ -107,6 +107,44 @@ class MeteorologicalFeatures:
 
 
 @dataclass
+class IndicatorFieldSet:
+    """Canonical indicator vector for one Saudi grid cell.
+
+    The ``values`` keys intentionally match indicator NetCDF variable names.
+    This is the primary risk/agent contract for processed indicator products.
+    """
+
+    grid: GridCell
+    valid_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    values: dict[str, float | int | None] = field(default_factory=dict)
+    units: dict[str, str] = field(default_factory=dict)
+    source: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "IndicatorFieldSet":
+        grid_payload = payload.get("grid", {})
+        grid = grid_payload if isinstance(grid_payload, GridCell) else GridCell(**grid_payload)
+        valid_time = payload.get("valid_time")
+        if isinstance(valid_time, str):
+            valid_time = datetime.fromisoformat(valid_time.replace("Z", "+00:00"))
+        elif valid_time is None:
+            valid_time = datetime.now(timezone.utc)
+        return cls(
+            grid=grid,
+            valid_time=valid_time,
+            values=dict(payload.get("values", {})),
+            units=dict(payload.get("units", {})),
+            source=payload.get("source"),
+        )
+
+    def get(self, name: str, default: Any = None) -> Any:
+        return self.values.get(name, default)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+
+@dataclass
 class ForecastField:
     """Standard forecast field container."""
 
@@ -136,6 +174,7 @@ class HazardRisk:
     model_version: str = "v1"
     metadata: dict[str, Any] = field(default_factory=dict)
     evidence: dict[str, Any] = field(default_factory=dict)
+    indicator_evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)

@@ -189,6 +189,8 @@ class TestBuildInputs:
         assert int(ds.sizes["time"]) == 1
         assert "missing_indicator_groups" in ds.attrs
         assert np.isfinite(ds["vpd_kpa"].values).any()
+        assert float(ds["pwat"].min()) >= 0.0
+        assert float(ds["daily_precip_total"].min()) >= 0.0
         assert not np.isinf(ds["convective_precip_ratio"].values).any()
         assert not np.isinf(ds["gpm_era5_precip_ratio"].values).any()
 

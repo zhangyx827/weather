@@ -156,8 +156,11 @@ def _daily_sum_from_accum(da: xr.DataArray, name: str, units: str = "") -> xr.Da
     if diff.sizes.get("time", 0) == 0:
         empty = da.isel(time=slice(0, 0)).rename(name)
         return empty
+    diff = diff.clip(min=0.0)
     valid_hours = diff["time"].dt.hour
-    daily = diff.where(valid_hours != 0, da.sel(time=diff["time"])).resample(time="1D").sum(skipna=True)
+    reset_values = da.sel(time=diff["time"]).clip(min=0.0)
+    daily = diff.where(valid_hours != 0, reset_values).resample(time="1D").sum(skipna=True)
+    daily = daily.clip(min=0.0)
     daily = daily.rename(name)
     if units:
         daily.attrs["units"] = units
@@ -284,6 +287,17 @@ def _ivt_components(q: xr.DataArray, u: xr.DataArray, v: xr.DataArray) -> tuple[
     for item in (ivt_u, ivt_v, ivt):
         item.attrs["units"] = "kg m-1 s-1"
     return ivt_u, ivt_v, ivt
+
+
+def _pwat_mm(q: xr.DataArray) -> xr.DataArray:
+    gravity = 9.80665
+    pressure = q["level"]
+    pressure_pa = xr.where(pressure.max(skipna=True) < 2000.0, pressure * 100.0, pressure)
+    order = np.argsort(pressure_pa.values)
+    q_sorted = q.isel(level=order).assign_coords(level=pressure_pa.isel(level=order))
+    pwat = (q_sorted.integrate("level") / gravity).clip(min=0.0).rename("pwat")
+    pwat.attrs["units"] = "mm"
+    return pwat
 
 
 def _horizontal_gradients(da: xr.DataArray, lat_name: str = "latitude", lon_name: str = "longitude") -> tuple[xr.DataArray, xr.DataArray]:
@@ -585,7 +599,7 @@ class RawInputBuilder:
         omega700 = _select_level(w, 700).rename("omega700")
         omega500 = _select_level(w, 500).rename("omega500")
         geopotential_height500 = (_select_level(z, 500) / 9.80665).rename("geopotential_height500")
-        pwat = (((q * 100.0).integrate("level")) / 9.80665).rename("pwat")
+        pwat = _pwat_mm(q)
         ivt_div_y, ivt_div_x = _horizontal_gradients(ivt_v)
         ivt_u_y, ivt_u_x = _horizontal_gradients(ivt_u)
         ivt_divergence = (ivt_u_x + ivt_div_y).rename("ivt_divergence")

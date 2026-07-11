@@ -19,6 +19,12 @@ from .io import (
     write_netcdf_dataset,
     write_zarr_dataset,
 )
+from .indicator_features import (
+    highest_indicator_point_from_dataset,
+    indicator_point_from_dataset,
+    indicator_point_from_netcdf,
+    read_indicator_dataset,
+)
 from .srtm import (
     SRTMElevationIndex,
     discover_srtm_tiles,
@@ -43,6 +49,10 @@ __all__ = [
     "write_json_features",
     "write_netcdf_dataset",
     "write_zarr_dataset",
+    "highest_indicator_point_from_dataset",
+    "indicator_point_from_dataset",
+    "indicator_point_from_netcdf",
+    "read_indicator_dataset",
     "SRTMElevationIndex",
     "discover_srtm_tiles",
     "enrich_features_with_elevation",

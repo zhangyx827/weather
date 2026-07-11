@@ -126,6 +126,12 @@ class HazardKnowledgeGraph:
             self.add(indicator_id, "rdf:type", self.namespace + "MeteorologicalIndicator")
             self.add(risk_id, self.namespace + "hasContributingFactor", indicator_id)
             self.add(indicator_id, "rdfs:label", factor)
+        for name, value in risk.indicator_evidence.items():
+            indicator_id = self.namespace + f"indicator_{risk.hazard_type}_{name}"
+            self.add(indicator_id, "rdf:type", self.namespace + "MeteorologicalIndicator")
+            self.add(risk_id, self.namespace + "hasIndicatorEvidence", indicator_id)
+            self.add(indicator_id, "rdfs:label", name)
+            self.add(indicator_id, self.namespace + "hasIndicatorValue", str(value))
 
     def query_hazard_impacts(self, hazard_type: str) -> dict[str, list[str]]:
         """Return affected exposure objects and response actions for a hazard."""
