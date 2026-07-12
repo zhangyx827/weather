@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - environment dependent
     xr = None
 
 from mazu_saudi.data import read_netcdf_dataset
-from mazu_saudi.risk.layer4_features import LAYER4_FEATURE_NAMES, feature_matrix_from_dataset
+from mazu_saudi.risk import LightGBMLayer4Model
 
 TARGET_NETCDF = ROOT / "data" / "raw" / "era5_saudi_20250616.nc"
 TARGET_JSON = ROOT / "data" / "output" / "risk_probe_result.json"
@@ -387,128 +387,6 @@ def add_layer2_indicators(dataset: "xr.Dataset") -> "xr.Dataset":
     merged = xr.merge([ds, derived], compat="override")
     merged.attrs["layer2_indicators"] = "vpd_kpa, heat_index_c, wind_speed_mps, relative_humidity_percent"
     return merged
-
-
-def _levels_from_probability(probability: Any) -> Any:
-    p = np.asarray(probability)
-    return np.where(
-        p >= 0.70,
-        3,
-        np.where(
-            p >= 0.45,
-            2,
-            np.where(
-                p >= 0.20,
-                1,
-                0,
-            ),
-        ),
-    ).astype(np.int8)
-
-
-class LightGBMLayer4Model:
-    """Real Layer-4 inference backed by trained LightGBM booster files."""
-
-    feature_names = LAYER4_FEATURE_NAMES
-
-    def __init__(
-        self,
-        extreme_heat_model_path: str | Path | None = None,
-        dry_heat_model_path: str | Path | None = None,
-    ) -> None:
-        try:
-            import lightgbm as lgb
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError(
-                "lightgbm is required for real Layer-4 inference. "
-                "Install it with `pip install lightgbm` and provide trained model files."
-            ) from exc
-
-        self.lgb = lgb
-        self.extreme_heat_model_path = self._resolve_model_path(
-            explicit=extreme_heat_model_path,
-            env_key="MAZU_LAYER4_EXTREME_HEAT_MODEL",
-            default_name="extreme_heat.txt",
-        )
-        self.dry_heat_model_path = self._resolve_model_path(
-            explicit=dry_heat_model_path,
-            env_key="MAZU_LAYER4_DRY_HEAT_MODEL",
-            default_name="dry_heat_stress.txt",
-        )
-        self.extreme_heat_model = self._load_booster(self.extreme_heat_model_path)
-        self.dry_heat_model = self._load_booster(self.dry_heat_model_path)
-
-    @staticmethod
-    def _resolve_model_path(explicit: str | Path | None, env_key: str, default_name: str) -> Path:
-        raw_path = explicit or os.environ.get(env_key) or (DEFAULT_LAYER4_MODEL_DIR / default_name)
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            path = ROOT / path
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Layer-4 LightGBM model file not found: {path}. "
-                f"Set {env_key} to a trained LightGBM booster file."
-            )
-        return path
-
-    def _load_booster(self, path: Path) -> Any:
-        try:
-            return self.lgb.Booster(model_file=str(path))
-        except Exception as exc:
-            raise RuntimeError(f"Unable to load LightGBM model from {path}: {exc}") from exc
-
-    @staticmethod
-    def _display_path(path: Path) -> str:
-        try:
-            return str(path.relative_to(ROOT))
-        except ValueError:
-            return str(path)
-
-    def _feature_matrix(self, ds: "xr.Dataset") -> tuple[np.ndarray, tuple[int, ...]]:
-        return feature_matrix_from_dataset(ds)
-
-    @staticmethod
-    def _predict_probability(model: Any, features: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-        prediction = np.asarray(model.predict(features))
-        if prediction.ndim == 2:
-            if prediction.shape[1] == 2:
-                prediction = prediction[:, 1]
-            elif prediction.shape[1] == 1:
-                prediction = prediction[:, 0]
-            else:
-                raise ValueError(f"Expected binary LightGBM probabilities, got prediction shape {prediction.shape}")
-        if prediction.size != features.shape[0]:
-            raise ValueError(
-                f"LightGBM prediction size {prediction.size} does not match feature rows {features.shape[0]}"
-            )
-        return np.clip(prediction.reshape(shape), 0.0, 1.0)
-
-    def predict_fields(self, dataset: "xr.Dataset") -> "xr.Dataset":
-        if xr is None:
-            raise RuntimeError("xarray is required for Layer-4 prediction fields")
-
-        ds = normalize_dataset(dataset)
-        features, shape = self._feature_matrix(ds)
-        extreme_heat_prob = self._predict_probability(self.extreme_heat_model, features, shape)
-        dry_heat_prob = self._predict_probability(self.dry_heat_model, features, shape)
-        extreme_heat_level = _levels_from_probability(extreme_heat_prob)
-        dry_heat_level = _levels_from_probability(dry_heat_prob)
-
-        return xr.Dataset(
-            data_vars={
-                "ExtremeHeat_Risk_Prob": (ds["t2m"].dims, np.asarray(np.clip(extreme_heat_prob, 0.0, 1.0)), {"units": "1"}),
-                "ExtremeHeat_Risk_Level": (ds["t2m"].dims, extreme_heat_level, {"units": "class"}),
-                "DryHeatStress_Risk_Prob": (ds["t2m"].dims, np.asarray(np.clip(dry_heat_prob, 0.0, 1.0)), {"units": "1"}),
-                "DryHeatStress_Risk_Level": (ds["t2m"].dims, dry_heat_level, {"units": "class"}),
-            },
-            coords={name: ds.coords[name] for name in ds.coords},
-            attrs={
-                "model_family": "LightGBMLayer4Model",
-                "extreme_heat_model": self._display_path(self.extreme_heat_model_path),
-                "dry_heat_model": self._display_path(self.dry_heat_model_path),
-                "feature_names": ",".join(self.feature_names),
-            },
-        )
 
 
 def _summary_stats(field: Any) -> dict[str, Any]:

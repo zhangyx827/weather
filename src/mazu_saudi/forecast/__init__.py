@@ -8,6 +8,7 @@ from .providers import (
     GenCastForecastProvider,
     JSONForecastProvider,
     MockForecastProvider,
+    forecast_fields_to_dataset,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "GenCastForecastProvider",
     "JSONForecastProvider",
     "MockForecastProvider",
+    "forecast_fields_to_dataset",
 ]

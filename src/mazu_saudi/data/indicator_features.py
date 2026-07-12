@@ -28,6 +28,27 @@ def _dataset_source_metadata(dataset: Any) -> dict[str, Any]:
         return {}
 
 
+def _resolved_source_ids(source_metadata: dict[str, Any]) -> tuple[str | None, list[str]]:
+    resolved = source_metadata.get("resolved_sources", {})
+    if not isinstance(resolved, dict) or not resolved:
+        return None, []
+    primary_source_id = None
+    secondary_source_ids: list[str] = []
+    for family, payload in resolved.items():
+        if not isinstance(payload, dict):
+            continue
+        source_id = payload.get("dataset_id") or payload.get("resolved_source") or family
+        role = payload.get("role", "secondary")
+        if primary_source_id is None and role == "primary":
+            primary_source_id = str(source_id)
+        else:
+            secondary_source_ids.append(str(source_id))
+    if primary_source_id is None:
+        primary_source_id = secondary_source_ids[0] if secondary_source_ids else None
+        secondary_source_ids = secondary_source_ids[1:] if secondary_source_ids else []
+    return primary_source_id, secondary_source_ids
+
+
 def indicator_point_from_dataset(
     dataset: Any,
     latitude: float,
@@ -68,13 +89,20 @@ def indicator_point_from_dataset(
         elevation_m=None if elevation is None else float(elevation),
         region=region,
     )
+    source_metadata = _dataset_source_metadata(dataset)
+    primary_source_id, secondary_source_ids = _resolved_source_ids(source_metadata)
     return IndicatorFieldSet(
         grid=grid,
         valid_time=_dataset_valid_time(dataset),
         values=values,
         units=units,
         source=source,
-        source_metadata=_dataset_source_metadata(dataset),
+        source_metadata=source_metadata,
+        source_status=str(source_metadata.get("source_status", "normal")),
+        primary_source_id=primary_source_id,
+        secondary_source_ids=secondary_source_ids,
+        grounding_gap=dict(source_metadata.get("grounding_gap", {})),
+        degradation_metadata=dict(source_metadata.get("degradation_metadata", {})),
     )
 
 

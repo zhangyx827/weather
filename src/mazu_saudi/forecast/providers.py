@@ -15,7 +15,14 @@ import numpy as np
 
 from mazu_saudi.data import crop_to_saudi as data_crop_to_saudi
 from mazu_saudi.data import read_netcdf_dataset, read_zarr_dataset
+from mazu_saudi.indicators import compute_heat_index_c, compute_vpd_kpa
 from mazu_saudi.schemas import ForecastField, GridCell
+from mazu_saudi.utils.math import is_missing
+
+try:
+    import xarray as xr
+except Exception:  # pragma: no cover - optional dependency
+    xr = None
 
 SAUDI_BBOX = (16.0, 34.0, 32.0, 56.0)
 
@@ -56,6 +63,9 @@ class BaseForecastProvider(ABC):
 
     name = "base"
     dataset: Any = None
+    provider_role = "deterministic"
+    provider_status = "ready"
+    source_status = "normal"
 
     @abstractmethod
     def fetch(self, variable: str, valid_time: datetime | None = None, bbox: tuple[float, float, float, float] = SAUDI_BBOX) -> ForecastField:
@@ -92,6 +102,20 @@ class BaseForecastProvider(ABC):
                 fields[f"{normalized}:+{int(lead)}h"] = self.fetch(normalized, valid_time=valid, bbox=bbox)
         return fields
 
+    def forecast_dataset(
+        self,
+        issue_time: datetime,
+        lead_hours: int | list[int],
+        bbox: tuple[float, float, float, float] = SAUDI_BBOX,
+        variables: list[str] | None = None,
+    ) -> Any:
+        """Return a Layer-4-compatible xarray Dataset for one provider run."""
+
+        if xr is None:
+            raise RuntimeError("xarray is required for forecast dataset export")
+        fields = self.get_forecast(issue_time, lead_hours, bbox=bbox, variables=variables)
+        return forecast_fields_to_dataset(fields, provider_metadata=self.build_runtime_metadata())
+
     def normalize_variables(self, variable: str) -> str:
         """Normalize provider-specific variable names to MAZU names."""
 
@@ -115,15 +139,49 @@ class BaseForecastProvider(ABC):
         min_lat, min_lon, max_lat, max_lon = bbox
         pairs = [(v, g) for v, g in zip(field.values, field.grid) if min_lat <= g.lat <= max_lat and min_lon <= g.lon <= max_lon]
         if not pairs:
-            return ForecastField(field.provider, field.variable, field.units, field.valid_time, [], [], dict(field.metadata))
+            return ForecastField(
+                field.provider,
+                field.variable,
+                field.units,
+                field.valid_time,
+                [],
+                [],
+                dict(field.metadata),
+                provider_role=field.provider_role,
+                provider_status=field.provider_status,
+                source_status=field.source_status,
+                degradation_metadata=dict(field.degradation_metadata),
+            )
         values, grid = zip(*pairs)
-        return ForecastField(field.provider, field.variable, field.units, field.valid_time, list(values), list(grid), dict(field.metadata))
+        return ForecastField(
+            field.provider,
+            field.variable,
+            field.units,
+            field.valid_time,
+            list(values),
+            list(grid),
+            dict(field.metadata),
+            provider_role=field.provider_role,
+            provider_status=field.provider_status,
+            source_status=field.source_status,
+            degradation_metadata=dict(field.degradation_metadata),
+        )
+
+    def build_runtime_metadata(self) -> dict[str, Any]:
+        return {
+            "provider_role": self.provider_role,
+            "provider_status": self.provider_status,
+            "source_status": self.source_status,
+        }
 
 
 class MockForecastProvider(BaseForecastProvider):
     """Deterministic mock forecast provider for demos and tests."""
 
     name = "mock"
+    provider_role = "deterministic_fallback"
+    provider_status = "degraded_mock"
+    source_status = "degraded"
 
     def fetch(self, variable: str, valid_time: datetime | None = None, bbox: tuple[float, float, float, float] = SAUDI_BBOX) -> ForecastField:
         valid = valid_time or datetime.now(timezone.utc)
@@ -150,8 +208,13 @@ class MockForecastProvider(BaseForecastProvider):
             grid,
             {
                 "source": "deterministic_mock",
+                **self.build_runtime_metadata(),
                 "structure": {"dims": ["time", "lat", "lon"], "time": [valid.isoformat()], "lat": [g.lat for g in grid], "lon": [g.lon for g in grid]},
             },
+            provider_role=self.provider_role,
+            provider_status=self.provider_status,
+            source_status=self.source_status,
+            degradation_metadata={"reason": "mock_provider_used", "provider": self.name},
         )
         return self.crop_to_bbox(field, bbox)
 
@@ -186,6 +249,9 @@ class ERA5MSWEPForecastProvider(BaseForecastProvider):
     """
 
     name = "era5_mswep"
+    provider_role = "reanalysis_background"
+    provider_status = "ready"
+    source_status = "normal"
 
     def __init__(self, era5_dir: str | Path = "era5_single_levels_2025", precip_dir: str | Path = "precip"):
         self.era5_dir = Path(era5_dir)
@@ -332,13 +398,19 @@ class ERA5MSWEPForecastProvider(BaseForecastProvider):
 class AuroraForecastProvider(MockForecastProvider):
     """Aurora integration placeholder with the standard provider interface."""
 
-    name = "aurora_placeholder"
+    name = "aurora"
+    provider_role = "primary_deterministic"
+
+    def __init__(self, status: str = "degraded_mock") -> None:
+        self.provider_status = status
+        self.source_status = "normal" if status == "ready" else "degraded"
 
 
 class GenCastForecastProvider(MockForecastProvider):
     """GenCast integration placeholder with the standard provider interface."""
 
-    name = "gencast_placeholder"
+    name = "gencast"
+    provider_role = "secondary_ensemble"
 
     def fetch(self, variable: str, valid_time: datetime | None = None, bbox: tuple[float, float, float, float] = SAUDI_BBOX) -> ForecastField:
         field = super().fetch(variable, valid_time, bbox)
@@ -346,8 +418,32 @@ class GenCastForecastProvider(MockForecastProvider):
         for offset in (-0.15, 0.0, 0.12, 0.25):
             member_values.append([float(value) * (1.0 + offset) for value in field.values])
         metadata = dict(field.metadata)
-        metadata.update({"member_count": len(member_values), "member_values": member_values, "structure": {"dims": ["member", "time", "lat", "lon"]}})
-        return ForecastField(field.provider, field.variable, field.units, field.valid_time, field.values, field.grid, metadata)
+        metadata.update(
+            {
+                "provider_role": self.provider_role,
+                "provider_status": self.provider_status,
+                "member_count": len(member_values),
+                "member_values": member_values,
+                "ensemble_stats": {
+                    "member_count": len(member_values),
+                    "mean": [sum(values) / len(values) for values in zip(*member_values)],
+                },
+                "structure": {"dims": ["member", "time", "lat", "lon"]},
+            }
+        )
+        return ForecastField(
+            field.provider,
+            field.variable,
+            field.units,
+            field.valid_time,
+            field.values,
+            field.grid,
+            metadata,
+            provider_role=self.provider_role,
+            provider_status=self.provider_status,
+            source_status=self.source_status,
+            degradation_metadata={"reason": "ensemble_placeholder_used", "provider": self.name},
+        )
 
     def member_count(self, field: ForecastField) -> int:
         """Return ensemble member count from metadata."""
@@ -383,7 +479,32 @@ class GenCastForecastProvider(MockForecastProvider):
 class AIFSBenchmarkProvider(MockForecastProvider):
     """AIFS benchmark integration placeholder with the standard provider interface."""
 
-    name = "aifs_benchmark_placeholder"
+    name = "aifs"
+    provider_role = "benchmark"
+
+    def fetch(self, variable: str, valid_time: datetime | None = None, bbox: tuple[float, float, float, float] = SAUDI_BBOX) -> ForecastField:
+        field = super().fetch(variable, valid_time, bbox)
+        metadata = dict(field.metadata)
+        metadata.update(
+            {
+                "provider_role": self.provider_role,
+                "provider_status": self.provider_status,
+                "benchmark_comparison": {"status": "placeholder", "benchmark_name": "aifs"},
+            }
+        )
+        return ForecastField(
+            field.provider,
+            field.variable,
+            field.units,
+            field.valid_time,
+            field.values,
+            field.grid,
+            metadata,
+            provider_role=self.provider_role,
+            provider_status=self.provider_status,
+            source_status=self.source_status,
+            degradation_metadata={"reason": "benchmark_placeholder_used", "provider": self.name},
+        )
 
 
 def _utc_naive(value: datetime) -> datetime:
@@ -392,6 +513,114 @@ def _utc_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def forecast_fields_to_dataset(fields: dict[str, ForecastField], provider_metadata: dict[str, Any] | None = None) -> Any:
+    """Convert standard forecast fields to a Layer-4-compatible Dataset."""
+
+    if xr is None:
+        raise RuntimeError("xarray is required for forecast dataset export")
+    if not fields:
+        raise ValueError("at least one ForecastField is required")
+
+    grouped: dict[datetime, dict[str, ForecastField]] = {}
+    latitudes: set[float] = set()
+    longitudes: set[float] = set()
+    for field in fields.values():
+        grouped.setdefault(field.valid_time, {})[field.variable] = field
+        for cell in field.grid:
+            latitudes.add(float(cell.lat))
+            longitudes.add(float(cell.lon))
+
+    times = sorted(grouped.keys())
+    latitude = np.asarray(sorted(latitudes), dtype=np.float32)
+    longitude = np.asarray(sorted(longitudes), dtype=np.float32)
+    lat_index = {float(value): idx for idx, value in enumerate(latitude)}
+    lon_index = {float(value): idx for idx, value in enumerate(longitude)}
+
+    data_vars: dict[str, Any] = {}
+    variable_units: dict[str, str] = {}
+    for valid_time, field_map in grouped.items():
+        for variable, field in field_map.items():
+            if variable not in data_vars:
+                data_vars[variable] = np.full((len(times), len(latitude), len(longitude)), np.nan, dtype=np.float32)
+                variable_units[variable] = field.units
+            time_idx = times.index(valid_time)
+            for value, cell in zip(field.values, field.grid):
+                if is_missing(value):
+                    continue
+                data_vars[variable][time_idx, lat_index[float(cell.lat)], lon_index[float(cell.lon)]] = float(value)
+
+    derived = _derived_dataset_fields(data_vars)
+    data_vars.update(derived)
+
+    attrs = _dataset_runtime_attrs(fields, provider_metadata)
+    ds = xr.Dataset(
+        data_vars={
+            name: (("time", "latitude", "longitude"), values, {"units": variable_units.get(name, _derived_units(name))})
+            for name, values in data_vars.items()
+        },
+        coords={
+            "time": np.asarray(times, dtype="datetime64[ns]"),
+            "latitude": latitude,
+            "longitude": longitude,
+        },
+        attrs=attrs,
+    )
+    return ds
+
+
+def _dataset_runtime_attrs(fields: dict[str, ForecastField], provider_metadata: dict[str, Any] | None) -> dict[str, Any]:
+    first = next(iter(fields.values()))
+    attrs = {
+        "primary_provider": first.provider,
+        "provider_role": first.provider_role,
+        "provider_status": first.provider_status,
+        "source_status": first.source_status,
+        "degradation_metadata_json": json.dumps(first.degradation_metadata, ensure_ascii=False, sort_keys=True),
+    }
+    if provider_metadata:
+        attrs.update(provider_metadata)
+    member_values = first.metadata.get("member_values")
+    if member_values is not None:
+        attrs["ensemble_member_count"] = int(first.metadata.get("member_count", len(member_values)))
+    benchmark = first.metadata.get("benchmark_comparison")
+    if benchmark is not None:
+        attrs["benchmark_comparison_json"] = json.dumps(benchmark, ensure_ascii=False, sort_keys=True)
+    return attrs
+
+
+def _derived_dataset_fields(data_vars: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    temp = data_vars.get("temp_c")
+    rh = data_vars.get("rh_percent")
+    wind = data_vars.get("wind_speed_mps")
+    derived: dict[str, np.ndarray] = {}
+    if temp is not None and rh is not None:
+        derived["relative_humidity_percent"] = np.clip(np.asarray(rh, dtype=np.float32), 0.0, 100.0)
+        heat_index = np.full(temp.shape, np.nan, dtype=np.float32)
+        vpd = np.full(temp.shape, np.nan, dtype=np.float32)
+        for index in np.ndindex(temp.shape):
+            t = temp[index]
+            h = rh[index]
+            if np.isfinite(t) and np.isfinite(h):
+                heat_index[index] = float(compute_heat_index_c(float(t), float(h)))
+                vpd[index] = float(compute_vpd_kpa(float(t), float(h)))
+        derived["heat_index_c"] = heat_index
+        derived["vpd_kpa"] = vpd
+    if wind is not None and "wind_speed_mps" not in derived:
+        derived["wind_speed_mps"] = np.asarray(wind, dtype=np.float32)
+    return derived
+
+
+def _derived_units(name: str) -> str:
+    return {
+        "heat_index_c": "degC",
+        "vpd_kpa": "kPa",
+        "relative_humidity_percent": "%",
+        "wind_speed_mps": "m/s",
+        "temp_c": "degC",
+        "rh_percent": "%",
+    }.get(name, "unknown")
 
 
 def _era5_month_path(era5_dir: Path, valid: datetime) -> Path:
@@ -466,7 +695,23 @@ def _field_from_data_array(
     }
     field_metadata = dict(metadata)
     field_metadata["structure"] = structure
-    return ForecastField(provider, variable, units, valid_time, values, grid, field_metadata)
+    provider_role = str(field_metadata.get("provider_role", "deterministic"))
+    provider_status = str(field_metadata.get("provider_status", "ready"))
+    source_status = str(field_metadata.get("source_status", "normal"))
+    degradation_metadata = dict(field_metadata.get("degradation_metadata", {}))
+    return ForecastField(
+        provider,
+        variable,
+        units,
+        valid_time,
+        values,
+        grid,
+        field_metadata,
+        provider_role=provider_role,
+        provider_status=provider_status,
+        source_status=source_status,
+        degradation_metadata=degradation_metadata,
+    )
 
 
 def _crop_xarray_to_bbox(data_array: Any, bbox: tuple[float, float, float, float]) -> Any:

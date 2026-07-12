@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from mazu_saudi.agent.briefing import build_warning_product
+from mazu_saudi.agent.strands import StrandsError, StrandsWarningAgent, generate_warning_response
 from mazu_saudi.agent.workflow import run_demo_pipeline, run_indicator_netcdf_pipeline
+from mazu_saudi.config import StrandsSettings
 from mazu_saudi.data import indicator_point_from_netcdf
 from mazu_saudi.kg import HazardKnowledgeGraph
 from mazu_saudi.risk import all_default_models
@@ -91,26 +92,13 @@ def create_app():
     async def warning_generate(payload: dict[str, Any] | WarningGenerateRequest) -> dict[str, Any]:
         try:
             raw_payload = payload.model_dump() if hasattr(payload, "model_dump") else payload
-            raw_features = raw_payload.get("features", raw_payload)
-            requested_industries = raw_payload.get("industries")
-            language = raw_payload.get("language", "zh")
-            features = IndicatorFieldSet.from_dict(raw_features) if isinstance(raw_features, dict) and "values" in raw_features else MeteorologicalFeatures.from_dict(raw_features)
-            risks = [model.predict_one(features) for model in all_default_models()]
-            graph = HazardKnowledgeGraph()
-            impacts = {}
-            for risk in risks:
-                graph.add_risk_evidence(risk)
-                impacts[risk.hazard_type] = graph.query_hazard_impacts(risk.hazard_type)
-            product = build_warning_product(features.grid.region or features.grid.id, risks, {"impacts": impacts, "triple_count": len(graph.triples)})
-            if requested_industries:
-                product.briefings = [briefing for briefing in product.briefings if briefing.industry in requested_industries]
-            output = product.to_dict()
-            output["requested_language"] = language
-            output["briefing_text"] = [
-                {"industry": item["industry"], "text": item.get(language, item["zh"])}
-                for item in output["briefings"]
-            ]
-            return output
+            return generate_warning_response(
+                raw_payload,
+                settings=StrandsSettings.from_env(),
+                agent_factory=StrandsWarningAgent,
+            )
+        except StrandsError as exc:
+            raise _http_error("strands_integration_failed", str(exc))
         except Exception as exc:
             raise _http_error("warning_generation_failed", str(exc))
 

@@ -887,6 +887,30 @@ class RawInputBuilder:
                             "precip_daily": precip_daily_metadata,
                             "precip_monthly": chirps_monthly.metadata if chirps_monthly is not None else self._missing_family_metadata("precip_monthly", day),
                         },
+                        "source_status": "normal",
+                        "primary_source_id": "era5",
+                        "secondary_source_ids": [
+                            str(sst.metadata.get("dataset_id", "sst")),
+                            str(dust.metadata.get("dataset_id", "dust")),
+                            str(precip_daily_metadata.get("dataset_id", "precip_daily")),
+                        ],
+                        "grounding_gap": {
+                            "precip_daily": {
+                                "source_pair": ["era5", str(precip_daily_metadata.get("dataset_id", "precip_daily"))],
+                                "comparison_time": day.isoformat(),
+                                "units": "mm",
+                                "abs_diff_variable": "gpm_era5_precip_diff",
+                                "relative_diff_variable": "gpm_era5_precip_ratio",
+                                "status": "available",
+                            },
+                            "sst": {
+                                "source_pair": ["era5", str(sst.metadata.get("dataset_id", "sst"))],
+                                "comparison_time": day.isoformat(),
+                                "units": "degC",
+                                "status": "available" if sst.metadata.get("validation_status") != "missing" else "missing",
+                            },
+                        },
+                        "degradation_metadata": {},
                         "validation_status": {
                             "sst": sst.metadata.get("validation_status", "not_run"),
                             "dust": dust.metadata.get("validation_status", "not_run"),

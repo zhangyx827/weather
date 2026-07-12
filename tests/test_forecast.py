@@ -18,12 +18,22 @@ class ForecastTests(unittest.TestCase):
     def test_gencast_ensemble_statistics(self):
         provider = GenCastForecastProvider()
         field = provider.fetch("temp_c")
+        self.assertEqual(field.provider_role, "secondary_ensemble")
+        self.assertEqual(field.provider_status, "degraded_mock")
         self.assertEqual(provider.member_count(field), 4)
         self.assertEqual(len(provider.ensemble_mean(field)), len(field.values))
         self.assertEqual(len(provider.ensemble_spread(field)), len(field.values))
         probs = provider.exceedance_probability(field, threshold=40.0, variable="temp_c")
         self.assertEqual(len(probs), len(field.values))
         self.assertTrue(all(0.0 <= value <= 1.0 for value in probs))
+        self.assertIn("ensemble_stats", field.metadata)
+
+    def test_mock_provider_marks_degraded_runtime(self):
+        provider = MockForecastProvider()
+        field = provider.fetch("temp_c")
+        self.assertEqual(field.provider_status, "degraded_mock")
+        self.assertEqual(field.source_status, "degraded")
+        self.assertEqual(field.degradation_metadata["reason"], "mock_provider_used")
 
     @unittest.skipUnless(Path("era5_single_levels_2025").exists() and Path("precip").exists(), "real forecast data not available")
     def test_era5_mswep_provider_reads_real_fields(self):

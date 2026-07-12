@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from mazu_saudi.indicators import (
     compute_dry_heat_stress_score,
     compute_dust_potential_score,
@@ -28,6 +30,15 @@ from .ml import OptionalMLAdapter, create_ml_adapter
 
 
 RiskInput = IndicatorFieldSet | MeteorologicalFeatures
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_LAYER4_MODEL_DIR = REPO_ROOT / "models" / "layer4"
+FEATURE_LABELS = {
+    "temp_c": "气温",
+    "vpd_kpa": "VPD",
+    "heat_index_c": "热指数",
+    "wind_speed_mps": "近地风速",
+    "relative_humidity_percent": "相对湿度",
+}
 
 
 def _value(record: RiskInput, *indicator_names: str, legacy: str | None = None, default: Any = None) -> Any:
@@ -58,12 +69,64 @@ def _input_valid_time(record: RiskInput):
     return record.valid_time
 
 
+def _default_runtime_source_status(features: RiskInput) -> tuple[str, dict[str, Any]]:
+    if isinstance(features, IndicatorFieldSet):
+        return features.source_status or "normal", dict(features.degradation_metadata)
+    return "normal", {}
+
+
+def _standard_indicator_values(features: RiskInput) -> dict[str, Any]:
+    temp = _value(features, "t2m_c", legacy="temp_c")
+    rh = _value(features, "rh2m", legacy="rh_percent")
+    wind = _value(features, "wind10_speed", legacy="wind_speed_mps")
+    vpd = _value(features, "vpd_kpa")
+    if is_missing(vpd):
+        vpd = compute_vpd_kpa(temp, rh)
+    heat_index = _value(features, "heat_index_c")
+    if is_missing(heat_index):
+        heat_index = compute_heat_index_c(temp, rh)
+    return {
+        "temp_c": None if is_missing(temp) else float(temp),
+        "vpd_kpa": None if is_missing(vpd) else float(vpd),
+        "heat_index_c": None if is_missing(heat_index) else float(heat_index),
+        "wind_speed_mps": None if is_missing(wind) else float(wind),
+        "relative_humidity_percent": None if is_missing(rh) else float(rh),
+    }
+
+
+def _layer4_feature_vector(features: RiskInput) -> np.ndarray | None:
+    values = _standard_indicator_values(features)
+    ordered = [
+        values["temp_c"],
+        values["vpd_kpa"],
+        values["heat_index_c"],
+        values["wind_speed_mps"],
+        values["relative_humidity_percent"],
+    ]
+    if any(value is None for value in ordered):
+        return None
+    return np.asarray(ordered, dtype=np.float32)
+
+
+def _top_shap_factors(shap_summary: dict[str, Any]) -> list[str]:
+    factors = []
+    for item in shap_summary.get("top_features", []):
+        name = str(item.get("feature", ""))
+        label = FEATURE_LABELS.get(name, name)
+        contribution = float(item.get("contribution", 0.0))
+        direction = "抬升" if contribution >= 0 else "压低"
+        factors.append(f"{label}贡献{direction}风险({contribution:.3f})")
+    return factors
+
+
 class BaseRiskModel(ABC):
     """Base interface for rule or ML risk models."""
 
     hazard_type: str
     model_name = "rule_screening_v1"
     model_version = "v1"
+    model_family = "rule"
+    inference_mode = "rule"
 
     def __init__(
         self,
@@ -120,6 +183,7 @@ class BaseRiskModel(ABC):
     def _risk(self, features: RiskInput, probability: float, factors: list[str], evidence: dict[str, Any]) -> HazardRisk:
         p = clamp(probability)
         indicator_evidence = dict(evidence.pop("indicator_evidence", {}))
+        source_status, degradation_metadata = _default_runtime_source_status(features)
 
         return HazardRisk(
             hazard_type=self.hazard_type,
@@ -130,9 +194,14 @@ class BaseRiskModel(ABC):
             valid_time=_input_valid_time(features),
             model_name=self.model_name,
             model_version=self.model_version,
-            metadata={"threshold_config": self.threshold_config.to_dict(), **self.metadata},
-            evidence={"model_version": self.model_version, **evidence},
+            metadata={"threshold_config": self.threshold_config.to_dict(), "model_family": self.model_family, **self.metadata},
+            evidence={"model_version": self.model_version, "model_family": self.model_family, "inference_mode": self.inference_mode, **evidence},
             indicator_evidence=indicator_evidence,
+            model_family=self.model_family,
+            inference_mode=self.inference_mode,
+            source_status=source_status,
+            degradation_metadata=degradation_metadata,
+            shap_summary=dict(evidence.get("shap_summary", evidence.get("shap", {}))),
         )
 
 
@@ -145,6 +214,7 @@ class MLBackedRiskModel(BaseRiskModel):
 
     hazard_type = "ml_backed_hazard"
     model_name = "ml_backed_placeholder"
+    model_family = "ml"
 
     def __init__(self, adapter: OptionalMLAdapter | None = None, backend: str = "fallback", **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -172,6 +242,87 @@ class MLBackedRiskModel(BaseRiskModel):
         explanation = self.shap_explain(features)
         factors = ["ML模型占位接口已执行"] if not explanation.get("values") else list(explanation["values"].keys())
         return self._risk(features, probability, factors, {"shap": explanation})
+
+
+class LightGBMHybridRiskModel(BaseRiskModel):
+    """Use a LightGBM booster when available, otherwise degrade to a rule model."""
+
+    model_family = "lightgbm"
+    model_name = "lightgbm_hybrid_v1"
+
+    def __init__(
+        self,
+        hazard_type: str,
+        fallback_model: BaseRiskModel,
+        model_path: str | Path,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.hazard_type = hazard_type
+        self.fallback_model = fallback_model
+        self.model_path = Path(model_path)
+        self.adapter: OptionalMLAdapter | None = None
+        self.metadata.update({"fallback_model": fallback_model.model_name, "model_path": str(self.model_path)})
+
+    def _load_adapter(self) -> OptionalMLAdapter | None:
+        if self.adapter is not None:
+            return self.adapter
+        if not self.model_path.exists():
+            return None
+        try:
+            adapter = create_ml_adapter("lightgbm")
+            adapter.load_model(self.model_path)
+        except Exception:
+            return None
+        self.adapter = adapter
+        return adapter
+
+    def predict(self, features: RiskInput) -> HazardRisk:
+        fallback = self.fallback_model.predict(features)
+        feature_vector = _layer4_feature_vector(features)
+        adapter = self._load_adapter()
+        if adapter is None or feature_vector is None:
+            fallback.model_family = self.model_family
+            fallback.inference_mode = "degraded_rule_fallback"
+            fallback.source_status = "degraded" if adapter is None else fallback.source_status
+            fallback.degradation_metadata = {
+                **fallback.degradation_metadata,
+                "fallback_reason": "missing_model_file" if adapter is None else "incomplete_ml_features",
+                "fallback_model": self.fallback_model.model_name,
+            }
+            fallback.evidence.update(
+                {
+                    "model_family": self.model_family,
+                    "inference_mode": "degraded_rule_fallback",
+                    "degradation_metadata": dict(fallback.degradation_metadata),
+                }
+            )
+            return fallback
+
+        probability = adapter.predict_proba(feature_vector)
+        shap_summary = adapter.shap_explain(feature_vector)
+        factors = _top_shap_factors(shap_summary) or list(fallback.contributing_factors)
+        indicator_values = _standard_indicator_values(features)
+        risk = self._risk(
+            features,
+            probability,
+            factors,
+            {
+                "shap_summary": shap_summary,
+                "indicator_evidence": {
+                    **dict(fallback.indicator_evidence),
+                    **{key: value for key, value in indicator_values.items() if value is not None},
+                },
+                "fallback_model": self.fallback_model.model_name,
+                "feature_source_contract_version": "layer4_v1",
+            },
+        )
+        risk.evidence["degradation_metadata"] = {}
+        risk.degradation_metadata = {}
+        risk.source_status = fallback.source_status
+        risk.valid_time = fallback.valid_time
+        risk.grid = fallback.grid
+        return risk
 
 
 class FlashFloodRiskModel(RuleBasedRiskModel):
@@ -339,10 +490,12 @@ class CoastalHumidHeatRiskModel(RuleBasedRiskModel):
 def all_default_models() -> list[BaseRiskModel]:
     """Return the five MVP hazard models."""
 
+    extreme_heat_rule = ExtremeHeatRiskModel()
+    dry_heat_rule = DryHeatStressRiskModel()
     return [
         FlashFloodRiskModel(),
-        ExtremeHeatRiskModel(),
-        DryHeatStressRiskModel(),
+        LightGBMHybridRiskModel("extreme_heat", extreme_heat_rule, DEFAULT_LAYER4_MODEL_DIR / "extreme_heat.txt"),
+        LightGBMHybridRiskModel("dry_heat_agriculture", dry_heat_rule, DEFAULT_LAYER4_MODEL_DIR / "dry_heat_stress.txt"),
         DustPotentialRiskModel(),
         CoastalHumidHeatRiskModel(),
     ]

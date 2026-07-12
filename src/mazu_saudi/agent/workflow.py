@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -10,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from mazu_saudi.data import check_missing_values, indicator_point_from_netcdf, read_json_features
-from mazu_saudi.agent.briefing import build_warning_product
-from mazu_saudi.forecast import MockForecastProvider
+from mazu_saudi.agent.briefing import build_warning_product, create_default_briefing_generator
+from mazu_saudi.forecast import AIFSBenchmarkProvider, AuroraForecastProvider, GenCastForecastProvider, MockForecastProvider
 from mazu_saudi.indicators import (
     compute_cape_placeholder,
     compute_heat_index_c,
@@ -62,6 +63,19 @@ else:
 
 
 Context = dict[str, Any]
+
+
+def create_default_forecast_provider():
+    """Create the runtime forecast provider from environment or defaults."""
+
+    provider_name = os.getenv("MAZU_FORECAST_PROVIDER", "aurora").strip().lower()
+    if provider_name == "gencast":
+        return GenCastForecastProvider()
+    if provider_name == "aifs":
+        return AIFSBenchmarkProvider()
+    if provider_name == "mock":
+        return MockForecastProvider()
+    return AuroraForecastProvider()
 
 
 class WorkflowNode(ABC):
@@ -129,18 +143,30 @@ class ForecastNode(WorkflowNode):
     name = "forecast"
 
     def __init__(self, provider=None):
-        self.provider = provider or MockForecastProvider()
+        self.provider = provider or create_default_forecast_provider()
 
     def run(self, context: Context) -> Context:
         if isinstance(context["features"], IndicatorFieldSet):
             context["forecast_fields"] = {}
-            context["forecast_confidence"] = {"status": "not_required", "provider": "processed_indicator_dataset"}
+            context["forecast_confidence"] = {
+                "status": "not_required",
+                "provider": "processed_indicator_dataset",
+                "provider_role": "preprocessed_indicator_dataset",
+            }
             context.setdefault("trace", []).append(self.name)
             return context
         features: MeteorologicalFeatures = context["features"]
         forecast = self.provider.get_forecast(features.valid_time, lead_hours=0)
         context["forecast_fields"] = {key: field.to_dict() for key, field in forecast.items()}
-        context["forecast_confidence"] = {"status": "unavailable", "provider": self.provider.name}
+        first_field = next(iter(forecast.values())) if forecast else None
+        context["forecast_confidence"] = {
+            "status": "ready" if first_field is not None else "unavailable",
+            "provider": self.provider.name,
+            "provider_role": getattr(first_field, "provider_role", getattr(self.provider, "provider_role", "deterministic")),
+            "provider_status": getattr(first_field, "provider_status", getattr(self.provider, "provider_status", "unknown")),
+            "source_status": getattr(first_field, "source_status", getattr(self.provider, "source_status", "unknown")),
+            "degradation_metadata": getattr(first_field, "degradation_metadata", {}),
+        }
         context.setdefault("trace", []).append(self.name)
         return context
 
@@ -189,6 +215,10 @@ class ModelInferenceNode(WorkflowNode):
     def run(self, context: Context) -> Context:
         features = context["features"]
         context["risks"] = [model.predict(features) for model in self.models]
+        context["risk_runtime"] = {
+            "model_families": {risk.hazard_type: risk.model_family for risk in context["risks"]},
+            "inference_modes": {risk.hazard_type: risk.inference_mode for risk in context["risks"]},
+        }
         context.setdefault("trace", []).append(self.name)
         return context
 
@@ -232,12 +262,19 @@ class EvidenceCheckNode(WorkflowNode):
                 "has_contributing_factors": bool(risk.contributing_factors),
                 "has_indicator_evidence": bool(risk.indicator_evidence),
                 "high_risk_requires_factors_ok": (not high_risk) or bool(risk.contributing_factors),
+                "model_family": risk.model_family,
+                "inference_mode": risk.inference_mode,
+                "source_status": risk.source_status,
+                "has_shap_summary": bool(risk.shap_summary.get("available") or risk.shap_summary.get("top_features")),
             }
+        source_metadata = getattr(context["features"], "source_metadata", {}) if isinstance(context["features"], IndicatorFieldSet) else {}
         context["evidence_status"] = {
             "physical_indicators_complete": all(indicator_status.values()),
             "indicator_status": indicator_status,
             "risk_status": risk_status,
             "gencast_confidence": context.get("forecast_confidence", {"status": "unavailable"}),
+            "grounding_metadata_present": bool(source_metadata.get("resolved_sources") or source_metadata.get("grounding_gap")),
+            "source_status": getattr(context["features"], "source_status", "normal") if isinstance(context["features"], IndicatorFieldSet) else "normal",
         }
         context.setdefault("trace", []).append(self.name)
         return context
@@ -248,10 +285,21 @@ class BriefingNode(WorkflowNode):
 
     name = "briefing"
 
+    def __init__(self, generator=None):
+        self.generator = generator or create_default_briefing_generator()
+
     def run(self, context: Context) -> Context:
         features = context["features"]
         area = features.grid.region or features.grid.id
-        context["warning_product"] = build_warning_product(area, context["risks"], context["kg_explanation"])
+        context["warning_product"] = build_warning_product(
+            area,
+            context["risks"],
+            context["kg_explanation"],
+            generator=self.generator,
+            context=context,
+        )
+        context["generation_metadata"] = context["warning_product"].generation_metadata
+        context["llm_raw"] = context["warning_product"].llm_raw
         context.setdefault("trace", []).append(self.name)
         return context
 

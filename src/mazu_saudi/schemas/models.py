@@ -120,6 +120,11 @@ class IndicatorFieldSet:
     units: dict[str, str] = field(default_factory=dict)
     source: str | None = None
     source_metadata: dict[str, Any] = field(default_factory=dict)
+    source_status: str = "normal"
+    primary_source_id: str | None = None
+    secondary_source_ids: list[str] = field(default_factory=list)
+    grounding_gap: dict[str, Any] = field(default_factory=dict)
+    degradation_metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "IndicatorFieldSet":
@@ -137,6 +142,11 @@ class IndicatorFieldSet:
             units=dict(payload.get("units", {})),
             source=payload.get("source"),
             source_metadata=dict(payload.get("source_metadata", {})),
+            source_status=payload.get("source_status", "normal"),
+            primary_source_id=payload.get("primary_source_id"),
+            secondary_source_ids=list(payload.get("secondary_source_ids", [])),
+            grounding_gap=dict(payload.get("grounding_gap", {})),
+            degradation_metadata=dict(payload.get("degradation_metadata", {})),
         )
 
     def get(self, name: str, default: Any = None) -> Any:
@@ -157,6 +167,10 @@ class ForecastField:
     values: list[float]
     grid: list[GridCell]
     metadata: dict[str, Any] = field(default_factory=dict)
+    provider_role: str = "deterministic"
+    provider_status: str = "ready"
+    source_status: str = "normal"
+    degradation_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
@@ -177,6 +191,11 @@ class HazardRisk:
     metadata: dict[str, Any] = field(default_factory=dict)
     evidence: dict[str, Any] = field(default_factory=dict)
     indicator_evidence: dict[str, Any] = field(default_factory=dict)
+    model_family: str = "rule"
+    inference_mode: str = "rule"
+    source_status: str = "normal"
+    degradation_metadata: dict[str, Any] = field(default_factory=dict)
+    shap_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
@@ -221,6 +240,8 @@ class WarningProduct:
     briefings: list[IndustryBriefing]
     kg_explanation: dict[str, Any] = field(default_factory=dict)
     status: str = "draft"
+    generation_metadata: dict[str, Any] = field(default_factory=dict)
+    llm_raw: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)

@@ -18,6 +18,8 @@ def test_indicator_netcdf_point_contract():
     assert isinstance(features, IndicatorFieldSet)
     assert features.grid.id == "saudi_24.7_46.7"
     assert features.valid_time.year == 2025
+    assert features.source_status in {"normal", "degraded"}
+    assert isinstance(features.source_metadata, dict)
     for name in ("t2m_c", "rh2m", "vpd_kpa", "heat_index_c", "wind10_speed"):
         assert name in features.values
         assert features.values[name] is not None
@@ -43,6 +45,8 @@ def test_indicator_pipeline_reaches_publish_and_kg():
     assert context["kg_explanation"]["triple_count"] > 0
     assert len(context["publish_payload"]["briefings"]) == 6
     assert all(status["has_indicator_evidence"] for status in context["evidence_status"]["risk_status"].values())
+    assert "grounding_metadata_present" in context["evidence_status"]
+    assert "model_family" in next(iter(context["evidence_status"]["risk_status"].values()))
 
 
 def test_run_indicator_netcdf_pipeline_payload():

@@ -42,6 +42,8 @@ class RiskModelTests(unittest.TestCase):
             self.assertIn(risk.risk_level, list(RiskLevel))
             self.assertTrue(risk.contributing_factors)
             self.assertTrue(risk.model_version)
+            self.assertTrue(risk.model_family)
+            self.assertTrue(risk.inference_mode)
 
     def test_batch_prediction_and_explain(self):
         model = all_default_models()[0]
@@ -56,6 +58,15 @@ class RiskModelTests(unittest.TestCase):
         self.assertEqual(model.train([sample_features()])["status"], "trained_stub")
         self.assertEqual(model.predict_proba(sample_features()), 0.0)
         self.assertFalse(model.shap_explain(sample_features())["available"])
+
+    def test_lightgbm_wrappers_degrade_to_rule_when_model_unavailable(self):
+        features = sample_features()
+        risks = [model.predict(features) for model in all_default_models() if model.hazard_type in {"extreme_heat", "dry_heat_agriculture"}]
+        self.assertEqual(len(risks), 2)
+        for risk in risks:
+            self.assertEqual(risk.model_family, "lightgbm")
+            self.assertIn(risk.inference_mode, {"degraded_rule_fallback", "rule"})
+            self.assertIn("degradation_metadata", risk.evidence)
 
 
 if __name__ == "__main__":
