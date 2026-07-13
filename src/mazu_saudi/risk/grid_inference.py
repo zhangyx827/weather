@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .layer4_features import LAYER4_FEATURE_NAMES, feature_matrix_from_dataset
+from .layer4_features import feature_matrix_from_dataset, feature_names_for_hazard
 
 try:
     import xarray as xr
@@ -40,15 +40,15 @@ def _levels_from_probability(probability: np.ndarray) -> np.ndarray:
 class LightGBMLayer4Model:
     """Layer-4 grid inference backed by LightGBM booster files."""
 
-    feature_names = LAYER4_FEATURE_NAMES
-
     def __init__(
         self,
         extreme_heat_model_path: str | Path | None = None,
         dry_heat_model_path: str | Path | None = None,
+        flash_flood_model_path: str | Path | None = None,
         *,
         extreme_heat_model: Any | None = None,
         dry_heat_model: Any | None = None,
+        flash_flood_model: Any | None = None,
     ) -> None:
         self.extreme_heat_model_path = self._resolve_model_path(
             explicit=extreme_heat_model_path,
@@ -62,8 +62,15 @@ class LightGBMLayer4Model:
             default_name="dry_heat_stress.txt",
             allow_missing=dry_heat_model is not None,
         )
+        self.flash_flood_model_path = self._resolve_model_path(
+            explicit=flash_flood_model_path,
+            env_key="MAZU_LAYER4_FLASH_FLOOD_MODEL",
+            default_name="flash_flood.txt",
+            allow_missing=True,
+        )
         self.extreme_heat_model = extreme_heat_model or self._load_booster(self.extreme_heat_model_path)
         self.dry_heat_model = dry_heat_model or self._load_booster(self.dry_heat_model_path)
+        self.flash_flood_model = flash_flood_model or self._load_optional_booster(self.flash_flood_model_path)
 
     @staticmethod
     def _resolve_model_path(
@@ -106,6 +113,11 @@ class LightGBMLayer4Model:
         except Exception as exc:
             raise RuntimeError(f"Unable to load LightGBM model from {path}: {exc}") from exc
 
+    def _load_optional_booster(self, path: Path | None) -> Any | None:
+        if path is None:
+            return None
+        return self._load_booster(path)
+
     @staticmethod
     def _display_path(path: Path | None) -> str | None:
         if path is None:
@@ -116,7 +128,7 @@ class LightGBMLayer4Model:
             return str(path)
 
     def _feature_matrix(self, dataset: Any) -> tuple[np.ndarray, tuple[int, ...]]:
-        return feature_matrix_from_dataset(dataset)
+        return feature_matrix_from_dataset(dataset, hazard_type="extreme_heat")
 
     @staticmethod
     def _predict_probability(model: Any, features: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
@@ -143,27 +155,59 @@ class LightGBMLayer4Model:
         ds = dataset
         features, shape = self._feature_matrix(ds)
         first_var = next(iter(ds.data_vars))
-        dims = ds[first_var].dims
+        source_dims = ds[first_var].dims
+        if len(source_dims) != len(shape):
+            dims = tuple(dim for dim in source_dims if ds[first_var].sizes.get(dim) != 1)
+        else:
+            dims = source_dims
 
         extreme_heat_prob = self._predict_probability(self.extreme_heat_model, features, shape)
-        dry_heat_prob = self._predict_probability(self.dry_heat_model, features, shape)
+        dry_features, dry_shape = feature_matrix_from_dataset(ds, hazard_type="dry_heat_agriculture")
+        if dry_shape != shape:
+            raise ValueError(f"Dry-heat feature shape {dry_shape} does not match extreme-heat feature shape {shape}")
+        dry_heat_prob = self._predict_probability(self.dry_heat_model, dry_features, shape)
+
+        data_vars = {
+            "ExtremeHeat_Risk_Prob": (dims, np.asarray(extreme_heat_prob, dtype=np.float32), {"units": "1"}),
+            "ExtremeHeat_Risk_Level": (dims, _levels_from_probability(extreme_heat_prob), {"units": "class"}),
+            "DryHeatStress_Risk_Prob": (dims, np.asarray(dry_heat_prob, dtype=np.float32), {"units": "1"}),
+            "DryHeatStress_Risk_Level": (dims, _levels_from_probability(dry_heat_prob), {"units": "class"}),
+        }
+        attrs = {
+            "model_family": "lightgbm",
+            "model_name": "LightGBMLayer4Model",
+            "extreme_heat_model": self._display_path(self.extreme_heat_model_path),
+            "dry_heat_model": self._display_path(self.dry_heat_model_path),
+            "flash_flood_model": self._display_path(self.flash_flood_model_path),
+            "feature_names_extreme_heat": ",".join(feature_names_for_hazard("extreme_heat")),
+            "feature_names_dry_heat_agriculture": ",".join(feature_names_for_hazard("dry_heat_agriculture")),
+            "feature_source_contract_version": "layer4_v2",
+        }
+        if self.flash_flood_model is not None:
+            flood_features, flood_shape = feature_matrix_from_dataset(ds, hazard_type="flash_flood")
+            if flood_shape != shape:
+                raise ValueError(f"Flash-flood feature shape {flood_shape} does not match extreme-heat feature shape {shape}")
+            flash_flood_prob = self._predict_probability(self.flash_flood_model, flood_features, shape)
+            data_vars.update(
+                {
+                    "FlashFlood_Risk_Prob": (dims, np.asarray(flash_flood_prob, dtype=np.float32), {"units": "1"}),
+                    "FlashFlood_Risk_Level": (dims, _levels_from_probability(flash_flood_prob), {"units": "class"}),
+                }
+            )
+            attrs["feature_names_flash_flood"] = ",".join(feature_names_for_hazard("flash_flood"))
 
         return xr.Dataset(
-            data_vars={
-                "ExtremeHeat_Risk_Prob": (dims, np.asarray(extreme_heat_prob, dtype=np.float32), {"units": "1"}),
-                "ExtremeHeat_Risk_Level": (dims, _levels_from_probability(extreme_heat_prob), {"units": "class"}),
-                "DryHeatStress_Risk_Prob": (dims, np.asarray(dry_heat_prob, dtype=np.float32), {"units": "1"}),
-                "DryHeatStress_Risk_Level": (dims, _levels_from_probability(dry_heat_prob), {"units": "class"}),
+            data_vars=data_vars,
+            coords={
+                name: (
+                    ds.coords[name].isel({name: 0}, drop=True)
+                    if name in ds.coords and ds.coords[name].sizes.get(name, 0) == 1 and name not in dims
+                    else ds.coords[name]
+                )
+                for name in ds.coords
+                if name in dims or name not in ds.dims or ds.coords[name].sizes.get(name, 0) != 1
             },
-            coords={name: ds.coords[name] for name in ds.coords},
-            attrs={
-                "model_family": "lightgbm",
-                "model_name": "LightGBMLayer4Model",
-                "extreme_heat_model": self._display_path(self.extreme_heat_model_path),
-                "dry_heat_model": self._display_path(self.dry_heat_model_path),
-                "feature_names": ",".join(self.feature_names),
-                "feature_source_contract_version": "layer4_v1",
-            },
+            attrs=attrs,
         )
 
 
@@ -172,11 +216,13 @@ def predict_layer4_risk_fields(
     *,
     extreme_heat_model_path: str | Path | None = None,
     dry_heat_model_path: str | Path | None = None,
+    flash_flood_model_path: str | Path | None = None,
 ) -> Any:
     """Run the standard Layer-4 grid inference entrypoint."""
 
     model = LightGBMLayer4Model(
         extreme_heat_model_path=extreme_heat_model_path,
         dry_heat_model_path=dry_heat_model_path,
+        flash_flood_model_path=flash_flood_model_path,
     )
     return model.predict_fields(dataset)

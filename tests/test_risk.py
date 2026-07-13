@@ -61,8 +61,8 @@ class RiskModelTests(unittest.TestCase):
 
     def test_lightgbm_wrappers_degrade_to_rule_when_model_unavailable(self):
         features = sample_features()
-        risks = [model.predict(features) for model in all_default_models() if model.hazard_type in {"extreme_heat", "dry_heat_agriculture"}]
-        self.assertEqual(len(risks), 2)
+        risks = [model.predict(features) for model in all_default_models() if model.hazard_type in {"flash_flood", "extreme_heat", "dry_heat_agriculture"}]
+        self.assertEqual(len(risks), 3)
         for risk in risks:
             self.assertEqual(risk.model_family, "lightgbm")
             self.assertIn(risk.inference_mode, {"degraded_rule_fallback", "rule"})

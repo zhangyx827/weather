@@ -25,6 +25,7 @@ from mazu_saudi.indicators import (
 )
 from mazu_saudi.schemas import HazardRisk, IndicatorFieldSet, MeteorologicalFeatures
 from mazu_saudi.utils.math import clamp, is_missing
+from .layer4_features import feature_names_for_hazard
 from .levels import RiskThresholdConfig, probability_to_level
 from .ml import OptionalMLAdapter, create_ml_adapter
 
@@ -34,10 +35,27 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LAYER4_MODEL_DIR = REPO_ROOT / "models" / "layer4"
 FEATURE_LABELS = {
     "temp_c": "气温",
+    "tmax_c": "最高气温",
+    "tmin_c": "最低气温",
     "vpd_kpa": "VPD",
     "heat_index_c": "热指数",
     "wind_speed_mps": "近地风速",
     "relative_humidity_percent": "相对湿度",
+    "sst_celsius": "海温",
+    "daily_precip_total": "日累计降水",
+    "daily_convective_precip": "对流降水",
+    "daily_large_scale_precip": "大尺度降水",
+    "cape": "CAPE",
+    "pwat": "可降水量",
+    "ivt": "整层水汽输送",
+    "wind850_speed": "850风速",
+    "wind_shear_850_200": "850-200切变",
+    "flash_flood_risk": "山洪筛查分数",
+    "daily_precip_anomaly": "降水距平",
+    "t2m_anomaly_c": "气温距平",
+    "tmax_anomaly_c": "最高温距平",
+    "heatwave_day_flag": "热浪日标志",
+    "heatwave_duration_days": "热浪持续日数",
 }
 
 
@@ -87,22 +105,35 @@ def _standard_indicator_values(features: RiskInput) -> dict[str, Any]:
         heat_index = compute_heat_index_c(temp, rh)
     return {
         "temp_c": None if is_missing(temp) else float(temp),
+        "tmax_c": None if is_missing(_value(features, "tmax_c")) else float(_value(features, "tmax_c")),
+        "tmin_c": None if is_missing(_value(features, "tmin_c")) else float(_value(features, "tmin_c")),
         "vpd_kpa": None if is_missing(vpd) else float(vpd),
         "heat_index_c": None if is_missing(heat_index) else float(heat_index),
         "wind_speed_mps": None if is_missing(wind) else float(wind),
         "relative_humidity_percent": None if is_missing(rh) else float(rh),
+        "sst_celsius": None if is_missing(_value(features, "sst_celsius")) else float(_value(features, "sst_celsius")),
+        "daily_precip_total": None if is_missing(_value(features, "daily_precip_total")) else float(_value(features, "daily_precip_total")),
+        "daily_convective_precip": None if is_missing(_value(features, "daily_convective_precip")) else float(_value(features, "daily_convective_precip")),
+        "daily_large_scale_precip": None if is_missing(_value(features, "daily_large_scale_precip")) else float(_value(features, "daily_large_scale_precip")),
+        "cape": None if is_missing(_value(features, "cape")) else float(_value(features, "cape")),
+        "pwat": None if is_missing(_value(features, "pwat", legacy="pwat_mm")) else float(_value(features, "pwat", legacy="pwat_mm")),
+        "ivt": None if is_missing(_value(features, "ivt", legacy="ivt_kg_m_s")) else float(_value(features, "ivt", legacy="ivt_kg_m_s")),
+        "wind850_speed": None if is_missing(_value(features, "wind850_speed")) else float(_value(features, "wind850_speed")),
+        "wind_shear_850_200": None if is_missing(_value(features, "wind_shear_850_200")) else float(_value(features, "wind_shear_850_200")),
+        "flash_flood_risk": None if is_missing(_value(features, "flash_flood_risk")) else float(_value(features, "flash_flood_risk")),
+        "daily_precip_anomaly": None if is_missing(_value(features, "daily_precip_anomaly")) else float(_value(features, "daily_precip_anomaly")),
+        "t2m_anomaly_c": None if is_missing(_value(features, "t2m_anomaly_c")) else float(_value(features, "t2m_anomaly_c")),
+        "tmax_anomaly_c": None if is_missing(_value(features, "tmax_anomaly_c")) else float(_value(features, "tmax_anomaly_c")),
+        "heatwave_day_flag": None if is_missing(_value(features, "heatwave_day_flag")) else float(_value(features, "heatwave_day_flag")),
+        "heatwave_duration_days": None if is_missing(_value(features, "heatwave_duration_days")) else float(_value(features, "heatwave_duration_days")),
     }
 
 
-def _layer4_feature_vector(features: RiskInput) -> np.ndarray | None:
+def _layer4_feature_vector(features: RiskInput, hazard_type: str) -> np.ndarray | None:
     values = _standard_indicator_values(features)
-    ordered = [
-        values["temp_c"],
-        values["vpd_kpa"],
-        values["heat_index_c"],
-        values["wind_speed_mps"],
-        values["relative_humidity_percent"],
-    ]
+    ordered = [values.get(name) for name in feature_names_for_hazard(hazard_type)]
+    optional = {"sst_celsius", "t2m_anomaly_c", "tmax_anomaly_c", "heatwave_day_flag", "heatwave_duration_days", "daily_precip_anomaly"}
+    ordered = [np.nan if value is None and name in optional else value for name, value in zip(feature_names_for_hazard(hazard_type), ordered)]
     if any(value is None for value in ordered):
         return None
     return np.asarray(ordered, dtype=np.float32)
@@ -279,7 +310,7 @@ class LightGBMHybridRiskModel(BaseRiskModel):
 
     def predict(self, features: RiskInput) -> HazardRisk:
         fallback = self.fallback_model.predict(features)
-        feature_vector = _layer4_feature_vector(features)
+        feature_vector = _layer4_feature_vector(features, self.hazard_type)
         adapter = self._load_adapter()
         if adapter is None or feature_vector is None:
             fallback.model_family = self.model_family
@@ -314,7 +345,7 @@ class LightGBMHybridRiskModel(BaseRiskModel):
                     **{key: value for key, value in indicator_values.items() if value is not None},
                 },
                 "fallback_model": self.fallback_model.model_name,
-                "feature_source_contract_version": "layer4_v1",
+                "feature_source_contract_version": "layer4_v2",
             },
         )
         risk.evidence["degradation_metadata"] = {}
@@ -490,10 +521,11 @@ class CoastalHumidHeatRiskModel(RuleBasedRiskModel):
 def all_default_models() -> list[BaseRiskModel]:
     """Return the five MVP hazard models."""
 
+    flash_flood_rule = FlashFloodRiskModel()
     extreme_heat_rule = ExtremeHeatRiskModel()
     dry_heat_rule = DryHeatStressRiskModel()
     return [
-        FlashFloodRiskModel(),
+        LightGBMHybridRiskModel("flash_flood", flash_flood_rule, DEFAULT_LAYER4_MODEL_DIR / "flash_flood.txt"),
         LightGBMHybridRiskModel("extreme_heat", extreme_heat_rule, DEFAULT_LAYER4_MODEL_DIR / "extreme_heat.txt"),
         LightGBMHybridRiskModel("dry_heat_agriculture", dry_heat_rule, DEFAULT_LAYER4_MODEL_DIR / "dry_heat_stress.txt"),
         DustPotentialRiskModel(),
