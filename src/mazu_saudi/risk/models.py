@@ -25,7 +25,7 @@ from mazu_saudi.indicators import (
 )
 from mazu_saudi.schemas import HazardRisk, IndicatorFieldSet, MeteorologicalFeatures
 from mazu_saudi.utils.math import clamp, is_missing
-from .layer4_features import feature_names_for_hazard
+from .layer4_features import feature_names_for_hazard, optional_feature_names_for_hazard
 from .levels import RiskThresholdConfig, probability_to_level
 from .ml import OptionalMLAdapter, create_ml_adapter
 
@@ -132,10 +132,25 @@ def _standard_indicator_values(features: RiskInput) -> dict[str, Any]:
 def _layer4_feature_vector(features: RiskInput, hazard_type: str) -> np.ndarray | None:
     values = _standard_indicator_values(features)
     ordered = [values.get(name) for name in feature_names_for_hazard(hazard_type)]
-    optional = {"sst_celsius", "t2m_anomaly_c", "tmax_anomaly_c", "heatwave_day_flag", "heatwave_duration_days", "daily_precip_anomaly"}
+    optional = set(optional_feature_names_for_hazard(hazard_type))
     ordered = [np.nan if value is None and name in optional else value for name, value in zip(feature_names_for_hazard(hazard_type), ordered)]
     if any(value is None for value in ordered):
         return None
+    return np.asarray(ordered, dtype=np.float32)
+
+
+def _layer4_feature_vector_for_names(features: RiskInput, feature_names: list[str] | tuple[str, ...]) -> np.ndarray | None:
+    values = _standard_indicator_values(features)
+    optional_names = set().union(*(optional_feature_names_for_hazard(name) for name in ("extreme_heat", "dry_heat_agriculture", "flash_flood")))
+    ordered: list[float] = []
+    for name in feature_names:
+        value = values.get(name)
+        if value is None and name in optional_names:
+            ordered.append(np.nan)
+            continue
+        if value is None:
+            return None
+        ordered.append(float(value))
     return np.asarray(ordered, dtype=np.float32)
 
 
@@ -310,17 +325,29 @@ class LightGBMHybridRiskModel(BaseRiskModel):
 
     def predict(self, features: RiskInput) -> HazardRisk:
         fallback = self.fallback_model.predict(features)
-        feature_vector = _layer4_feature_vector(features, self.hazard_type)
         adapter = self._load_adapter()
-        if adapter is None or feature_vector is None:
+        trained_feature_names = list(adapter.metadata.get("feature_names", [])) if adapter is not None else []
+        feature_vector = (
+            _layer4_feature_vector_for_names(features, trained_feature_names)
+            if trained_feature_names
+            else _layer4_feature_vector(features, self.hazard_type)
+        )
+        fallback_reason = None
+        if adapter is None:
+            fallback_reason = "missing_model_file"
+        elif feature_vector is None:
+            fallback_reason = "incomplete_ml_features" if not trained_feature_names else "incompatible_model_features"
+        if fallback_reason is not None:
             fallback.model_family = self.model_family
             fallback.inference_mode = "degraded_rule_fallback"
             fallback.source_status = "degraded" if adapter is None else fallback.source_status
             fallback.degradation_metadata = {
                 **fallback.degradation_metadata,
-                "fallback_reason": "missing_model_file" if adapter is None else "incomplete_ml_features",
+                "fallback_reason": fallback_reason,
                 "fallback_model": self.fallback_model.model_name,
             }
+            if trained_feature_names:
+                fallback.degradation_metadata["trained_feature_names"] = trained_feature_names
             fallback.evidence.update(
                 {
                     "model_family": self.model_family,
@@ -345,6 +372,7 @@ class LightGBMHybridRiskModel(BaseRiskModel):
                     **{key: value for key, value in indicator_values.items() if value is not None},
                 },
                 "fallback_model": self.fallback_model.model_name,
+                "trained_feature_names": trained_feature_names or list(feature_names_for_hazard(self.hazard_type)),
                 "feature_source_contract_version": "layer4_v2",
             },
         )

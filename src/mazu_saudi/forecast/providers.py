@@ -533,10 +533,12 @@ def forecast_fields_to_dataset(fields: dict[str, ForecastField], provider_metada
             longitudes.add(float(cell.lon))
 
     times = sorted(grouped.keys())
-    latitude = np.asarray(sorted(latitudes), dtype=np.float32)
-    longitude = np.asarray(sorted(longitudes), dtype=np.float32)
-    lat_index = {float(value): idx for idx, value in enumerate(latitude)}
-    lon_index = {float(value): idx for idx, value in enumerate(longitude)}
+    sorted_latitudes = sorted(latitudes)
+    sorted_longitudes = sorted(longitudes)
+    latitude = np.asarray(sorted_latitudes, dtype=np.float32)
+    longitude = np.asarray(sorted_longitudes, dtype=np.float32)
+    lat_index = {value: idx for idx, value in enumerate(sorted_latitudes)}
+    lon_index = {value: idx for idx, value in enumerate(sorted_longitudes)}
 
     data_vars: dict[str, Any] = {}
     variable_units: dict[str, str] = {}

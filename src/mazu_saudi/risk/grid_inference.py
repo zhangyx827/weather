@@ -8,7 +8,14 @@ from typing import Any
 
 import numpy as np
 
-from .layer4_features import feature_matrix_from_dataset, feature_names_for_hazard
+from .layer4_features import (
+    _dataset_feature_fields,
+    enhancement_feature_names_for_hazard,
+    evidence_feature_names_for_hazard,
+    feature_matrix_from_dataset,
+    feature_names_for_hazard,
+    required_feature_names_for_hazard,
+)
 
 try:
     import xarray as xr
@@ -131,6 +138,29 @@ class LightGBMLayer4Model:
         return feature_matrix_from_dataset(dataset, hazard_type="extreme_heat")
 
     @staticmethod
+    def _model_feature_names(model: Any, hazard_type: str) -> tuple[str, ...]:
+        feature_names_attr = getattr(model, "feature_name", None)
+        if callable(feature_names_attr):
+            names = tuple(str(name) for name in feature_names_attr() if str(name))
+            if names:
+                return names
+        return feature_names_for_hazard(hazard_type)
+
+    def _aligned_feature_matrix(self, dataset: Any, hazard_type: str, model: Any) -> tuple[np.ndarray, tuple[int, ...]]:
+        model_feature_names = self._model_feature_names(model, hazard_type)
+        if model_feature_names == feature_names_for_hazard(hazard_type):
+            return feature_matrix_from_dataset(dataset, hazard_type=hazard_type)
+
+        fields, shape, _ = _dataset_feature_fields(dataset, hazard_type, include_evidence_only=True)
+        matrix = np.column_stack([fields[name].reshape(-1) for name in model_feature_names]).astype(np.float32)
+        required_indexes = [index for index, name in enumerate(model_feature_names) if name not in enhancement_feature_names_for_hazard(hazard_type)]
+        if required_indexes and not np.all(np.isfinite(matrix[:, required_indexes]), axis=1).any():
+            raise ValueError(
+                f"Layer-4 dataset has no valid cells for {hazard_type} using trained model features {model_feature_names}"
+            )
+        return matrix, shape
+
+    @staticmethod
     def _predict_probability(model: Any, features: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
         prediction = np.asarray(model.predict(features))
         if prediction.ndim == 2:
@@ -153,7 +183,7 @@ class LightGBMLayer4Model:
             raise TypeError(f"Expected xarray.Dataset-like input, got {type(dataset)!r}")
 
         ds = dataset
-        features, shape = self._feature_matrix(ds)
+        features, shape = self._aligned_feature_matrix(ds, "extreme_heat", self.extreme_heat_model)
         first_var = next(iter(ds.data_vars))
         source_dims = ds[first_var].dims
         if len(source_dims) != len(shape):
@@ -162,7 +192,7 @@ class LightGBMLayer4Model:
             dims = source_dims
 
         extreme_heat_prob = self._predict_probability(self.extreme_heat_model, features, shape)
-        dry_features, dry_shape = feature_matrix_from_dataset(ds, hazard_type="dry_heat_agriculture")
+        dry_features, dry_shape = self._aligned_feature_matrix(ds, "dry_heat_agriculture", self.dry_heat_model)
         if dry_shape != shape:
             raise ValueError(f"Dry-heat feature shape {dry_shape} does not match extreme-heat feature shape {shape}")
         dry_heat_prob = self._predict_probability(self.dry_heat_model, dry_features, shape)
@@ -181,10 +211,16 @@ class LightGBMLayer4Model:
             "flash_flood_model": self._display_path(self.flash_flood_model_path),
             "feature_names_extreme_heat": ",".join(feature_names_for_hazard("extreme_heat")),
             "feature_names_dry_heat_agriculture": ",".join(feature_names_for_hazard("dry_heat_agriculture")),
+            "required_core_features_extreme_heat": ",".join(required_feature_names_for_hazard("extreme_heat")),
+            "required_core_features_dry_heat_agriculture": ",".join(required_feature_names_for_hazard("dry_heat_agriculture")),
+            "optional_enhancement_features_extreme_heat": ",".join(enhancement_feature_names_for_hazard("extreme_heat")),
+            "optional_enhancement_features_dry_heat_agriculture": ",".join(enhancement_feature_names_for_hazard("dry_heat_agriculture")),
+            "evidence_only_features_extreme_heat": ",".join(evidence_feature_names_for_hazard("extreme_heat")),
+            "evidence_only_features_dry_heat_agriculture": ",".join(evidence_feature_names_for_hazard("dry_heat_agriculture")),
             "feature_source_contract_version": "layer4_v2",
         }
         if self.flash_flood_model is not None:
-            flood_features, flood_shape = feature_matrix_from_dataset(ds, hazard_type="flash_flood")
+            flood_features, flood_shape = self._aligned_feature_matrix(ds, "flash_flood", self.flash_flood_model)
             if flood_shape != shape:
                 raise ValueError(f"Flash-flood feature shape {flood_shape} does not match extreme-heat feature shape {shape}")
             flash_flood_prob = self._predict_probability(self.flash_flood_model, flood_features, shape)
@@ -195,6 +231,9 @@ class LightGBMLayer4Model:
                 }
             )
             attrs["feature_names_flash_flood"] = ",".join(feature_names_for_hazard("flash_flood"))
+            attrs["required_core_features_flash_flood"] = ",".join(required_feature_names_for_hazard("flash_flood"))
+            attrs["optional_enhancement_features_flash_flood"] = ",".join(enhancement_feature_names_for_hazard("flash_flood"))
+            attrs["evidence_only_features_flash_flood"] = ",".join(evidence_feature_names_for_hazard("flash_flood"))
 
         return xr.Dataset(
             data_vars=data_vars,

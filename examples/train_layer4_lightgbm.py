@@ -16,7 +16,12 @@ import numpy as np
 
 from mazu_saudi.data import read_netcdf_dataset
 from mazu_saudi.indicators.physical import compute_dry_heat_stress_score
-from mazu_saudi.risk.layer4_features import feature_matrix_from_dataset, feature_names_for_hazard, prepare_feature_frame
+from mazu_saudi.risk.layer4_features import (
+    feature_matrix_from_dataset,
+    feature_names_for_hazard,
+    prepare_feature_frame,
+    required_feature_names_for_hazard,
+)
 
 DEFAULT_SOURCE = ROOT / "data" / "raw" / "era5_saudi_20250616.nc"
 DEFAULT_MODEL_DIR = ROOT / "models" / "layer4"
@@ -93,11 +98,8 @@ def build_target_from_features(features: np.ndarray, hazard_type: str) -> np.nda
         temp = features[:, index["temp_c"]]
         hi = features[:, index["heat_index_c"]]
         tmax = features[:, index["tmax_c"]]
-        anomaly = np.nan_to_num(features[:, index["tmax_anomaly_c"]], nan=0.0)
-        heatwave = np.nan_to_num(features[:, index["heatwave_day_flag"]], nan=0.0)
         target = np.maximum((temp - 38.0) / 12.0, (hi - 41.0) / 12.0)
         target = np.maximum(target, (tmax - 42.0) / 10.0)
-        target = target + np.where(anomaly >= 3.0, 0.08, 0.0) + np.where(heatwave >= 1.0, 0.08, 0.0)
         return np.clip(target, 0.0, 1.0).astype(np.float32)
     if hazard_type == "dry_heat_agriculture":
         temp = features[:, index["temp_c"]]
@@ -115,7 +117,6 @@ def build_target_from_features(features: np.ndarray, hazard_type: str) -> np.nda
         ivt = features[:, index["ivt"]]
         shear = features[:, index["wind_shear_850_200"]]
         screen = features[:, index["flash_flood_risk"]]
-        anomaly = np.nan_to_num(features[:, index["daily_precip_anomaly"]], nan=0.0)
         target = np.maximum.reduce(
             [
                 precip / 50.0,
@@ -125,7 +126,6 @@ def build_target_from_features(features: np.ndarray, hazard_type: str) -> np.nda
                 ivt / 400.0,
                 shear / 60.0,
                 screen / 4.0,
-                np.maximum(anomaly, 0.0) / 25.0,
             ]
         )
         return np.clip(target, 0.0, 1.0).astype(np.float32)
@@ -180,7 +180,7 @@ def build_training_table(dataset, hazard_type: str):
     else:
         features, _ = feature_matrix_from_dataset(ds, hazard_type=hazard_type)
 
-    required_names = [name for name in feature_names_for_hazard(hazard_type) if name not in {"sst_celsius", "t2m_anomaly_c", "tmax_anomaly_c", "heatwave_day_flag", "heatwave_duration_days", "daily_precip_anomaly"}]
+    required_names = list(required_feature_names_for_hazard(hazard_type))
     required_indexes = [feature_names_for_hazard(hazard_type).index(name) for name in required_names]
     valid_mask = np.all(np.isfinite(features[:, required_indexes]), axis=1)
     features = features[valid_mask]
@@ -190,11 +190,66 @@ def build_training_table(dataset, hazard_type: str):
     return features, target
 
 
+def summarize_frame_training_targets(table, hazard_type: str) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "target_source": "pseudo_target",
+        "input_rows": int(len(table)),
+        "rows_after_label_filter": int(len(table)),
+        "rows_with_explicit_label": 0,
+    }
+    if hazard_type != "flash_flood" or "label" not in table.columns:
+        return summary
+
+    working = table.reset_index(drop=True).copy()
+    if "label_status" in working.columns:
+        label_status = working["label_status"].astype(str).str.lower()
+        status_counts = label_status.value_counts(dropna=False).to_dict()
+        filtered = working[label_status.isin(("positive", "negative"))].copy()
+        summary["label_status_counts"] = {str(key): int(value) for key, value in status_counts.items()}
+    else:
+        filtered = working
+    summary["rows_after_label_filter"] = int(len(filtered))
+
+    labels = filtered["label"].astype(np.float32)
+    explicit_mask = labels.notna()
+    summary["rows_with_explicit_label"] = int(explicit_mask.sum())
+    if explicit_mask.any():
+        summary["target_source"] = "explicit_label"
+        summary["positive_labels"] = int((labels[explicit_mask] > 0.5).sum())
+        summary["negative_labels"] = int((labels[explicit_mask] <= 0.5).sum())
+        if "label_source_mode" in filtered.columns:
+            source_counts = (
+                filtered.loc[explicit_mask, "label_source_mode"]
+                .astype(str)
+                .value_counts(dropna=False)
+                .to_dict()
+            )
+            summary["label_source_mode_counts"] = {str(key): int(value) for key, value in source_counts.items()}
+    return summary
+
+
 def build_training_table_from_frame(table, hazard_type: str):
-    frame = prepare_feature_frame(table, hazard_type=hazard_type)
+    working = table.reset_index(drop=True).copy()
+    target = None
+    if hazard_type == "flash_flood" and "label" in working.columns:
+        labels = working["label"]
+        if "label_status" in working.columns:
+            label_status = working["label_status"].astype(str).str.lower()
+            working = working[label_status.isin(("positive", "negative"))].copy()
+            working = working.reset_index(drop=True)
+            labels = working["label"]
+        labels = labels.astype(np.float32)
+        if labels.notna().any():
+            labels = labels.reset_index(drop=True)
+            target = labels
+
+    frame = prepare_feature_frame(working, hazard_type=hazard_type)
     names = list(feature_names_for_hazard(hazard_type))
     features = frame.loc[:, names].to_numpy(dtype=np.float32)
-    target = build_target_from_features(features, hazard_type)
+    if target is not None:
+        target = target.loc[frame.index].to_numpy(dtype=np.float32)
+    else:
+        target = build_target_from_features(features, hazard_type)
     return features, target
 
 
@@ -286,7 +341,9 @@ def main() -> int:
     model_dir.mkdir(parents=True, exist_ok=True)
 
     dataset, resolved_source_format = load_training_source(source, args.source_format)
+    target_summary = None
     if resolved_source_format == "indicator-parquet":
+        target_summary = summarize_frame_training_targets(dataset, args.hazard_type)
         features, target = build_training_table_from_frame(dataset, args.hazard_type)
     else:
         features, target = build_training_table(dataset, args.hazard_type)
@@ -308,6 +365,8 @@ def main() -> int:
         "feature_names": list(feature_names_for_hazard(args.hazard_type)),
         "model": {"path": display_path(model_path), "valid_rmse": rmse},
     }
+    if target_summary is not None:
+        summary["training_target"] = target_summary
     (model_dir / "train_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
