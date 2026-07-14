@@ -50,7 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--years", nargs="+", required=True, help="Years to download, e.g. 2023 2024")
     parser.add_argument("--single-root", type=Path, default=Path("data/raw"))
     parser.add_argument("--pressure-root", type=Path, default=Path("data/raw"))
-    parser.add_argument("--skip-existing", action="store_true")
+    # 修改：默认就是跳过，只有传入 --overwrite 时才会强制覆盖下载
+    parser.add_argument("--overwrite", action="store_true", help="Force overwrite existing files instead of skipping them.")
     return parser.parse_args()
 
 
@@ -81,11 +82,15 @@ def main() -> int:
             # 1. 下载地面/单层变量 (Single-level)
             # ----------------------------------------------------
             single_target = single_dir / f"era5_single_levels_{year}_{month_str}.nc"
-            if not (args.skip_existing and single_target.exists()):
-                print(f"[{year}-{month_str}] 正在请求地面单层数据...")
-                
-                # 增加网络抖动重试机制
-                for attempt in range(3):
+            
+            # 默认逻辑：如果文件存在且没有指定 --overwrite，则跳过
+            if single_target.exists() and not args.overwrite:
+                print(f"⏭️  [{year}-{month_str}] 地面单层数据文件已存在，自动跳过。")
+            else:
+                print(f"📡 [{year}-{month_str}] 正在请求地面单层数据...")
+                retries = 5
+                backoff = 5
+                for attempt in range(retries):
                     try:
                         client.retrieve(
                             "reanalysis-era5-single-levels",
@@ -101,29 +106,37 @@ def main() -> int:
                             },
                             str(single_target),
                         )
-                        break  # 下载成功，跳出重试循环
-                    except (requests.exceptions.SSLError, MaxRetryError) as e:
-                        if attempt == 2:  # 三次都失败则抛出异常
+                        time.sleep(3)  # 成功后冷却
+                        break
+                    except (requests.exceptions.SSLError, MaxRetryError, requests.exceptions.HTTPError) as e:
+                        if attempt == retries - 1:
                             raise e
-                        print(f"⚠️ 遇到网络连接异常(SSL/Retry)，5秒后进行第 {attempt + 2} 次重试...")
-                        time.sleep(5)
+                        print(f"⚠️ 地面数据下载异常，{backoff}秒后重试...")
+                        time.sleep(backoff)
+                        backoff *= 2
 
             # ----------------------------------------------------
             # 2. 下载高空/气压层变量 (Pressure-level)
             # ----------------------------------------------------
-            # 优化：合并所有变量到单个 NetCDF 文件中请求，避免高频请求触发 CDS 服务器防火墙拦截
-            pressure_target = pressure_dir / f"era5_pl_{year}_{month_str}.nc"
-            if not (args.skip_existing and pressure_target.exists()):
-                print(f"[{year}-{month_str}] 正在合并请求高空气压层数据...")
+            for variable in PRESSURE_VARS:
+                pressure_target = pressure_dir / f"era5_pl_{year}_{month_str}_{variable}.nc"
                 
-                for attempt in range(3):
+                # 默认逻辑：如果文件存在且没有指定 --overwrite，则跳过
+                if pressure_target.exists() and not args.overwrite:
+                    print(f"⏭️  [{year}-{month_str}] 高空变量 {variable} 已存在，自动跳过。")
+                    continue
+                
+                print(f"📡 [{year}-{month_str}] 正在请求高空层变量: {variable} ...")
+                retries = 5
+                backoff = 5
+                for attempt in range(retries):
                     try:
                         client.retrieve(
                             "reanalysis-era5-pressure-levels",
                             {
                                 "product_type": "reanalysis",
                                 "data_format": "netcdf",
-                                "variable": PRESSURE_VARS,  # 传入完整的变量列表，不再循环
+                                "variable": [variable],
                                 "pressure_level": PRESSURE_LEVELS,
                                 "year": year,
                                 "month": month_str,
@@ -133,14 +146,16 @@ def main() -> int:
                             },
                             str(pressure_target),
                         )
-                        break  # 下载成功，跳出重试循环
-                    except (requests.exceptions.SSLError, MaxRetryError) as e:
-                        if attempt == 2:
+                        time.sleep(3)  # 成功后冷却
+                        break
+                    except (requests.exceptions.SSLError, MaxRetryError, requests.exceptions.HTTPError) as e:
+                        if attempt == retries - 1:
                             raise e
-                        print(f"⚠️ 遇到网络连接异常(SSL/Retry)，5秒后进行第 {attempt + 2} 次重试...")
-                        time.sleep(5)
+                        print(f"⚠️ 高空变量 {variable} 下载异常，{backoff}秒后重试...")
+                        time.sleep(backoff)
+                        backoff *= 2
                         
-    print("🎉 所有请求及下载任务已顺利完成！")
+    print("🎉 所有任务处理完毕！")
     return 0
 
 
