@@ -22,6 +22,7 @@ from mazu_saudi.risk.layer4_features import (
     prepare_feature_frame,
     required_feature_names_for_hazard,
 )
+from mazu_saudi.risk.ml import LightGBMAdapter
 
 DEFAULT_SOURCE = ROOT / "data" / "raw" / "era5_saudi_20250616.nc"
 DEFAULT_MODEL_DIR = ROOT / "models" / "layer4"
@@ -253,52 +254,6 @@ def build_training_table_from_frame(table, hazard_type: str):
     return features, target
 
 
-def train_booster(features, target, hazard_type: str, seed=42):
-    import lightgbm as lgb
-
-    indices = np.arange(features.shape[0])
-    rng = np.random.default_rng(seed)
-    rng.shuffle(indices)
-
-    split = int(indices.size * 0.9)
-    train_idx = indices[:split]
-    valid_idx = indices[split:]
-
-    feature_names = list(feature_names_for_hazard(hazard_type))
-    train_set = lgb.Dataset(features[train_idx], label=target[train_idx], feature_name=feature_names, free_raw_data=False)
-    valid_set = lgb.Dataset(features[valid_idx], label=target[valid_idx], feature_name=feature_names, free_raw_data=False)
-
-    params = {
-        "boosting_type": "gbdt",
-        "objective": "regression",
-        "metric": "rmse",
-        "learning_rate": 0.05,
-        "num_leaves": 31,
-        "min_data_in_leaf": 100,
-        "feature_fraction": 0.9,
-        "bagging_fraction": 0.9,
-        "bagging_freq": 1,
-        "lambda_l2": 1.0,
-        "verbosity": -1,
-        "seed": seed,
-        "feature_fraction_seed": seed,
-        "bagging_seed": seed,
-        "data_random_seed": seed,
-    }
-
-    booster = lgb.train(
-        params,
-        train_set,
-        num_boost_round=250,
-        valid_sets=[valid_set],
-        callbacks=[lgb.early_stopping(20, verbose=False)],
-    )
-
-    valid_pred = booster.predict(features[valid_idx])
-    rmse = float(np.sqrt(np.mean((valid_pred - target[valid_idx]) ** 2)))
-    return booster, rmse
-
-
 def display_path(path: Path) -> str:
     try:
         return str(path.relative_to(ROOT))
@@ -348,14 +303,25 @@ def main() -> int:
     else:
         features, target = build_training_table(dataset, args.hazard_type)
 
-    model, rmse = train_booster(features, target, args.hazard_type, seed=args.seed)
+    adapter = LightGBMAdapter()
+    training_summary = adapter.train(
+        {
+            "features": features,
+            "labels": target,
+            "feature_names": list(feature_names_for_hazard(args.hazard_type)),
+        },
+        validation_fraction=0.1,
+        seed=args.seed,
+        num_boost_round=250,
+        early_stopping_rounds=20,
+    )
     model_filenames = {
         "extreme_heat": "extreme_heat.txt",
         "dry_heat_agriculture": "dry_heat_stress.txt",
         "flash_flood": "flash_flood.txt",
     }
     model_path = model_dir / model_filenames[args.hazard_type]
-    model.save_model(str(model_path))
+    adapter.save_model(model_path)
 
     summary = {
         "source": display_path(source),
@@ -363,7 +329,14 @@ def main() -> int:
         "hazard_type": args.hazard_type,
         "samples": int(features.shape[0]),
         "feature_names": list(feature_names_for_hazard(args.hazard_type)),
-        "model": {"path": display_path(model_path), "valid_rmse": rmse},
+        "model": {
+            "path": display_path(model_path),
+            "backend": training_summary["backend"],
+            "objective": training_summary["objective"],
+            "metric": training_summary["metric"],
+            "validation_metric": training_summary["validation_metric"],
+            "best_iteration": training_summary["best_iteration"],
+        },
     }
     if target_summary is not None:
         summary["training_target"] = target_summary

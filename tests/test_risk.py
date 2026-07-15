@@ -1,8 +1,13 @@
 """Tests for risk models and levels."""
 
+import tempfile
 import unittest
+from pathlib import Path
+
+import numpy as np
 
 from mazu_saudi.risk import MLBackedRiskModel, all_default_models, probability_to_level
+from mazu_saudi.risk.ml import LightGBMAdapter
 from mazu_saudi.schemas import GridCell, MeteorologicalFeatures, RiskLevel
 
 
@@ -67,6 +72,51 @@ class RiskModelTests(unittest.TestCase):
             self.assertEqual(risk.model_family, "lightgbm")
             self.assertIn(risk.inference_mode, {"degraded_rule_fallback", "rule"})
             self.assertIn("degradation_metadata", risk.evidence)
+
+    def test_lightgbm_adapter_train_save_load_roundtrip(self):
+        adapter = LightGBMAdapter()
+        rng = np.random.default_rng(42)
+        features = rng.normal(size=(48, 3)).astype(np.float32)
+        labels = (features[:, 0] + 0.5 * features[:, 1] > 0.0).astype(np.float32)
+
+        summary = adapter.train(
+            {
+                "features": features,
+                "labels": labels,
+                "feature_names": ["temp_c", "rh2m", "wind10_speed"],
+            }
+        )
+
+        self.assertEqual(summary["status"], "trained")
+        self.assertEqual(summary["backend"], "lightgbm")
+        self.assertEqual(summary["feature_names"], ["temp_c", "rh2m", "wind10_speed"])
+        self.assertEqual(summary["objective"], "binary")
+        self.assertEqual(summary["metric"], "binary_logloss")
+        self.assertGreater(summary["train_rows"], 0)
+        self.assertGreater(summary["validation_rows"], 0)
+        self.assertIsInstance(summary["validation_metric"], float)
+        prediction = adapter.predict_proba(features[0])
+        self.assertGreaterEqual(prediction, 0.0)
+        self.assertLessEqual(prediction, 1.0)
+        shap = adapter.shap_explain(features[0])
+        self.assertTrue(shap["available"])
+        self.assertEqual(shap["backend"], "lightgbm")
+        self.assertEqual(set(shap["values"].keys()), {"temp_c", "rh2m", "wind10_speed"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "flash_flood.txt"
+            adapter.save_model(model_path)
+            self.assertTrue(model_path.exists())
+            self.assertTrue(Path(f"{model_path}.metadata.json").exists())
+
+            reloaded = LightGBMAdapter().load_model(model_path)
+            self.assertTrue(reloaded.trained)
+            self.assertEqual(reloaded.metadata["feature_names"], ["temp_c", "rh2m", "wind10_speed"])
+            self.assertEqual(reloaded.metadata["objective"], "binary")
+            self.assertEqual(reloaded.metadata["metric"], "binary_logloss")
+            reloaded_prediction = reloaded.predict_proba(features[0])
+            self.assertGreaterEqual(reloaded_prediction, 0.0)
+            self.assertLessEqual(reloaded_prediction, 1.0)
 
 
 if __name__ == "__main__":

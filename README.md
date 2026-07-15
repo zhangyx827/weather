@@ -43,6 +43,18 @@ Inspect current repo capabilities:
 python3 scripts/capability_report.py
 ```
 
+STCast 2024 data cadence and stats-window contract:
+
+```bash
+cat docs/stcast_2024_contract.md
+```
+
+Verified flash-flood source ingestion contract:
+
+```bash
+cat docs/flash_flood_verified_ingestion.md
+```
+
 Run API after installing dependencies:
 
 ```bash

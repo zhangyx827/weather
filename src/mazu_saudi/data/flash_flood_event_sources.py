@@ -58,13 +58,22 @@ def _records_from_input(records: Any) -> list[dict[str, Any]]:
 
 
 def _canonical_event_key(event: FlashFloodEvent) -> tuple[Any, ...]:
+    normalized_location = _normalize_slug(event.location_name)
+    normalized_geometry = _normalize_text(event.geometry_wkt)
+    rounded_latitude = None if event.latitude is None else round(float(event.latitude), 2)
+    rounded_longitude = None if event.longitude is None else round(float(event.longitude), 2)
+    if normalized_geometry:
+        spatial_key: tuple[Any, ...] = ("geometry", normalized_geometry)
+    elif normalized_location:
+        spatial_key = ("location", normalized_location)
+    else:
+        spatial_key = ("coordinates", rounded_latitude, rounded_longitude)
     return (
+        _normalize_slug(event.hazard_type),
         event.start_date.isoformat(),
         event.end_date.isoformat(),
-        _normalize_slug(event.location_name),
-        None if event.latitude is None else round(float(event.latitude), 2),
-        None if event.longitude is None else round(float(event.longitude), 2),
-        _normalize_text(event.geometry_wkt),
+        _normalize_slug(event.country_code),
+        *spatial_key,
     )
 
 

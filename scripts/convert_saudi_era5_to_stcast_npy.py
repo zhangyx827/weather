@@ -33,18 +33,26 @@ def _open_monthly_pressure(pressure_dir: Path, missing_dir: Path, year: int, mon
     missing_path = missing_dir / f"era5_pl_{year}_{month:02d}_{long_name}_missing.nc"
     if not regular_path.exists():
         raise FileNotFoundError(f"Missing pressure file: {regular_path}")
-    if not missing_path.exists():
-        raise FileNotFoundError(f"Missing supplemental pressure file: {missing_path}")
-
-    with xr.open_dataset(regular_path) as regular_ds, xr.open_dataset(missing_path) as missing_ds:
+    with xr.open_dataset(regular_path) as regular_ds:
         regular_var = next(iter(regular_ds.data_vars))
-        missing_var = next(iter(missing_ds.data_vars))
-        combined = xr.concat([regular_ds[regular_var], missing_ds[missing_var]], dim="pressure_level")
-        combined = combined.sortby("pressure_level", ascending=False)
-        levels = combined.pressure_level.values.astype(float).tolist()
-        if levels != PRESSURE_LEVELS:
-            raise ValueError(f"Unexpected pressure levels for {long_name} {year}-{month:02d}: {levels}")
-        return combined.load()
+        regular = regular_ds[regular_var]
+        regular_levels = regular.pressure_level.values.astype(float).tolist()
+        if regular_levels == PRESSURE_LEVELS:
+            return regular.load()
+
+        if not missing_path.exists():
+            raise FileNotFoundError(
+                f"Missing supplemental pressure file for incomplete levels: {missing_path}"
+            )
+
+        with xr.open_dataset(missing_path) as missing_ds:
+            missing_var = next(iter(missing_ds.data_vars))
+            combined = xr.concat([regular, missing_ds[missing_var]], dim="pressure_level")
+            combined = combined.sortby("pressure_level", ascending=False)
+            levels = combined.pressure_level.values.astype(float).tolist()
+            if levels != PRESSURE_LEVELS:
+                raise ValueError(f"Unexpected pressure levels for {long_name} {year}-{month:02d}: {levels}")
+            return combined.load()
 
 
 def _sanitize_field(data: xr.DataArray) -> np.ndarray:

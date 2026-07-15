@@ -22,6 +22,8 @@ from mazu_saudi.data import (
     build_flash_flood_training_labels,
     seed_flash_flood_events,
 )
+from mazu_saudi.risk.layer4_features import feature_names_for_hazard
+from mazu_saudi.risk.ml import LightGBMAdapter
 
 try:
     import pandas as pd
@@ -154,19 +156,37 @@ def run_demo(
     train_module = _load_training_module()
     target_summary = train_module.summarize_frame_training_targets(supervised, "flash_flood")
     features_matrix, target = train_module.build_training_table_from_frame(supervised, "flash_flood")
-    model, rmse = train_module.train_booster(features_matrix, target, "flash_flood", seed=seed)
+    adapter = LightGBMAdapter()
+    training_summary = adapter.train(
+        {
+            "features": features_matrix,
+            "labels": target,
+            "feature_names": list(feature_names_for_hazard("flash_flood")),
+        },
+        validation_fraction=0.1,
+        seed=seed,
+        num_boost_round=250,
+        early_stopping_rounds=20,
+    )
 
     model_dir = output_dir / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / "flash_flood.txt"
-    model.save_model(str(model_path))
+    adapter.save_model(model_path)
     train_summary = {
         "source": str(supervised_path) if "supervised_path" in summary else str(feature_path),
         "source_format": "indicator-parquet" if "supervised_path" in summary else "demo-dataframe",
         "hazard_type": "flash_flood",
         "samples": int(features_matrix.shape[0]),
-        "feature_names": list(train_module.feature_names_for_hazard("flash_flood")),
-        "model": {"path": str(model_path), "valid_rmse": rmse},
+        "feature_names": list(feature_names_for_hazard("flash_flood")),
+        "model": {
+            "path": str(model_path),
+            "backend": training_summary["backend"],
+            "objective": training_summary["objective"],
+            "metric": training_summary["metric"],
+            "validation_metric": training_summary["validation_metric"],
+            "best_iteration": training_summary["best_iteration"],
+        },
         "training_target": target_summary,
     }
     train_summary_path = model_dir / "train_summary.json"

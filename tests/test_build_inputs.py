@@ -20,14 +20,17 @@ def _write_dataset(path: Path, ds: xr.Dataset) -> None:
 def _build_fake_raw_tree(
     root: Path,
     *,
+    year: int = 2025,
     include_oisst: bool = True,
     include_jpl_mur: bool = False,
     oisst_value_c: float = 25.0,
     jpl_value_c: float = 27.0,
+    supplemental_pressure_levels: dict[str, tuple[int, ...]] | None = None,
 ) -> Path:
     raw_root = root / "data" / "raw"
-    single_dir = raw_root / "era5_single_levels_2025"
-    pressure_dir = raw_root / "era5_pressure_levels_2025"
+    single_dir = raw_root / f"era5_single_levels_{year}"
+    pressure_dir = raw_root / f"era5_pressure_levels_{year}"
+    missing_pressure_dir = raw_root / f"era5_pressure_levels_{year}_missing"
     precip_dir = raw_root / "precip"
     dust_dir = raw_root / "dust"
     sst_dir = raw_root / "sst"
@@ -35,11 +38,11 @@ def _build_fake_raw_tree(
 
     times = np.array(
         [
-            "2025-01-01T00:00:00",
-            "2025-01-01T06:00:00",
-            "2025-01-01T12:00:00",
-            "2025-01-01T18:00:00",
-            "2025-01-02T00:00:00",
+            f"{year}-01-01T00:00:00",
+            f"{year}-01-01T06:00:00",
+            f"{year}-01-01T12:00:00",
+            f"{year}-01-01T18:00:00",
+            f"{year}-01-02T00:00:00",
         ],
         dtype="datetime64[ns]",
     )
@@ -94,7 +97,7 @@ def _build_fake_raw_tree(
     instant.to_netcdf(tmp_instant)
     accum.to_netcdf(tmp_accum)
     max_ds.to_netcdf(tmp_max)
-    zip_path = single_dir / "era5_single_levels_2025_01.nc"
+    zip_path = single_dir / f"era5_single_levels_{year}_01.nc"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w") as archive:
         archive.write(tmp_instant, "data_stream-oper_stepType-instant.nc")
@@ -109,8 +112,8 @@ def _build_fake_raw_tree(
         },
         coords={"valid_time": times, "latitude": lats, "longitude": lons},
     )
-    _write_dataset(single_dir / "era5_single_levels_2025_01_aurora.nc", aurora_single)
-    _write_dataset(single_dir / "era5_single_levels_2025_01_static.nc", aurora_single[["lsm", "slt"]].isel(valid_time=slice(0, 1)))
+    _write_dataset(single_dir / f"era5_single_levels_{year}_01_aurora.nc", aurora_single)
+    _write_dataset(single_dir / f"era5_single_levels_{year}_01_static.nc", aurora_single[["lsm", "slt"]].isel(valid_time=slice(0, 1)))
 
     pressure_payloads = {
         "specific_humidity": ("q", 0.01, "kg kg**-1"),
@@ -122,6 +125,7 @@ def _build_fake_raw_tree(
         "divergence": ("d", -1e-5, "s**-1"),
         "relative_vorticity": ("r", 60.0, "%"),
     }
+    supplemental_pressure_levels = supplemental_pressure_levels or {}
     for suffix, (var_name, value, units) in pressure_payloads.items():
         ds = xr.Dataset(
             {
@@ -133,13 +137,22 @@ def _build_fake_raw_tree(
             },
             coords={"valid_time": times, "pressure_level": levels, "latitude": lats, "longitude": lons},
         )
-        _write_dataset(pressure_dir / f"era5_pl_2025_01_{suffix}.nc", ds)
+        supplemental_levels = supplemental_pressure_levels.get(suffix, ())
+        if supplemental_levels:
+            primary_levels = [level for level in levels.tolist() if level not in supplemental_levels]
+            _write_dataset(pressure_dir / f"era5_pl_{year}_01_{suffix}.nc", ds.sel(pressure_level=primary_levels))
+            _write_dataset(
+                missing_pressure_dir / f"era5_pl_{year}_01_{suffix}_missing.nc",
+                ds.sel(pressure_level=list(supplemental_levels)),
+            )
+            continue
+        _write_dataset(pressure_dir / f"era5_pl_{year}_01_{suffix}.nc", ds)
 
     gpm = xr.Dataset(
         {"precipitation": (("time", "lat", "lon"), np.full((1, len(lats), len(lons)), 12.0, dtype=np.float32), {"units": "mm/day"})},
-        coords={"time": np.array(["2025-01-01"], dtype="datetime64[ns]"), "lat": lats[::-1], "lon": lons},
+        coords={"time": np.array([f"{year}-01-01"], dtype="datetime64[ns]"), "lat": lats[::-1], "lon": lons},
     )
-    _write_dataset(precip_dir / "GPM_3IMERGDF_20250101.nc4", gpm)
+    _write_dataset(precip_dir / f"GPM_3IMERGDF_{year}0101.nc4", gpm)
 
     dust = xr.Dataset(
         {
@@ -147,16 +160,16 @@ def _build_fake_raw_tree(
             "DUCMASS": (("time", "lat", "lon"), np.full((2, len(lats), len(lons)), 0.2, dtype=np.float32), {"units": "kg m-2"}),
             "DUSMASS": (("time", "lat", "lon"), np.full((2, len(lats), len(lons)), 0.001, dtype=np.float32), {"units": "kg m-3"}),
         },
-        coords={"time": np.array(["2025-01-01T00:00:00", "2025-01-01T12:00:00"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
+        coords={"time": np.array([f"{year}-01-01T00:00:00", f"{year}-01-01T12:00:00"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
     )
-    _write_dataset(dust_dir / "MERRA2_20250101.nc4", dust)
+    _write_dataset(dust_dir / f"MERRA2_{year}0101.nc4", dust)
 
     if include_oisst:
         sst = xr.Dataset(
             {"sst": (("time", "lat", "lon"), np.full((1, len(lats), len(lons)), oisst_value_c, dtype=np.float32), {"units": "degC"})},
-            coords={"time": np.array(["2025-01-01"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
+            coords={"time": np.array([f"{year}-01-01"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
         )
-        _write_dataset(sst_dir / "oisst.day.mean.2025.nc", sst)
+        _write_dataset(sst_dir / f"oisst.day.mean.{year}.nc", sst)
     if include_jpl_mur:
         jpl = xr.Dataset(
             {
@@ -166,15 +179,15 @@ def _build_fake_raw_tree(
                     {"units": "degC"},
                 )
             },
-            coords={"time": np.array(["2025-01-01"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
+            coords={"time": np.array([f"{year}-01-01"], dtype="datetime64[ns]"), "lat": lats, "lon": lons},
         )
         _write_dataset(sst_dir / "jplMURSST41_72e4_84a7_e7ac.nc", jpl)
 
     chirps = xr.Dataset(
         {"precip": (("time", "latitude", "longitude"), np.full((1, len(lats), len(lons)), 31.0, dtype=np.float32), {"units": "mm/month"})},
-        coords={"time": np.array(["2025-01-01"], dtype="datetime64[ns]"), "latitude": lats, "longitude": lons},
+        coords={"time": np.array([f"{year}-01-01"], dtype="datetime64[ns]"), "latitude": lats, "longitude": lons},
     )
-    _write_dataset(precip_dir / "chirps-v3.0.2025.monthly.nc", chirps)
+    _write_dataset(precip_dir / f"chirps-v3.0.{year}.monthly.nc", chirps)
 
     elevation = xr.Dataset(
         {"elevation_m": (("latitude", "longitude"), np.array([[100.0, 110.0], [90.0, 95.0]], dtype=np.float32))},
@@ -325,3 +338,55 @@ class TestBuildInputs:
         assert indicator_entry["metadata"]["resolved_sources"]["sst"]["resolved_source"] == "oisst"
         assert indicator_entry["metadata"]["resolved_sources"]["dust"]["resolved_source"] == "merra2_dust"
         assert indicator_entry["metadata"]["resolved_sources"]["precip_daily"]["resolved_source"] == "gpm_imerg_daily"
+
+    def test_build_daily_indicators_supports_explicit_2024_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = _build_fake_raw_tree(Path(tmp), year=2024)
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=Path(tmp) / "aurora",
+                indicator_nc_out=Path(tmp) / "nc",
+                indicator_parquet_out=Path(tmp) / "pq",
+                single_dir=raw_root / "era5_single_levels_2024",
+                pressure_dir=raw_root / "era5_pressure_levels_2024",
+            )
+            try:
+                ds = builder.build_daily_indicators(date(2024, 1, 1))
+            finally:
+                builder.close()
+
+        assert "flash_flood_risk" in ds.data_vars
+        assert str(ds["time"].values[0]).startswith("2024-01-01")
+
+    def test_build_daily_indicators_merges_supplemental_pressure_levels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = _build_fake_raw_tree(
+                Path(tmp),
+                supplemental_pressure_levels={"temperature": (300, 200)},
+            )
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=Path(tmp) / "aurora",
+                indicator_nc_out=Path(tmp) / "nc",
+                indicator_parquet_out=Path(tmp) / "pq",
+                missing_pressure_dir=raw_root / "era5_pressure_levels_2025_missing",
+            )
+            try:
+                ds = builder.build_daily_indicators(date(2025, 1, 1))
+            finally:
+                builder.close()
+
+            assert "pwat" in ds.data_vars
+            aurora = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=Path(tmp) / "aurora",
+                indicator_nc_out=Path(tmp) / "nc",
+                indicator_parquet_out=Path(tmp) / "pq",
+                missing_pressure_dir=raw_root / "era5_pressure_levels_2025_missing",
+            )
+            try:
+                aurora_ds = aurora.build_aurora_input(datetime(2025, 1, 1, 6, tzinfo=timezone.utc))
+            finally:
+                aurora.close()
+
+            assert list(aurora_ds["level"].values) == list(PRESSURE_LEVELS)

@@ -65,6 +65,14 @@ def _parquet_available() -> bool:
             return False
 
 
+def _lightgbm_available() -> bool:
+    try:
+        import lightgbm  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def _indicator_frame(rows: int = 512) -> pd.DataFrame:
     rng = np.random.default_rng(42)
     return pd.DataFrame(
@@ -149,7 +157,11 @@ def test_indicator_parquet_training_smoke():
         summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
         assert summary["source_format"] == "indicator-parquet"
         assert summary["hazard_type"] == "extreme_heat"
+        assert summary["model"]["backend"] == "lightgbm"
+        assert summary["model"]["objective"] == "regression"
+        assert summary["model"]["metric"] == "rmse"
         assert (model_dir / "extreme_heat.txt").exists()
+        assert (model_dir / "extreme_heat.txt.metadata.json").exists()
 
 
 def test_indicator_netcdf_training_table():
@@ -337,3 +349,21 @@ def test_demo_flash_flood_supervised_training_builds_balanced_dataset(tmp_path: 
     assert (tmp_path / "flash_flood_demo_labels.csv").exists()
     if _parquet_available():
         assert (tmp_path / "flash_flood_demo_supervised.parquet").exists()
+
+
+def test_demo_flash_flood_supervised_training_trains_with_adapter(tmp_path: Path):
+    if not _lightgbm_available():
+        return
+
+    module = _load_demo_supervised_module()
+    summary = module.run_demo(tmp_path, rows_per_bucket=3, train_model=True)
+
+    assert summary["model_path"].endswith("flash_flood.txt")
+    assert Path(summary["model_path"]).exists()
+    assert Path(f"{summary['model_path']}.metadata.json").exists()
+    train_summary = json.loads(Path(summary["train_summary_path"]).read_text(encoding="utf-8"))
+    assert train_summary["hazard_type"] == "flash_flood"
+    assert train_summary["model"]["backend"] == "lightgbm"
+    assert train_summary["model"]["objective"] == "binary"
+    assert train_summary["model"]["metric"] == "binary_logloss"
+    assert train_summary["training_target"]["target_source"] == "explicit_label"

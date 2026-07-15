@@ -13,6 +13,55 @@ from typing import Any
 import numpy as np
 
 
+def _metadata_sidecar_path(path: str | Path) -> Path:
+    target = Path(path)
+    return target.with_name(f"{target.name}.metadata.json")
+
+
+def _coerce_training_arrays(dataset: Any) -> tuple[np.ndarray, np.ndarray, list[str] | None]:
+    """Normalize common training payload shapes into dense arrays."""
+
+    feature_names = None
+    features = None
+    labels = None
+
+    if isinstance(dataset, dict):
+        features = dataset.get("features", dataset.get("X"))
+        labels = dataset.get("labels", dataset.get("y", dataset.get("target")))
+        raw_feature_names = dataset.get("feature_names")
+        if raw_feature_names is not None:
+            feature_names = [str(name) for name in raw_feature_names]
+    elif isinstance(dataset, (tuple, list)) and len(dataset) == 2:
+        features, labels = dataset
+    else:
+        features = getattr(dataset, "features", getattr(dataset, "X", None))
+        labels = getattr(dataset, "labels", getattr(dataset, "y", getattr(dataset, "target", None)))
+        raw_feature_names = getattr(dataset, "feature_names", None)
+        if raw_feature_names is not None:
+            feature_names = [str(name) for name in raw_feature_names]
+
+    if features is None or labels is None:
+        raise TypeError("Training dataset must provide features and labels")
+
+    feature_array = np.asarray(features, dtype=np.float32)
+    label_array = np.asarray(labels, dtype=np.float32).reshape(-1)
+    if feature_array.ndim == 1:
+        feature_array = feature_array.reshape(-1, 1)
+    if feature_array.ndim != 2:
+        raise ValueError(f"Expected 2D feature matrix, got shape {feature_array.shape}")
+    if feature_array.shape[0] != label_array.shape[0]:
+        raise ValueError(
+            f"Feature row count {feature_array.shape[0]} does not match label count {label_array.shape[0]}"
+        )
+    if feature_names is not None and len(feature_names) != feature_array.shape[1]:
+        raise ValueError(
+            f"Feature name count {len(feature_names)} does not match feature width {feature_array.shape[1]}"
+        )
+    if feature_names is None:
+        feature_names = [f"feature_{index}" for index in range(feature_array.shape[1])]
+    return feature_array, label_array, feature_names
+
+
 class OptionalMLAdapter:
     """Stable adapter contract for future LightGBM/XGBoost/SHAP models."""
 
@@ -75,17 +124,157 @@ class LightGBMAdapter(OptionalMLAdapter):
         self.lgb = lgb
         self.booster = None
 
-    def load_model(self, path: str | Path) -> "LightGBMAdapter":
-        self.booster = self.lgb.Booster(model_file=str(path))
+    def train(
+        self,
+        dataset: Any,
+        *,
+        validation_fraction: float = 0.2,
+        seed: int = 42,
+        num_boost_round: int = 100,
+        early_stopping_rounds: int = 10,
+        objective: str | None = None,
+        metric: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        features, labels, feature_names = _coerce_training_arrays(dataset)
+        indices = np.arange(features.shape[0], dtype=np.int32)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+
+        if indices.size >= 10 and validation_fraction > 0.0:
+            validation_fraction = min(max(validation_fraction, 0.05), 0.5)
+            split = max(1, min(indices.size - 1, int(indices.size * (1.0 - validation_fraction))))
+            train_idx = indices[:split]
+            valid_idx = indices[split:]
+        else:
+            train_idx = indices
+            valid_idx = np.asarray([], dtype=np.int32)
+
+        unique_labels = {float(value) for value in np.unique(labels[np.isfinite(labels)])}
+        is_binary = unique_labels.issubset({0.0, 1.0}) and len(unique_labels) >= 1
+        resolved_objective = objective or ("binary" if is_binary else "regression")
+        resolved_metric = metric or ("binary_logloss" if resolved_objective == "binary" else "rmse")
+        training_params = {
+            "boosting_type": "gbdt",
+            "objective": resolved_objective,
+            "metric": resolved_metric,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "min_data_in_leaf": max(1, min(20, max(1, features.shape[0] // 10))),
+            "feature_fraction": 0.9,
+            "bagging_fraction": 0.9,
+            "bagging_freq": 1,
+            "lambda_l2": 1.0,
+            "verbosity": -1,
+            "seed": seed,
+            "feature_fraction_seed": seed,
+            "bagging_seed": seed,
+            "data_random_seed": seed,
+        }
+        if params:
+            training_params.update(params)
+        train_set = self.lgb.Dataset(
+            features[train_idx],
+            label=labels[train_idx],
+            feature_name=feature_names,
+            free_raw_data=False,
+        )
+        valid_sets = []
+        valid_names = []
+        callbacks = []
+        if valid_idx.size:
+            valid_sets.append(
+                self.lgb.Dataset(
+                    features[valid_idx],
+                    label=labels[valid_idx],
+                    feature_name=feature_names,
+                    free_raw_data=False,
+                )
+            )
+            valid_names.append("validation")
+            callbacks.append(self.lgb.early_stopping(early_stopping_rounds, verbose=False))
+
+        self.booster = self.lgb.train(
+            training_params,
+            train_set,
+            num_boost_round=num_boost_round,
+            valid_sets=valid_sets or None,
+            valid_names=valid_names or None,
+            callbacks=callbacks,
+        )
+        self.trained = True
+        best_iteration = int(getattr(self.booster, "best_iteration", 0) or 0)
+        best_score = getattr(self.booster, "best_score", {}) or {}
+        validation_scores = best_score.get("validation", {})
+        validation_metric = None
+        if resolved_metric in validation_scores:
+            validation_metric = float(validation_scores[resolved_metric])
+        elif validation_scores:
+            first_metric_name, first_metric_value = next(iter(validation_scores.items()))
+            resolved_metric = str(first_metric_name)
+            validation_metric = float(first_metric_value)
+        training_summary = {
+            "status": "trained",
+            "backend": self.backend,
+            "sample_count": int(features.shape[0]),
+            "feature_count": int(features.shape[1]),
+            "feature_names": list(feature_names),
+            "objective": training_params["objective"],
+            "metric": resolved_metric,
+            "best_iteration": best_iteration,
+            "train_rows": int(train_idx.size),
+            "validation_rows": int(valid_idx.size),
+            "validation_metric": validation_metric,
+        }
         self.metadata.update(
             {
+                "backend": self.backend,
+                "trained": True,
+                "training_params": training_params,
+                **training_summary,
+            }
+        )
+        return training_summary
+
+    def load_model(self, path: str | Path) -> "LightGBMAdapter":
+        self.booster = self.lgb.Booster(model_file=str(path))
+        metadata_path = _metadata_sidecar_path(path)
+        if metadata_path.exists():
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            loaded_metadata = dict(payload.get("metadata", payload))
+        else:
+            loaded_metadata = {}
+        feature_names = list(self.booster.feature_name())
+        self.metadata.update(
+            {
+                **loaded_metadata,
+                "backend": self.backend,
                 "trained": True,
                 "model_path": str(path),
-                "feature_names": list(self.booster.feature_name()),
+                "feature_names": feature_names,
             }
         )
         self.trained = True
         return self
+
+    def save_model(self, path: str | Path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if self.booster is None:
+            raise RuntimeError("No LightGBM booster is loaded or trained")
+        self.booster.save_model(str(target))
+        self.metadata.update(
+            {
+                "backend": self.backend,
+                "trained": True,
+                "model_path": str(target),
+                "feature_names": list(self.booster.feature_name()),
+            }
+        )
+        _metadata_sidecar_path(target).write_text(
+            json.dumps({"backend": self.backend, "metadata": self.metadata}, indent=2),
+            encoding="utf-8",
+        )
 
     def predict_proba(self, features: Any) -> float:
         if self.booster is None:
