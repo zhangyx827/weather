@@ -27,6 +27,7 @@ from mazu_saudi.risk.layer4_features import feature_frame_from_dataset
 
 
 HAZARD_TYPES = ("extreme_heat", "dry_heat_agriculture", "flash_flood")
+FORMATS = ("csv", "json", "parquet")
 DEFAULT_PATTERN = "saudi_indicators_*.nc"
 DATE_PATTERN = re.compile(r"(\d{8})")
 
@@ -37,6 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data" / "processed" / "layer4_training_tables")
     parser.add_argument("--hazard-type", choices=HAZARD_TYPES, action="append", help="Hazard type to export. Repeat for multiple hazards. Defaults to all.")
     parser.add_argument("--glob", default=DEFAULT_PATTERN, help="Glob pattern used when --input is a directory.")
+    parser.add_argument("--format", choices=FORMATS, default="csv", help="Output table format. Defaults to csv.")
     return parser.parse_args(argv)
 
 
@@ -77,7 +79,13 @@ def _build_table_for_file(source_path: Path, hazard_type: str):
     return frame
 
 
-def _write_parquet(table: Any, path: Path) -> None:
+def _write_table(table: Any, path: Path, fmt: str) -> None:
+    if fmt == "csv":
+        table.to_csv(path, index=False)
+        return
+    if fmt == "json":
+        path.write_text(table.to_json(orient="records", force_ascii=False, indent=2), encoding="utf-8")
+        return
     try:
         table.to_parquet(path, index=False)
     except Exception as exc:
@@ -99,13 +107,14 @@ def main(argv: list[str] | None = None) -> int:
     for hazard_type in hazard_types:
         tables = [_build_table_for_file(path, hazard_type) for path in input_files]
         table = tables[0] if len(tables) == 1 else pd.concat(tables, ignore_index=True)
-        output_path = args.output_dir / f"{hazard_type}_training.parquet"
-        _write_parquet(table, output_path)
+        output_path = args.output_dir / f"{hazard_type}_training.{args.format}"
+        _write_table(table, output_path, args.format)
         summary.append(
             {
                 "hazard_type": hazard_type,
                 "files": len(input_files),
                 "rows": int(len(table)),
+                "format": args.format,
                 "output": str(output_path),
             }
         )

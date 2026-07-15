@@ -77,6 +77,9 @@ def _indicator_frame(rows: int = 512) -> pd.DataFrame:
     rng = np.random.default_rng(42)
     return pd.DataFrame(
         {
+            "date": pd.date_range("2025-01-01", periods=rows, freq="D").strftime("%Y-%m-%d"),
+            "latitude": rng.uniform(16.0, 33.0, rows).astype(np.float32),
+            "longitude": rng.uniform(34.0, 57.0, rows).astype(np.float32),
             "t2m_c": rng.uniform(24.0, 48.0, rows).astype(np.float32),
             "tmax_c": rng.uniform(28.0, 52.0, rows).astype(np.float32),
             "tmin_c": rng.uniform(18.0, 34.0, rows).astype(np.float32),
@@ -100,6 +103,33 @@ def _indicator_frame(rows: int = 512) -> pd.DataFrame:
             "flash_flood_risk": rng.integers(0, 4, rows).astype(np.int16),
             "daily_precip_anomaly": rng.uniform(-10.0, 30.0, rows).astype(np.float32),
         }
+    )
+
+
+def _daily_era5_dataset() -> xr.Dataset:
+    lat = np.array([16.0, 16.1], dtype=np.float32)
+    lon = np.array([34.0, 34.1], dtype=np.float32)
+    time = np.array(["2025-01-01"], dtype="datetime64[ns]")
+    base = np.arange(lat.size * lon.size, dtype=np.float32).reshape(lat.size, lon.size)
+    return xr.Dataset(
+        data_vars={
+            "t2m": (("time", "latitude", "longitude"), (305.0 + base)[None, :, :]),
+            "mx2t": (("time", "latitude", "longitude"), (309.0 + base)[None, :, :]),
+            "mn2t": (("time", "latitude", "longitude"), (300.0 + base * 0.5)[None, :, :]),
+            "d2m": (("time", "latitude", "longitude"), (293.0 + base * 0.3)[None, :, :]),
+            "u10": (("time", "latitude", "longitude"), (2.0 + base * 0.1)[None, :, :]),
+            "v10": (("time", "latitude", "longitude"), (1.0 + base * 0.1)[None, :, :]),
+            "tp": (("time", "latitude", "longitude"), (0.01 + base * 0.001)[None, :, :]),
+            "cp": (("time", "latitude", "longitude"), (0.003 + base * 0.0005)[None, :, :]),
+            "cape": (("time", "latitude", "longitude"), (800.0 + base * 50.0)[None, :, :]),
+            "u850": (("time", "latitude", "longitude"), (8.0 + base * 0.3)[None, :, :]),
+            "v850": (("time", "latitude", "longitude"), (4.0 + base * 0.2)[None, :, :]),
+            "u200": (("time", "latitude", "longitude"), (18.0 + base * 0.3)[None, :, :]),
+            "v200": (("time", "latitude", "longitude"), (12.0 + base * 0.2)[None, :, :]),
+            "sp": (("time", "latitude", "longitude"), (100800.0 + base * 10.0)[None, :, :]),
+            "slope_deg": (("time", "latitude", "longitude"), (3.0 + base * 0.5)[None, :, :]),
+        },
+        coords={"time": time, "latitude": lat, "longitude": lon},
     )
 
 
@@ -164,11 +194,89 @@ def test_indicator_parquet_training_smoke():
         assert (model_dir / "extreme_heat.txt.metadata.json").exists()
 
 
+def test_indicator_csv_training_smoke():
+    module = _load_training_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        source = tmp_path / "flash_flood_supervised.csv"
+        model_dir = tmp_path / "models"
+        frame = _indicator_frame(rows=16)
+        frame["label"] = np.array([1.0, 0.0] * 8, dtype=np.float32)
+        frame["label_status"] = ["positive", "negative"] * 8
+        frame["label_source_mode"] = ["point_buffer", "no_event_day"] * 8
+        frame.to_csv(source, index=False)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "train_layer4_lightgbm.py",
+            "--source",
+            str(source),
+            "--source-format",
+            "indicator-csv",
+            "--model-dir",
+            str(model_dir),
+            "--hazard-type",
+            "flash_flood",
+        ]
+        try:
+            assert module.main() == 0
+        finally:
+            sys.argv = old_argv
+
+        summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
+        assert summary["source_format"] == "indicator-csv"
+        assert summary["hazard_type"] == "flash_flood"
+        assert summary["model"]["objective"] == "binary"
+        assert summary["training_target"]["target_source"] == "explicit_label"
+        assert (model_dir / "flash_flood.txt").exists()
+
+
+def test_indicator_json_training_smoke_dry_heat():
+    module = _load_training_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        source = tmp_path / "dry_heat_daily.json"
+        model_dir = tmp_path / "models"
+        _indicator_frame(rows=24).to_json(source, orient="records")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "train_layer4_lightgbm.py",
+            "--source",
+            str(source),
+            "--source-format",
+            "indicator-json",
+            "--model-dir",
+            str(model_dir),
+            "--hazard-type",
+            "dry_heat_agriculture",
+        ]
+        try:
+            assert module.main() == 0
+        finally:
+            sys.argv = old_argv
+
+        summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
+        assert summary["source_format"] == "indicator-json"
+        assert summary["hazard_type"] == "dry_heat_agriculture"
+        assert summary["model"]["objective"] == "regression"
+        assert (model_dir / "dry_heat_stress.txt").exists()
+
+
 def test_indicator_netcdf_training_table():
     module = _load_training_module()
     ds = _indicator_dataset()
     features, target = module.build_training_table(ds, "extreme_heat")
     assert features.shape[1] == len(module.feature_names_for_hazard("extreme_heat"))
+    assert features.shape[0] == ds.latitude.size * ds.longitude.size
+    assert target.shape == (features.shape[0],)
+
+
+def test_daily_era5_training_table_flash_flood():
+    module = _load_training_module()
+    ds = _daily_era5_dataset()
+    features, target = module.build_training_table(ds, "flash_flood")
+    assert features.shape[1] == len(module.feature_names_for_hazard("flash_flood"))
     assert features.shape[0] == ds.latitude.size * ds.longitude.size
     assert target.shape == (features.shape[0],)
 
@@ -180,6 +288,29 @@ def test_indicator_netcdf_training_table_flash_flood():
     assert features.shape[1] == len(module.feature_names_for_hazard("flash_flood"))
     assert features.shape[0] == ds.latitude.size * ds.longitude.size
     assert target.shape == (features.shape[0],)
+
+
+def test_build_layer4_training_table_script_exports_csv_by_default():
+    module = _load_build_table_module()
+    ds = _indicator_dataset()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        input_dir = tmp_path / "indicators"
+        output_dir = tmp_path / "tables"
+        input_dir.mkdir()
+        source = input_dir / "saudi_indicators_20250101.nc"
+        ds.to_netcdf(source)
+
+        result = module.main(["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood"])
+        assert result == 0
+
+        table = pd.read_csv(output_dir / "flash_flood_training.csv")
+        assert len(table) == ds.latitude.size * ds.longitude.size
+        assert set(["date", "hazard_type", "latitude", "longitude", "source_status", "degradation_metadata"]).issubset(table.columns)
+        assert set(module.HAZARD_TYPES) >= {"flash_flood"}
+        assert table["hazard_type"].nunique() == 1
+        assert table["hazard_type"].iloc[0] == "flash_flood"
 
 
 def test_build_layer4_training_table_script_exports_parquet():
@@ -196,15 +327,13 @@ def test_build_layer4_training_table_script_exports_parquet():
         source = input_dir / "saudi_indicators_20250101.nc"
         ds.to_netcdf(source)
 
-        result = module.main(["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood"])
+        result = module.main(
+            ["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood", "--format", "parquet"]
+        )
         assert result == 0
 
         table = pd.read_parquet(output_dir / "flash_flood_training.parquet")
         assert len(table) == ds.latitude.size * ds.longitude.size
-        assert set(["date", "hazard_type", "latitude", "longitude", "source_status", "degradation_metadata"]).issubset(table.columns)
-        assert set(module.HAZARD_TYPES) >= {"flash_flood"}
-        assert table["hazard_type"].nunique() == 1
-        assert table["hazard_type"].iloc[0] == "flash_flood"
 
 
 def test_layer4_feature_schema_separates_evidence_only_fields():
@@ -245,6 +374,57 @@ def test_build_training_table_from_frame_uses_explicit_flash_flood_labels():
 
     assert features.shape[0] == 6
     assert target.tolist() == [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+
+
+def test_build_training_table_from_frame_filters_rows_with_missing_required_features():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=4)
+    frame.loc[1, "daily_precip_total"] = np.nan
+    frame["label"] = np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    frame["label_status"] = ["positive", "negative", "positive", "negative"]
+
+    features, target = module.build_training_table_from_frame(frame, "flash_flood")
+
+    assert features.shape[0] == 3
+    assert target.tolist() == [1.0, 1.0, 0.0]
+
+
+def test_build_training_table_from_frame_requires_daily_date_column():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=4).drop(columns=["date"])
+
+    try:
+        module.build_training_table_from_frame(frame, "extreme_heat")
+    except KeyError as exc:
+        assert "date" in str(exc)
+    else:
+        raise AssertionError("Expected missing date column to raise")
+
+
+def test_build_training_table_from_frame_rejects_invalid_daily_dates():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=4)
+    frame["date"] = ["2025-01-01", "not-a-date", "2025-01-03", "2025-01-04"]
+
+    try:
+        module.build_training_table_from_frame(frame, "extreme_heat")
+    except ValueError as exc:
+        assert "invalid date" in str(exc)
+    else:
+        raise AssertionError("Expected invalid date to raise")
+
+
+def test_build_training_table_from_frame_rejects_subdaily_timestamps():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=4)
+    frame["date"] = ["2025-01-01T00:00:00", "2025-01-02T06:00:00", "2025-01-03", "2025-01-04"]
+
+    try:
+        module.build_training_table_from_frame(frame, "extreme_heat")
+    except ValueError as exc:
+        assert "sub-daily" in str(exc)
+    else:
+        raise AssertionError("Expected sub-daily timestamp to raise")
 
 
 def test_summarize_frame_training_targets_reports_explicit_label_usage():

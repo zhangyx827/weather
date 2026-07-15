@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Download Saudi ERA5 single-level and pressure-level inputs via CDS API."""
+"""Download legacy raw Saudi ERA5 inputs via CDS API.
+
+The Layer-4 training path in this repository now operates on daily feature
+tables or daily NetCDF inputs. This script remains a raw-data helper and is no
+longer the default prerequisite for daily model training.
+"""
 
 from __future__ import annotations
 
@@ -46,7 +51,7 @@ PRESSURE_VARS = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download Saudi ERA5 input files using CDS API.")
+    parser = argparse.ArgumentParser(description="Download legacy raw Saudi ERA5 input files using CDS API.")
     parser.add_argument("--years", nargs="+", required=True, help="Years to download, e.g. 2023 2024")
     parser.add_argument("--single-root", type=Path, default=Path("data/raw"))
     parser.add_argument("--pressure-root", type=Path, default=Path("data/raw"))

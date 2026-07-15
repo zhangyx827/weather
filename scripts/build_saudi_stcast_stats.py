@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build STCast normalization statistics from a converted Saudi dataset."""
+"""Build STCast normalization statistics from one or more converted Saudi datasets."""
 
 from __future__ import annotations
 
@@ -14,6 +14,20 @@ import numpy as np
 PRESSURE_LEVELS = [1000.0, 925.0, 850.0, 700.0, 600.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0, 100.0, 50.0]
 PRESSURE_VARIABLES = ("z", "q", "u", "v", "t")
 SURFACE_VARIABLES = ("t2m", "u10", "v10", "msl")
+
+
+def _parse_source_spec(value: str) -> dict[str, object]:
+    parts = [part.strip() for part in value.split(",", 2)]
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(
+            "source spec must be 'root_dir,train_start,train_end' with ISO timestamps, "
+            f"got: {value!r}"
+        )
+    return {
+        "root_dir": Path(parts[0]),
+        "train_start": datetime.fromisoformat(parts[1]),
+        "train_end": datetime.fromisoformat(parts[2]),
+    }
 
 
 def _iter_timestamps(start: datetime, end: datetime, step_hours: int) -> list[datetime]:
@@ -53,11 +67,10 @@ def _load_surface_sample(root: Path, stamp: datetime) -> np.ndarray:
     return np.stack([np.load(day_dir / f"{stamp:%H}:00:00-{name}.npy").astype(np.float64) for name in SURFACE_VARIABLES], axis=0)
 
 
-def build_stats(root: Path, stats_dir: Path, start: datetime, end: datetime, step_hours: int) -> None:
+def _collect_samples(root: Path, start: datetime, end: datetime, step_hours: int) -> tuple[dict[str, list[np.ndarray]], list[np.ndarray], int]:
     timestamps = _iter_timestamps(start, end, step_hours)
     if not timestamps:
         raise ValueError("No timestamps selected for statistics generation")
-
     pressure_stats: dict[str, list[np.ndarray]] = {name: [] for name in PRESSURE_VARIABLES}
     surface_stats: list[np.ndarray] = []
     count = 0
@@ -67,6 +80,31 @@ def build_stats(root: Path, stats_dir: Path, start: datetime, end: datetime, ste
             pressure_stats[name].append(_load_pressure_sample(root, stamp, name))
         surface_stats.append(_load_surface_sample(root, stamp))
         count += 1
+
+    return pressure_stats, surface_stats, count
+
+
+def build_stats(sources: list[dict[str, object]], stats_dir: Path, step_hours: int) -> None:
+    if not sources:
+        raise ValueError("At least one source must be provided")
+
+    pressure_stats: dict[str, list[np.ndarray]] = {name: [] for name in PRESSURE_VARIABLES}
+    surface_stats: list[np.ndarray] = []
+    count = 0
+    latest_end: datetime | None = None
+
+    for source in sources:
+        root = Path(source["root_dir"])
+        start = source["train_start"]
+        end = source["train_end"]
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise TypeError("train_start and train_end must be datetime instances")
+        source_pressure, source_surface, source_count = _collect_samples(root, start, end, step_hours)
+        for name in PRESSURE_VARIABLES:
+            pressure_stats[name].extend(source_pressure[name])
+        surface_stats.extend(source_surface)
+        count += source_count
+        latest_end = end if latest_end is None or end > latest_end else latest_end
 
     mean_payload: dict[str, object] = {}
     std_payload: dict[str, object] = {}
@@ -85,23 +123,42 @@ def build_stats(root: Path, stats_dir: Path, start: datetime, end: datetime, ste
 
     stats_dir.mkdir(parents=True, exist_ok=True)
     with (stats_dir / "mean_std.json").open("w", encoding="utf-8") as fh:
-        json.dump({"mean": mean_payload, "std": std_payload, "count": count, "current_date": f"{end:%Y/%Y-%m-%dT%H:00:00.nc}"}, fh)
+        current_date = f"{latest_end:%Y/%Y-%m-%dT%H:00:00.nc}" if latest_end is not None else None
+        json.dump({"mean": mean_payload, "std": std_payload, "count": count, "current_date": current_date}, fh)
     with (stats_dir / "mean_std_single.json").open("w", encoding="utf-8") as fh:
         json.dump({"mean": single_mean, "std": single_std, "count": count}, fh)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root-dir", required=True, type=Path)
+    parser.add_argument("--root-dir", type=Path, help="Legacy single-source root dir.")
     parser.add_argument("--stats-dir", required=True, type=Path)
-    parser.add_argument("--train-start", required=True, type=str, help="YYYY-mm-ddTHH:MM")
-    parser.add_argument("--train-end", required=True, type=str, help="YYYY-mm-ddTHH:MM")
+    parser.add_argument("--train-start", type=str, help="Legacy single-source start, YYYY-mm-ddTHH:MM")
+    parser.add_argument("--train-end", type=str, help="Legacy single-source end, YYYY-mm-ddTHH:MM")
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        help="Repeatable source spec: root_dir,train_start,train_end. Example: data/processed/stcast_saudi_2022_6h,2022-01-01T00:00,2022-12-31T18:00",
+    )
     parser.add_argument("--step-hours", default=6, type=int)
     args = parser.parse_args()
 
-    start = datetime.fromisoformat(args.train_start)
-    end = datetime.fromisoformat(args.train_end)
-    build_stats(args.root_dir, args.stats_dir, start, end, args.step_hours)
+    sources: list[dict[str, object]]
+    if args.source:
+        sources = [_parse_source_spec(value) for value in args.source]
+    else:
+        if args.root_dir is None or args.train_start is None or args.train_end is None:
+            parser.error("either repeat --source or provide --root-dir, --train-start, and --train-end")
+        sources = [
+            {
+                "root_dir": args.root_dir,
+                "train_start": datetime.fromisoformat(args.train_start),
+                "train_end": datetime.fromisoformat(args.train_end),
+            }
+        ]
+
+    build_stats(sources, args.stats_dir, args.step_hours)
     print(f"Wrote statistics to {args.stats_dir}")
 
 
