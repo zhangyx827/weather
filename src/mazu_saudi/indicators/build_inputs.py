@@ -485,15 +485,21 @@ class RawInputBuilder:
     single_dir: Path | None = None
     pressure_dir: Path | None = None
     missing_pressure_dir: Path | None = None
+    single_dirs_by_year: dict[int, Path] | None = None
+    pressure_dirs_by_year: dict[int, Path] | None = None
+    missing_pressure_dirs_by_year: dict[int, Path | None] | None = None
 
     def __post_init__(self) -> None:
-        self.single_dir = Path(self.single_dir) if self.single_dir is not None else self.raw_root / "era5_single_levels_2025"
-        self.pressure_dir = Path(self.pressure_dir) if self.pressure_dir is not None else self.raw_root / "era5_pressure_levels_2025"
+        self.single_dir = Path(self.single_dir) if self.single_dir is not None else None
+        self.pressure_dir = Path(self.pressure_dir) if self.pressure_dir is not None else None
         if self.missing_pressure_dir is not None:
             self.missing_pressure_dir = Path(self.missing_pressure_dir)
-        else:
-            candidate = self.pressure_dir.with_name(f"{self.pressure_dir.name}_missing")
-            self.missing_pressure_dir = candidate if candidate.exists() else None
+        self.single_dirs_by_year = self._normalize_year_path_mapping(self.single_dirs_by_year)
+        self.pressure_dirs_by_year = self._normalize_year_path_mapping(self.pressure_dirs_by_year)
+        self.missing_pressure_dirs_by_year = self._normalize_year_path_mapping(
+            self.missing_pressure_dirs_by_year,
+            allow_none=True,
+        )
         self.precip_dir = self.raw_root / "precip"
         self.dust_dir = self.raw_root / "dust"
         self.sst_dir = self.raw_root / "sst"
@@ -511,6 +517,90 @@ class RawInputBuilder:
             "precip_monthly": PRECIP_MONTHLY_SOURCE_REGISTRY,
         }
 
+    @staticmethod
+    def _normalize_year_path_mapping(
+        mapping: dict[int, Path] | dict[int, Path | None] | None,
+        *,
+        allow_none: bool = False,
+    ) -> dict[int, Path] | dict[int, Path | None]:
+        normalized: dict[int, Path] | dict[int, Path | None] = {}
+        if mapping is None:
+            return normalized
+        for year, path in mapping.items():
+            normalized_year = int(year)
+            if path is None:
+                if not allow_none:
+                    raise ValueError(f"year {normalized_year} path cannot be null")
+                normalized[normalized_year] = None
+                continue
+            normalized[normalized_year] = Path(path)
+        return normalized
+
+    def _default_single_dir(self, year: int) -> Path:
+        direct = self.raw_root / f"era5_single_levels_{year}"
+        if direct.exists():
+            return direct
+        six_hour = self.raw_root / f"era5_single_levels_{year}_6h"
+        if six_hour.exists():
+            return six_hour
+        return direct
+
+    def _default_pressure_dir(self, year: int) -> Path:
+        direct = self.raw_root / f"era5_pressure_levels_{year}"
+        if direct.exists():
+            return direct
+        six_hour = self.raw_root / f"era5_pressure_levels_{year}_6h"
+        if six_hour.exists():
+            return six_hour
+        return direct
+
+    def _resolve_single_dir(self, year: int) -> Path:
+        if year in self.single_dirs_by_year:
+            return self.single_dirs_by_year[year]
+        if self.single_dir is not None:
+            return self.single_dir
+        return self._default_single_dir(year)
+
+    def _resolve_pressure_dir(self, year: int) -> Path:
+        if year in self.pressure_dirs_by_year:
+            return self.pressure_dirs_by_year[year]
+        if self.pressure_dir is not None:
+            return self.pressure_dir
+        return self._default_pressure_dir(year)
+
+    def _resolve_missing_pressure_dir(self, year: int) -> Path | None:
+        if year in self.missing_pressure_dirs_by_year:
+            return self.missing_pressure_dirs_by_year[year]
+        if self.missing_pressure_dir is not None:
+            return self.missing_pressure_dir
+        pressure_dir = self._resolve_pressure_dir(year)
+        candidate = pressure_dir.with_name(f"{pressure_dir.name}_missing")
+        return candidate if candidate.exists() else None
+
+    @staticmethod
+    def _indicator_table_path(output_dir: Path, start_date: date, end_date: date) -> Path:
+        if start_date == end_date:
+            suffix = start_date.strftime("%Y%m%d")
+        elif start_date.year == end_date.year:
+            suffix = f"{start_date:%Y%m%d}_{end_date:%Y%m%d}"
+        else:
+            suffix = f"{start_date:%Y%m%d}_{end_date:%Y%m%d}"
+        return output_dir / f"saudi_indicator_samples_{suffix}.parquet"
+
+    @staticmethod
+    def _fallback_source_metadata(variable_family: str, fallback_source: str, detail: str) -> dict[str, Any]:
+        return {
+            "variable_family": variable_family,
+            "resolved_source": fallback_source,
+            "resolved_role": "fallback",
+            "resolved_path": "",
+            "fallback_chain": [],
+            "comparison_summary": [],
+            "secondary_sources": [],
+            "validation_status": "degraded_primary_missing",
+            "detail": detail,
+        }
+
     def close(self) -> None:
         for dataset in self._single_cache.values():
             dataset.close()
@@ -523,11 +613,12 @@ class RawInputBuilder:
         if self._elevation_cache is not None:
             self._elevation_cache.close()
 
-    def build(self, start_date: date, end_date: date) -> BuildResult:
+    def build(self, start_date: date, end_date: date, *, include_aurora: bool = True) -> BuildResult:
         result = BuildResult()
-        self.aurora_out.mkdir(parents=True, exist_ok=True)
         self.indicator_nc_out.mkdir(parents=True, exist_ok=True)
         self.indicator_parquet_out.mkdir(parents=True, exist_ok=True)
+        if include_aurora:
+            self.aurora_out.mkdir(parents=True, exist_ok=True)
 
         indicator_frames: list[Any] = []
         current = start_date
@@ -550,24 +641,25 @@ class RawInputBuilder:
 
         if indicator_frames:
             table = self._concat_frames(indicator_frames)
-            table_path = self.indicator_parquet_out / f"saudi_indicator_samples_{start_date.year}.parquet"
+            table_path = self._indicator_table_path(self.indicator_parquet_out, start_date, end_date)
             try:
                 self._write_parquet(table, table_path)
                 result.add("indicator_table", str(start_date.year), "ok", str(table_path))
             except Exception as exc:
                 result.add("indicator_table", str(start_date.year), "skipped", str(exc))
 
-        aurora_time = _as_day_start(start_date)
-        final_time = _as_day_start(end_date) + timedelta(hours=18)
-        while aurora_time <= final_time:
-            try:
-                ds = self.build_aurora_input(aurora_time)
-                path = self.aurora_out / f"aurora_input_{aurora_time:%Y%m%d%H}.nc"
-                ds.to_netcdf(path)
-                result.add("aurora", aurora_time.isoformat(), "ok", str(path))
-            except Exception as exc:
-                result.add("aurora", aurora_time.isoformat(), "skipped", str(exc))
-            aurora_time += timedelta(hours=self.aurora_cadence_hours)
+        if include_aurora:
+            aurora_time = _as_day_start(start_date)
+            final_time = _as_day_start(end_date) + timedelta(hours=18)
+            while aurora_time <= final_time:
+                try:
+                    ds = self.build_aurora_input(aurora_time)
+                    path = self.aurora_out / f"aurora_input_{aurora_time:%Y%m%d%H}.nc"
+                    ds.to_netcdf(path)
+                    result.add("aurora", aurora_time.isoformat(), "ok", str(path))
+                except Exception as exc:
+                    result.add("aurora", aurora_time.isoformat(), "skipped", str(exc))
+                aurora_time += timedelta(hours=self.aurora_cadence_hours)
 
         result.write(self.aurora_out.parent / "build_manifest.json")
         return result
@@ -644,8 +736,6 @@ class RawInputBuilder:
     def build_daily_indicators(self, day: date) -> xr.Dataset:
         single = self._daily_single_level_fields(day)
         pressure = self._daily_pressure_level_fields(day)
-        gpm = self._daily_gpm(day)
-        dust = self._daily_dust(day)
         sst = self._daily_sst(day)
         elevation = self._elevation()
         chirps_monthly = self._monthly_chirps(day)
@@ -734,34 +824,72 @@ class RawInputBuilder:
         low_level_jet_flag = _flag(wind850, 12.0).rename("low_level_jet_flag")
         strong_shear_flag = _flag(shear_850_200, 20.0).rename("strong_shear_flag")
 
+        daily_total_2d = daily_total.isel(time=0, drop=True)
+        try:
+            gpm = self._daily_gpm(day)
+            gpm_daily = gpm.data["precipitation"].rename("gpm_daily_precip")
+            precip_daily_metadata = dict(gpm.metadata)
+            precip_daily_metadata["comparison_summary"] = [
+                self._compare_arrays_against_reference(
+                    primary_data=daily_total_2d,
+                    secondary_data=gpm_daily,
+                    primary_source="era5",
+                    secondary_source=precip_daily_metadata["resolved_source"],
+                    secondary_role=precip_daily_metadata["resolved_role"],
+                )
+            ]
+            precip_daily_metadata["secondary_sources"] = ["era5"]
+            precip_daily_metadata["validation_status"] = "compared"
+        except FileNotFoundError as exc:
+            gpm_daily = daily_total_2d.rename("gpm_daily_precip")
+            precip_daily_metadata = self._fallback_source_metadata("precip_daily", "era5", str(exc))
+
+        wind10_2d = wind10.isel(time=0, drop=True)
+        try:
+            dust = self._daily_dust(day)
+            dust_aod = dust.data["DUEXTTAU"].rename("dust_aod")
+            dust_column = dust.data["DUCMASS"].rename("dust_column_mass")
+            dust_surface = dust.data["DUSMASS"].rename("dust_surface_mass")
+        except FileNotFoundError as exc:
+            dust_metadata = self._fallback_source_metadata("dust", "missing", str(exc))
+            dust = ResolvedDataset(
+                data=xr.Dataset(
+                    {
+                        "DUEXTTAU": xr.full_like(wind10_2d, np.nan).rename("DUEXTTAU"),
+                        "DUCMASS": xr.full_like(wind10_2d, np.nan).rename("DUCMASS"),
+                        "DUSMASS": xr.full_like(wind10_2d, np.nan).rename("DUSMASS"),
+                    }
+                ),
+                metadata=dust_metadata,
+            )
+            dust_aod = dust.data["DUEXTTAU"].rename("dust_aod")
+            dust_column = dust.data["DUCMASS"].rename("dust_column_mass")
+            dust_surface = dust.data["DUSMASS"].rename("dust_surface_mass")
+
         sst_da = sst.data.rename("sst_celsius")
-        dust_aod = dust.data["DUEXTTAU"].rename("dust_aod")
-        dust_column = dust.data["DUCMASS"].rename("dust_column_mass")
-        dust_surface = dust.data["DUSMASS"].rename("dust_surface_mass")
         dust_risk = (
-            xr.where(wind10.isel(time=0, drop=True) >= 8.0, 0.4, 0.0)
+            xr.where(wind10_2d >= 8.0, 0.4, 0.0)
             + xr.where(dust_aod >= 0.3, 0.3, 0.0)
             + xr.where(dust_surface >= 5.0e-4, 0.3, 0.0)
         ).clip(max=1.0).rename("dust_risk_proxy")
-        strong_wind_flag = _flag(wind10.isel(time=0, drop=True), 10.0).rename("strong_wind_flag")
-        dust_emission_flag = (_flag(wind10.isel(time=0, drop=True), 8.0) * _flag(dust_surface, 5.0e-4)).astype("int8").rename("dust_emission_flag")
+        strong_wind_flag = _flag(wind10_2d, 10.0).rename("strong_wind_flag")
+        dust_emission_flag = (_flag(wind10_2d, 8.0) * _flag(dust_surface, 5.0e-4)).astype("int8").rename("dust_emission_flag")
 
-        gpm_daily = gpm.data["precipitation"].rename("gpm_daily_precip")
-        gpm_diff = (gpm_daily - daily_total.isel(time=0, drop=True)).rename("gpm_era5_precip_diff")
-        gpm_ratio = _safe_ratio(gpm_daily, daily_total.isel(time=0, drop=True).where(daily_total.isel(time=0, drop=True) > 0.1)).rename("gpm_era5_precip_ratio")
-        heavy_rain_flag = _flag(daily_total.isel(time=0, drop=True), 25.0).rename("heavy_rain_flag")
-        extreme_rain_flag = _flag(daily_total.isel(time=0, drop=True), 50.0).rename("extreme_rain_flag")
-        gpm_overlap = (_flag(gpm_daily, 10.0) * _flag(daily_total.isel(time=0, drop=True), 10.0)).astype("int8").rename("gpm_era5_heavy_rain_overlap")
-        precip_3day = self._daily_precip_window_total(day, 3, current_day_total=daily_total.isel(time=0, drop=True)).rename("precip_3day")
-        precip_7day = self._daily_precip_window_total(day, 7, current_day_total=daily_total.isel(time=0, drop=True)).rename("precip_7day")
+        gpm_diff = (gpm_daily - daily_total_2d).rename("gpm_era5_precip_diff")
+        gpm_ratio = _safe_ratio(gpm_daily, daily_total_2d.where(daily_total_2d > 0.1)).rename("gpm_era5_precip_ratio")
+        heavy_rain_flag = _flag(daily_total_2d, 25.0).rename("heavy_rain_flag")
+        extreme_rain_flag = _flag(daily_total_2d, 50.0).rename("extreme_rain_flag")
+        gpm_overlap = (_flag(gpm_daily, 10.0) * _flag(daily_total_2d, 10.0)).astype("int8").rename("gpm_era5_heavy_rain_overlap")
+        precip_3day = self._daily_precip_window_total(day, 3, current_day_total=daily_total_2d).rename("precip_3day")
+        precip_7day = self._daily_precip_window_total(day, 7, current_day_total=daily_total_2d).rename("precip_7day")
 
         elev = elevation["elevation_m"].rename("orography")
         slope = _compute_slope_deg(elev)
 
         flash = xr.apply_ufunc(
             np.vectorize(compute_flash_flood_screening_score),
-            xr.full_like(gpm_daily, np.nan) + daily_total.isel(time=0, drop=True),
-            xr.full_like(gpm_daily, np.nan) + daily_total.isel(time=0, drop=True),
+            xr.full_like(gpm_daily, np.nan) + daily_total_2d,
+            xr.full_like(gpm_daily, np.nan) + daily_total_2d,
             xr.full_like(gpm_daily, np.nan) + gpm_daily,
             slope,
             xr.zeros_like(gpm_daily) + 0.15,
@@ -774,18 +902,6 @@ class RawInputBuilder:
             monthly_chirps_precip_total = chirps_monthly.data.rename("monthly_chirps_precip_total")
             monthly_chirps_precip_mmday = (chirps_monthly.data / days_in_month).rename("monthly_chirps_precip_mmday")
 
-        precip_daily_metadata = dict(gpm.metadata)
-        precip_daily_metadata["comparison_summary"] = [
-            self._compare_arrays_against_reference(
-                primary_data=daily_total.isel(time=0, drop=True),
-                secondary_data=gpm_daily,
-                primary_source="era5",
-                secondary_source=precip_daily_metadata["resolved_source"],
-                secondary_role=precip_daily_metadata["resolved_role"],
-            )
-        ]
-        precip_daily_metadata["secondary_sources"] = ["era5"]
-        precip_daily_metadata["validation_status"] = "compared"
         daily_time = daily_total["time"]
         dust_aod = _promote_2d_to_time(dust_aod, daily_time)
         dust_column = _promote_2d_to_time(dust_column, daily_time)
@@ -966,8 +1082,9 @@ class RawInputBuilder:
     def _aurora_static(self, year: int, month: int) -> xr.Dataset:
         key = (year, month)
         if key not in self._static_cache:
-            aurora_candidate = self.single_dir / f"era5_single_levels_{year}_{month:02d}_aurora.nc"
-            static_candidate = self.single_dir / f"era5_single_levels_{year}_{month:02d}_static.nc"
+            single_dir = self._resolve_single_dir(year)
+            aurora_candidate = single_dir / f"era5_single_levels_{year}_{month:02d}_aurora.nc"
+            static_candidate = single_dir / f"era5_single_levels_{year}_{month:02d}_static.nc"
             datasets = []
             for path in (aurora_candidate, static_candidate):
                 if path.exists():
@@ -1332,11 +1449,18 @@ class RawInputBuilder:
             raise KeyError(f"unsupported ERA5 single-level member: {member_name}") from exc
 
     def _single_container_paths(self, year: int, month: int) -> tuple[Path, Path | None]:
-        primary = self.single_dir / f"era5_single_levels_{year}_{month:02d}.nc"
+        single_dir = self._resolve_single_dir(year)
+        primary = single_dir / f"era5_single_levels_{year}_{month:02d}.nc"
         if not primary.exists():
             raise FileNotFoundError(primary)
-        supplement = self.single_dir / f"era5_single_levels_{year}_{month:02d}_supplement.nc"
-        return primary, supplement if supplement.exists() else None
+        supplements = (
+            single_dir / f"era5_single_levels_{year}_{month:02d}_supplement.nc",
+            single_dir / f"era5_single_levels_{year}_{month:02d}_supplement_backfill.nc",
+        )
+        for supplement in supplements:
+            if supplement.exists():
+                return primary, supplement
+        return primary, None
 
     def _single_member_from_archive(self, archive_path: Path, member_name: str) -> xr.Dataset:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1370,6 +1494,13 @@ class RawInputBuilder:
             if remaining:
                 parts.append(supplement[remaining])
                 loaded_variables.update(remaining)
+        elif supplement_path is not None:
+            with xr.open_dataset(supplement_path, engine="netcdf4") as ds:
+                supplement = _normalize_dataset(ds.load())
+            remaining = [name for name in member_variables if name not in loaded_variables and name in supplement.data_vars]
+            if remaining:
+                parts.append(supplement[remaining])
+                loaded_variables.update(remaining)
 
         if not parts:
             raise KeyError(f"single-level member {member_name} is unavailable for {year}-{month:02d}")
@@ -1383,13 +1514,15 @@ class RawInputBuilder:
         return xr.merge(parts, compat="override", join="outer") if len(parts) > 1 else parts[0]
 
     def _aurora_single_month(self, year: int, month: int) -> xr.Dataset:
-        path = self.single_dir / f"era5_single_levels_{year}_{month:02d}_aurora.nc"
+        single_dir = self._resolve_single_dir(year)
+        path = single_dir / f"era5_single_levels_{year}_{month:02d}_aurora.nc"
         if not path.exists():
             raise FileNotFoundError(path)
         return _normalize_dataset(xr.open_dataset(path, engine="netcdf4").load())
 
     def _aurora_single_month_slice(self, year: int, month: int, start: np.datetime64, end: np.datetime64) -> xr.Dataset:
-        path = self.single_dir / f"era5_single_levels_{year}_{month:02d}_aurora.nc"
+        single_dir = self._resolve_single_dir(year)
+        path = single_dir / f"era5_single_levels_{year}_{month:02d}_aurora.nc"
         if not path.exists():
             raise FileNotFoundError(path)
         with xr.open_dataset(path, engine="netcdf4") as ds:
@@ -1414,22 +1547,57 @@ class RawInputBuilder:
     ) -> xr.Dataset:
         ds = self._open_pressure_dataset(year, month, long_name)
         try:
-            normalized = _normalize_dataset(ds)
+            normalized = self._normalize_pressure_dataset(ds, long_name)
             subset = normalized.sel(time=slice(start, end)).load()
         finally:
             ds.close()
         return subset
 
     def _pressure_file_path(self, year: int, month: int, long_name: str) -> tuple[Path, Path | None]:
-        primary = self.pressure_dir / f"era5_pl_{year}_{month:02d}_{long_name}.nc"
-        if not primary.exists():
-            raise FileNotFoundError(primary)
+        pressure_dir = self._resolve_pressure_dir(year)
+        missing_pressure_dir = self._resolve_missing_pressure_dir(year)
+        primary_names = [long_name]
+        if long_name == "relative_vorticity":
+            primary_names.append("vorticity")
+        primary = None
+        for candidate_name in primary_names:
+            candidate = pressure_dir / f"era5_pl_{year}_{month:02d}_{candidate_name}.nc"
+            if candidate.exists():
+                primary = candidate
+                break
+        if primary is None:
+            raise FileNotFoundError(pressure_dir / f"era5_pl_{year}_{month:02d}_{long_name}.nc")
         supplemental = None
-        if self.missing_pressure_dir is not None:
-            candidate = self.missing_pressure_dir / f"era5_pl_{year}_{month:02d}_{long_name}_missing.nc"
+        if missing_pressure_dir is not None:
+            candidate = missing_pressure_dir / f"era5_pl_{year}_{month:02d}_{long_name}_missing.nc"
             if candidate.exists():
                 supplemental = candidate
         return primary, supplemental
+
+    @staticmethod
+    def _canonical_pressure_variable_name(long_name: str) -> str:
+        mapping = {
+            "specific_humidity": "q",
+            "u_component_of_wind": "u",
+            "v_component_of_wind": "v",
+            "geopotential": "z",
+            "temperature": "t",
+            "vertical_velocity": "w",
+            "divergence": "d",
+            "relative_vorticity": "r",
+        }
+        try:
+            return mapping[long_name]
+        except KeyError as exc:
+            raise KeyError(f"unsupported pressure variable: {long_name}") from exc
+
+    def _normalize_pressure_dataset(self, ds: xr.Dataset, long_name: str) -> xr.Dataset:
+        normalized = _normalize_dataset(ds)
+        data_var = next(iter(normalized.data_vars))
+        canonical_name = self._canonical_pressure_variable_name(long_name)
+        if data_var != canonical_name:
+            normalized = normalized.rename({data_var: canonical_name})
+        return normalized
 
     def _open_pressure_dataset(self, year: int, month: int, long_name: str):
         primary_path, supplemental_path = self._pressure_file_path(year, month, long_name)
@@ -1443,8 +1611,8 @@ class RawInputBuilder:
             raise
 
         try:
-            primary_normalized = _normalize_dataset(primary_ds)
-            supplemental_normalized = _normalize_dataset(supplemental_ds)
+            primary_normalized = self._normalize_pressure_dataset(primary_ds, long_name)
+            supplemental_normalized = self._normalize_pressure_dataset(supplemental_ds, long_name)
             primary_var = next(iter(primary_normalized.data_vars))
             supplemental_var = next(iter(supplemental_normalized.data_vars))
             combined = xr.concat(
@@ -1461,7 +1629,12 @@ class RawInputBuilder:
     def _load_pressure_dataset(self, year: int, month: int, long_name: str) -> xr.Dataset:
         combined = self._open_pressure_dataset(year, month, long_name)
         try:
-            return combined.load()
+            loaded = combined.load()
+            data_var = next(iter(loaded.data_vars))
+            canonical_name = self._canonical_pressure_variable_name(long_name)
+            if data_var != canonical_name:
+                loaded = loaded.rename({data_var: canonical_name})
+            return loaded
         finally:
             combined.close()
 

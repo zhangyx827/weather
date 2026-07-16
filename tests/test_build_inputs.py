@@ -386,6 +386,46 @@ class TestBuildInputs:
         assert "flash_flood_risk" in ds.data_vars
         assert str(ds["time"].values[0]).startswith("2024-01-01")
 
+    def test_build_daily_indicators_supports_year_specific_directory_mappings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_root = _build_fake_raw_tree(root, year=2022)
+            _build_fake_raw_tree(root, year=2024, single_layout="direct_plus_supplement")
+
+            single_2022 = raw_root / "era5_single_levels_2022"
+            pressure_2022 = raw_root / "era5_pressure_levels_2022"
+            single_2022_6h = raw_root / "era5_single_levels_2022_6h"
+            pressure_2022_6h = raw_root / "era5_pressure_levels_2022_6h"
+            for supplement in single_2022.glob("*_supplement.nc"):
+                supplement.rename(supplement.with_name(supplement.name.replace("_supplement.nc", "_supplement_backfill.nc")))
+            single_2022.rename(single_2022_6h)
+            pressure_2022.rename(pressure_2022_6h)
+
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=root / "aurora",
+                indicator_nc_out=root / "nc",
+                indicator_parquet_out=root / "pq",
+                single_dirs_by_year={
+                    2022: single_2022_6h,
+                    2024: raw_root / "era5_single_levels_2024",
+                },
+                pressure_dirs_by_year={
+                    2022: pressure_2022_6h,
+                    2024: raw_root / "era5_pressure_levels_2024",
+                },
+            )
+            try:
+                ds_2022 = builder.build_daily_indicators(date(2022, 1, 1))
+                ds_2024 = builder.build_daily_indicators(date(2024, 1, 1))
+            finally:
+                builder.close()
+
+        assert str(ds_2022["time"].values[0]).startswith("2022-01-01")
+        assert str(ds_2024["time"].values[0]).startswith("2024-01-01")
+        assert "flash_flood_risk" in ds_2022.data_vars
+        assert "flash_flood_risk" in ds_2024.data_vars
+
     def test_build_daily_indicators_merges_supplemental_pressure_levels(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_root = _build_fake_raw_tree(
