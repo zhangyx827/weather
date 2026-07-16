@@ -17,6 +17,13 @@ def _write_dataset(path: Path, ds: xr.Dataset) -> None:
     ds.to_netcdf(path)
 
 
+def _write_fake_srtm_tile(path: Path) -> None:
+    array = np.full((1201, 1201), 100, dtype=np.int16)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("N16E034.hgt", array.astype(">i2").tobytes())
+
+
 def _build_fake_raw_tree(
     root: Path,
     *,
@@ -367,6 +374,40 @@ class TestBuildInputs:
         assert indicator_entry["metadata"]["resolved_sources"]["dust"]["resolved_source"] == "merra2_dust"
         assert indicator_entry["metadata"]["resolved_sources"]["precip_daily"]["resolved_source"] == "gpm_imerg_daily"
 
+    def test_build_falls_back_to_csv_when_parquet_engine_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_root = _build_fake_raw_tree(root, include_oisst=True, include_jpl_mur=True)
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=root / "aurora",
+                indicator_nc_out=root / "nc",
+                indicator_parquet_out=root / "pq",
+            )
+            original_to_parquet = getattr(builder._daily_to_frame(builder.build_daily_indicators(date(2025, 1, 1)), date(2025, 1, 1)).__class__, "to_parquet")
+
+            def _raise_missing_engine(self, path, index=False):
+                raise ImportError("missing parquet engine")
+
+            try:
+                import pandas as pd
+
+                pd.DataFrame.to_parquet = _raise_missing_engine
+                result = builder.build(date(2025, 1, 1), date(2025, 1, 1), include_aurora=False)
+            finally:
+                import pandas as pd
+
+                pd.DataFrame.to_parquet = original_to_parquet
+                builder.close()
+
+            table_entry = next(entry for entry in result.entries if entry.kind == "indicator_table")
+            csv_path = root / "pq" / "saudi_indicator_samples_20250101.csv"
+            csv_exists = csv_path.exists()
+
+        assert table_entry.status == "ok"
+        assert table_entry.detail == str(csv_path)
+        assert csv_exists
+
     def test_build_daily_indicators_supports_explicit_2024_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_root = _build_fake_raw_tree(Path(tmp), year=2024, single_layout="direct_plus_supplement")
@@ -385,6 +426,30 @@ class TestBuildInputs:
 
         assert "flash_flood_risk" in ds.data_vars
         assert str(ds["time"].values[0]).startswith("2024-01-01")
+
+    def test_build_daily_indicators_rebuilds_missing_nis_netcdf_from_raw_tiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_root = _build_fake_raw_tree(root, year=2024, single_layout="direct_plus_supplement")
+            nis_path = root / "data" / "output" / "nis" / "nis_elevation_grid.nc"
+            nis_path.unlink()
+            _write_fake_srtm_tile(raw_root / "nis" / "N16E034.SRTMGL1.hgt.zip")
+            builder = RawInputBuilder(
+                raw_root=raw_root,
+                aurora_out=root / "aurora",
+                indicator_nc_out=root / "nc",
+                indicator_parquet_out=root / "pq",
+                single_dir=raw_root / "era5_single_levels_2024",
+                pressure_dir=raw_root / "era5_pressure_levels_2024",
+            )
+            try:
+                ds = builder.build_daily_indicators(date(2024, 1, 1))
+            finally:
+                builder.close()
+            nis_exists = nis_path.exists()
+
+        assert "flash_flood_risk" in ds.data_vars
+        assert nis_exists
 
     def test_build_daily_indicators_supports_year_specific_directory_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:

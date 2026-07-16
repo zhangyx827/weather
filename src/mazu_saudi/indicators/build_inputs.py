@@ -13,7 +13,6 @@ from typing import Any
 
 import numpy as np
 import xarray as xr
-
 from mazu_saudi.indicators.physical import compute_flash_flood_screening_score
 
 SAUDI_BBOX = (16.0, 34.0, 32.0, 56.0)
@@ -503,6 +502,7 @@ class RawInputBuilder:
         self.precip_dir = self.raw_root / "precip"
         self.dust_dir = self.raw_root / "dust"
         self.sst_dir = self.raw_root / "sst"
+        self.nis_raw_dir = self.raw_root / "nis"
         self.nis_path = self.raw_root.parent / "output" / "nis" / "nis_elevation_grid.nc"
         self._single_cache: dict[tuple[int, int, str], xr.Dataset] = {}
         self._pressure_cache: dict[tuple[int, int, str], xr.Dataset] = {}
@@ -655,6 +655,7 @@ class RawInputBuilder:
                     indicator_frames.append(self._daily_to_frame(daily, current))
                     
                 except Exception as exc:
+                    print(exc)
                     result.add("indicator_nc", current.isoformat(), "error", str(exc))
                 current += timedelta(days=1)
 
@@ -665,8 +666,8 @@ class RawInputBuilder:
                 table = self._concat_frames(indicator_frames)
                 table_path = self._indicator_table_path(self.indicator_parquet_out, start_date, end_date)
                 try:
-                    self._write_parquet(table, table_path)
-                    result.add("indicator_table", str(start_date.year), "ok", str(table_path))
+                    written_path = self._write_indicator_table(table, table_path)
+                    result.add("indicator_table", str(start_date.year), "ok", str(written_path))
                 except Exception as exc:
                     result.add("indicator_table", str(start_date.year), "skipped", str(exc))
 
@@ -1350,7 +1351,14 @@ class RawInputBuilder:
     def _elevation(self) -> xr.Dataset:
         if self._elevation_cache is None:
             if not self.nis_path.exists():
-                raise FileNotFoundError(self.nis_path)
+                if not self.nis_raw_dir.exists():
+                    raise FileNotFoundError(self.nis_path)
+                from mazu_saudi.data.srtm import SRTMElevationIndex
+
+                index = SRTMElevationIndex(self.nis_raw_dir)
+                generated = index.to_xarray_dataset(bbox=SAUDI_BBOX, resolution_deg=STANDARD_RESOLUTION)
+                self.nis_path.parent.mkdir(parents=True, exist_ok=True)
+                generated.to_netcdf(self.nis_path)
             self._elevation_cache = _align_to_standard_grid(xr.open_dataset(self.nis_path, engine="netcdf4"), method="nearest")
         return self._elevation_cache
 
@@ -1614,13 +1622,14 @@ class RawInputBuilder:
         return flat
 
     @staticmethod
-    def _write_parquet(table: Any, path: Path) -> None:
+    def _write_indicator_table(table: Any, path: Path) -> Path:
         try:
             table.to_parquet(path, index=False)
-        except Exception as exc:
-            raise RuntimeError(
-                "Parquet export requires a pandas parquet engine such as pyarrow or fastparquet"
-            ) from exc
+            return path
+        except Exception:
+            csv_path = path.with_suffix(".csv")
+            table.to_csv(csv_path, index=False)
+            return csv_path
 
 
 def daterange(start_date: date, end_date: date) -> Iterable[date]:
