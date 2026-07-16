@@ -26,6 +26,7 @@ def _build_fake_raw_tree(
     oisst_value_c: float = 25.0,
     jpl_value_c: float = 27.0,
     supplemental_pressure_levels: dict[str, tuple[int, ...]] | None = None,
+    single_layout: str = "zip",
 ) -> Path:
     raw_root = root / "data" / "raw"
     single_dir = raw_root / f"era5_single_levels_{year}"
@@ -97,12 +98,39 @@ def _build_fake_raw_tree(
     instant.to_netcdf(tmp_instant)
     accum.to_netcdf(tmp_accum)
     max_ds.to_netcdf(tmp_max)
-    zip_path = single_dir / f"era5_single_levels_{year}_01.nc"
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.write(tmp_instant, "data_stream-oper_stepType-instant.nc")
-        archive.write(tmp_accum, "data_stream-oper_stepType-accum.nc")
-        archive.write(tmp_max, "data_stream-oper_stepType-max.nc")
+    primary_path = single_dir / f"era5_single_levels_{year}_01.nc"
+    primary_path.parent.mkdir(parents=True, exist_ok=True)
+    if single_layout == "zip":
+        with zipfile.ZipFile(primary_path, "w") as archive:
+            archive.write(tmp_instant, "data_stream-oper_stepType-instant.nc")
+            archive.write(tmp_accum, "data_stream-oper_stepType-accum.nc")
+            archive.write(tmp_max, "data_stream-oper_stepType-max.nc")
+    elif single_layout == "direct_plus_supplement":
+        primary_direct = xr.merge(
+            [
+                instant[["t2m", "u10", "v10", "z"]],
+                xr.Dataset(
+                    {
+                        "msl": (("valid_time", "latitude", "longitude"), np.full(shape_3d, 101000.0, dtype=np.float32), {"units": "Pa"}),
+                        "lsm": (("valid_time", "latitude", "longitude"), np.full(shape_3d, 1.0, dtype=np.float32)),
+                        "slt": (("valid_time", "latitude", "longitude"), np.full(shape_3d, 2.0, dtype=np.float32)),
+                    },
+                    coords={"valid_time": times, "latitude": lats, "longitude": lons},
+                ),
+            ],
+            compat="override",
+        )
+        _write_dataset(primary_path, primary_direct)
+        supplement_path = single_dir / f"era5_single_levels_{year}_01_supplement.nc"
+        direct_missing = instant[["d2m", "sp", "cape", "cin", "tcc", "lcc", "mcc", "hcc"]]
+        tmp_direct_missing = root / "instant_missing.nc"
+        direct_missing.to_netcdf(tmp_direct_missing)
+        with zipfile.ZipFile(supplement_path, "w") as archive:
+            archive.write(tmp_direct_missing, "data_stream-oper_stepType-instant.nc")
+            archive.write(tmp_accum, "data_stream-oper_stepType-accum.nc")
+            archive.write(tmp_max, "data_stream-oper_stepType-max.nc")
+    else:
+        raise ValueError(f"unsupported single_layout: {single_layout}")
 
     aurora_single = xr.Dataset(
         {
@@ -341,7 +369,7 @@ class TestBuildInputs:
 
     def test_build_daily_indicators_supports_explicit_2024_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
-            raw_root = _build_fake_raw_tree(Path(tmp), year=2024)
+            raw_root = _build_fake_raw_tree(Path(tmp), year=2024, single_layout="direct_plus_supplement")
             builder = RawInputBuilder(
                 raw_root=raw_root,
                 aurora_out=Path(tmp) / "aurora",

@@ -1305,15 +1305,7 @@ class RawInputBuilder:
         key = (year, month, member_name)
         if key in self._single_cache:
             return self._single_cache[key]
-        path = self.single_dir / f"era5_single_levels_{year}_{month:02d}.nc"
-        if not path.exists():
-            raise FileNotFoundError(path)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            target = Path(tmpdir) / member_name
-            with zipfile.ZipFile(path) as archive:
-                target.write_bytes(archive.read(member_name))
-            ds = xr.open_dataset(target, engine="netcdf4").load()
-        self._single_cache[key] = _normalize_dataset(ds)
+        self._single_cache[key] = self._load_single_member_dataset(year, month, member_name)
         return self._single_cache[key]
 
     def _single_member_slice(
@@ -1324,17 +1316,71 @@ class RawInputBuilder:
         start: np.datetime64,
         end: np.datetime64,
     ) -> xr.Dataset:
-        path = self.single_dir / f"era5_single_levels_{year}_{month:02d}.nc"
-        if not path.exists():
-            raise FileNotFoundError(path)
+        ds = self._single_member(year, month, member_name)
+        return ds.sel(time=slice(start, end)).load()
+
+    @staticmethod
+    def _single_member_variable_names(member_name: str) -> tuple[str, ...]:
+        mapping = {
+            "data_stream-oper_stepType-instant.nc": ("t2m", "d2m", "u10", "v10", "sp", "z", "cape", "cin", "tcc", "lcc", "mcc", "hcc"),
+            "data_stream-oper_stepType-accum.nc": ("tp", "cp", "ssrd", "strd", "sshf", "slhf"),
+            "data_stream-oper_stepType-max.nc": ("mx2t", "mn2t"),
+        }
+        try:
+            return mapping[member_name]
+        except KeyError as exc:
+            raise KeyError(f"unsupported ERA5 single-level member: {member_name}") from exc
+
+    def _single_container_paths(self, year: int, month: int) -> tuple[Path, Path | None]:
+        primary = self.single_dir / f"era5_single_levels_{year}_{month:02d}.nc"
+        if not primary.exists():
+            raise FileNotFoundError(primary)
+        supplement = self.single_dir / f"era5_single_levels_{year}_{month:02d}_supplement.nc"
+        return primary, supplement if supplement.exists() else None
+
+    def _single_member_from_archive(self, archive_path: Path, member_name: str) -> xr.Dataset:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / member_name
-            with zipfile.ZipFile(path) as archive:
+            with zipfile.ZipFile(archive_path) as archive:
                 target.write_bytes(archive.read(member_name))
-            with xr.open_dataset(target, engine="netcdf4") as ds:
-                normalized = _normalize_dataset(ds)
-                subset = normalized.sel(time=slice(start, end)).load()
-        return subset
+            ds = xr.open_dataset(target, engine="netcdf4").load()
+        return _normalize_dataset(ds)
+
+    def _load_single_member_dataset(self, year: int, month: int, member_name: str) -> xr.Dataset:
+        member_variables = self._single_member_variable_names(member_name)
+        primary_path, supplement_path = self._single_container_paths(year, month)
+        parts: list[xr.Dataset] = []
+        loaded_variables: set[str] = set()
+
+        if zipfile.is_zipfile(primary_path):
+            direct = self._single_member_from_archive(primary_path, member_name)
+            parts.append(direct)
+            loaded_variables.update(direct.data_vars)
+        else:
+            with xr.open_dataset(primary_path, engine="netcdf4") as ds:
+                normalized = _normalize_dataset(ds.load())
+            available = [name for name in member_variables if name in normalized.data_vars]
+            if available:
+                parts.append(normalized[available])
+                loaded_variables.update(available)
+
+        if supplement_path is not None and zipfile.is_zipfile(supplement_path):
+            supplement = self._single_member_from_archive(supplement_path, member_name)
+            remaining = [name for name in member_variables if name not in loaded_variables and name in supplement.data_vars]
+            if remaining:
+                parts.append(supplement[remaining])
+                loaded_variables.update(remaining)
+
+        if not parts:
+            raise KeyError(f"single-level member {member_name} is unavailable for {year}-{month:02d}")
+
+        missing = [name for name in member_variables if name not in loaded_variables]
+        if missing:
+            raise KeyError(
+                f"single-level member {member_name} is missing required variables for {year}-{month:02d}: {missing}"
+            )
+
+        return xr.merge(parts, compat="override", join="outer") if len(parts) > 1 else parts[0]
 
     def _aurora_single_month(self, year: int, month: int) -> xr.Dataset:
         path = self.single_dir / f"era5_single_levels_{year}_{month:02d}_aurora.nc"
