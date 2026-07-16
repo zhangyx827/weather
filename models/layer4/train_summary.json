@@ -1,21 +1,28 @@
 {
-  "source": "data/raw/era5_saudi_20250616.nc",
-  "samples": 277680,
+  "source": "data/processed/layer4_training_tables/dry_heat_agriculture_training.parquet",
+  "source_format": "indicator-parquet",
+  "hazard_type": "dry_heat_agriculture",
+  "samples": 26045292,
   "feature_names": [
     "temp_c",
-    "vpd_kpa",
+    "tmax_c",
     "heat_index_c",
+    "vpd_kpa",
     "wind_speed_mps",
     "relative_humidity_percent"
   ],
-  "models": {
-    "extreme_heat": {
-      "path": "models/layer4/extreme_heat.txt",
-      "valid_rmse": 0.0036273362555989323
-    },
-    "dry_heat_stress": {
-      "path": "models/layer4/dry_heat_stress.txt",
-      "valid_rmse": 0.001786065687134001
-    }
+  "model": {
+    "path": "models/layer4/dry_heat_stress.txt",
+    "backend": "lightgbm",
+    "objective": "regression",
+    "metric": "rmse",
+    "validation_metric": 0.004334276329624984,
+    "best_iteration": 250
+  },
+  "training_target": {
+    "target_source": "pseudo_target",
+    "input_rows": 26045292,
+    "rows_after_label_filter": 26045292,
+    "rows_with_explicit_label": 0
   }
 }
