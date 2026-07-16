@@ -78,19 +78,25 @@ def _source_signature(source_path: Path) -> dict[str, Any]:
     }
 
 
-def _build_table_for_file(source_path: Path, hazard_type: str):
-    dataset = read_netcdf_dataset(source_path)
+def _build_table_from_dataset(dataset: Any, source_path: Path, hazard_type: str, source_signature: dict[str, Any]):
+    """优化抽离：接受已打开的 dataset 避免重复进行文件 I/O"""
     frame = feature_frame_from_dataset(dataset, hazard_type=hazard_type)
     frame.insert(0, "date", _coerce_timestamp(dataset, source_path))
     frame.insert(1, "hazard_type", hazard_type)
     frame["source_file"] = source_path.name
     frame["source_status"] = dataset.attrs.get("source_status", "normal")
     frame["degradation_metadata"] = _degradation_metadata_json(dataset)
-    source_signature = _source_signature(source_path)
     frame["source_size_bytes"] = source_signature["source_size_bytes"]
     frame["source_mtime_ns"] = source_signature["source_mtime_ns"]
     frame["source_mtime_utc"] = source_signature["source_mtime_utc"]
     return frame
+
+
+def _build_table_for_file(source_path: Path, hazard_type: str):
+    """保持向后兼容的原始接口"""
+    dataset = read_netcdf_dataset(source_path)
+    source_signature = _source_signature(source_path)
+    return _build_table_from_dataset(dataset, source_path, hazard_type, source_signature)
 
 
 def _write_table(table: Any, path: Path, fmt: str) -> None:
@@ -120,19 +126,15 @@ def _incremental_merge(existing_table, new_tables):
     if not new_tables:
         return existing_table
 
-    source_file_series = existing_table["source_file"].astype(str) if "source_file" in existing_table.columns else None
     retained = existing_table.copy()
-    merged_tables = []
+    
+    # 优化点 3：通过集合收集所有要被替换的 source_file，利用向量化 .isin() 一次性过滤，避免循环过滤
+    if "source_file" in retained.columns:
+        files_to_remove = {str(table["source_file"].iloc[0]) for table in new_tables if not table.empty}
+        if files_to_remove:
+            retained = retained[~retained["source_file"].astype(str).isin(files_to_remove)]
 
-    for table in new_tables:
-        source_file = str(table["source_file"].iloc[0])
-        if source_file_series is not None and source_file in set(source_file_series):
-            retained = retained[retained["source_file"].astype(str) != source_file]
-        merged_tables.append(table)
-
-    if merged_tables:
-        retained = pd.concat([retained, *merged_tables], ignore_index=True)
-    return retained
+    return pd.concat([retained, *new_tables], ignore_index=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -146,37 +148,71 @@ def main(argv: list[str] | None = None) -> int:
     hazard_types = args.hazard_type or list(HAZARD_TYPES)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 优化点 1：提前读取所有灾害的历史大表，并构建高性能的签名哈希映射缓存
+    existing_tables = {}
+    existing_signatures = {}  # 格式: {hazard_type: {source_file: (size, mtime)}}
+    
+    for hazard_type in hazard_types:
+        output_path = args.output_dir / f"{hazard_type}_training.{args.format}"
+        if output_path.exists():
+            table = _read_table(output_path, args.format)
+            existing_tables[hazard_type] = table
+            
+            sigs = {}
+            if table is not None and "source_file" in table.columns and {"source_size_bytes", "source_mtime_ns"}.issubset(table.columns):
+                # 去重获取每个文件在历史记录中的第一条签名数据（对应原 .iloc[0] 逻辑）
+                df_dropped = table.drop_duplicates(subset=["source_file"])
+                sigs = dict(zip(
+                    df_dropped["source_file"].astype(str),
+                    zip(df_dropped["source_size_bytes"].astype(int), df_dropped["source_mtime_ns"].astype(int))
+                ))
+            existing_signatures[hazard_type] = sigs
+        else:
+            existing_tables[hazard_type] = None
+            existing_signatures[hazard_type] = {}
+
+    # 初始化收集容器
+    new_tables_by_hazard = {h: [] for h in hazard_types}
+    skipped_counts = {h: 0 for h in hazard_types}
+
+    # 优化点 2：颠倒循环，外层循环文件，确保一个大 NetCDF 文件只做一次 I/O 读取
+    for path in input_files:
+        source_file = path.name
+        source_signature = _source_signature(path)
+        
+        # 找出当前文件需要为哪些灾害类型生成特征数据（未匹配上签名的灾害）
+        hazards_to_process = []
+        for hazard_type in hazard_types:
+            sigs = existing_signatures[hazard_type]
+            if source_file in sigs:
+                prior_size, prior_mtime = sigs[source_file]
+                if prior_size == source_signature["source_size_bytes"] and prior_mtime == source_signature["source_mtime_ns"]:
+                    skipped_counts[hazard_type] += 1
+                    continue
+            hazards_to_process.append(hazard_type)
+        
+        # 只有在至少有一种灾害需要处理时，才加载 NetCDF 文件
+        if hazards_to_process:
+            dataset = read_netcdf_dataset(path)
+            for hazard_type in hazards_to_process:
+                frame = _build_table_from_dataset(dataset, path, hazard_type, source_signature)
+                new_tables_by_hazard[hazard_type].append(frame)
+
+    # 按原始要求的灾害顺序，进行增量合并写入并构建最终的 Summary 输出
     summary: list[dict[str, Any]] = []
     for hazard_type in hazard_types:
         output_path = args.output_dir / f"{hazard_type}_training.{args.format}"
-        existing_table = _read_table(output_path, args.format) if output_path.exists() else None
-        existing_source_files = set()
-        if existing_table is not None and "source_file" in existing_table.columns:
-            existing_source_files = set(existing_table["source_file"].astype(str).tolist())
-
-        tables = []
-        skipped_files = 0
-        for path in input_files:
-            source_file = path.name
-            source_signature = _source_signature(path)
-            if (
-                existing_table is not None
-                and source_file in existing_source_files
-                and {"source_size_bytes", "source_mtime_ns"}.issubset(existing_table.columns)
-            ):
-                prior = existing_table.loc[existing_table["source_file"].astype(str) == source_file].iloc[0]
-                if int(prior["source_size_bytes"]) == source_signature["source_size_bytes"] and int(prior["source_mtime_ns"]) == source_signature["source_mtime_ns"]:
-                    skipped_files += 1
-                    continue
-            tables.append(_build_table_for_file(path, hazard_type))
-
-        table = _incremental_merge(existing_table, tables)
+        existing_table = existing_tables[hazard_type]
+        new_tables = new_tables_by_hazard[hazard_type]
+        
+        table = _incremental_merge(existing_table, new_tables)
         _write_table(table, output_path, args.format)
+        
         summary.append(
             {
                 "hazard_type": hazard_type,
                 "files": len(input_files),
-                "skipped_files": skipped_files,
+                "skipped_files": skipped_counts[hazard_type],
                 "rows": int(len(table)),
                 "format": args.format,
                 "output": str(output_path),
