@@ -336,6 +336,44 @@ def test_build_layer4_training_table_script_exports_parquet():
         assert len(table) == ds.latitude.size * ds.longitude.size
 
 
+def test_build_layer4_training_table_script_is_incremental():
+    module = _load_build_table_module()
+    ds = _indicator_dataset()
+    ds_next = ds.assign_coords(time=np.array(["2025-01-02"], dtype="datetime64[ns]"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        input_dir = tmp_path / "indicators"
+        output_dir = tmp_path / "tables"
+        input_dir.mkdir()
+
+        (input_dir / "saudi_indicators_20250101.nc").write_bytes(ds.to_netcdf())
+
+        result = module.main(["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood"])
+        assert result == 0
+
+        table = pd.read_csv(output_dir / "flash_flood_training.csv")
+        assert len(table) == ds.latitude.size * ds.longitude.size
+        assert table["source_file"].nunique() == 1
+
+        (input_dir / "saudi_indicators_20250102.nc").write_bytes(ds_next.to_netcdf())
+
+        result = module.main(["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood"])
+        assert result == 0
+
+        table = pd.read_csv(output_dir / "flash_flood_training.csv")
+        assert len(table) == ds.latitude.size * ds.longitude.size * 2
+        assert table["source_file"].nunique() == 2
+        assert set(table["source_file"]) == {"saudi_indicators_20250101.nc", "saudi_indicators_20250102.nc"}
+
+        result = module.main(["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood"])
+        assert result == 0
+
+        table = pd.read_csv(output_dir / "flash_flood_training.csv")
+        assert len(table) == ds.latitude.size * ds.longitude.size * 2
+        assert table["source_file"].nunique() == 2
+
+
 def test_layer4_feature_schema_separates_evidence_only_fields():
     from mazu_saudi.risk.layer4_features import (
         evidence_feature_names_for_hazard,
