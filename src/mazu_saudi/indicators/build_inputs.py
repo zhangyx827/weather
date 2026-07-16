@@ -614,124 +614,85 @@ class RawInputBuilder:
             self._elevation_cache.close()
 
     def build(self, start_date: date, end_date: date, *, include_aurora: bool = True) -> BuildResult:
-        result = BuildResult()
-        self.indicator_nc_out.mkdir(parents=True, exist_ok=True)
-        self.indicator_parquet_out.mkdir(parents=True, exist_ok=True)
-        if include_aurora:
-            self.aurora_out.mkdir(parents=True, exist_ok=True)
+            result = BuildResult()
+            self.indicator_nc_out.mkdir(parents=True, exist_ok=True)
+            self.indicator_parquet_out.mkdir(parents=True, exist_ok=True)
+            if include_aurora:
+                self.aurora_out.mkdir(parents=True, exist_ok=True)
 
-        indicator_frames: list[Any] = []
-        current = start_date
-        while current <= end_date:
-            try:
-                daily = self.build_daily_indicators(current)
-                nc_path = self.indicator_nc_out / f"saudi_indicators_{current:%Y%m%d}.nc"
-                daily.to_netcdf(nc_path)
-                result.add(
-                    "indicator_nc",
-                    current.isoformat(),
-                    "ok",
-                    str(nc_path),
-                    metadata=self._dataset_manifest_metadata(daily),
-                )
-                indicator_frames.append(self._daily_to_frame(daily, current))
-            except Exception as exc:
-                result.add("indicator_nc", current.isoformat(), "error", str(exc))
-            current += timedelta(days=1)
-
-        if indicator_frames:
-            table = self._concat_frames(indicator_frames)
-            table_path = self._indicator_table_path(self.indicator_parquet_out, start_date, end_date)
-            try:
-                self._write_parquet(table, table_path)
-                result.add("indicator_table", str(start_date.year), "ok", str(table_path))
-            except Exception as exc:
-                result.add("indicator_table", str(start_date.year), "skipped", str(exc))
-
-        if include_aurora:
-            aurora_time = _as_day_start(start_date)
-            final_time = _as_day_start(end_date) + timedelta(hours=18)
-            while aurora_time <= final_time:
+            # =====================================================================
+            # 1. 每日指标生成部分 (已改造为安全增量模式)
+            # =====================================================================
+            indicator_frames: list[Any] = []
+            current = start_date
+            while current <= end_date:
                 try:
-                    ds = self.build_aurora_input(aurora_time)
-                    path = self.aurora_out / f"aurora_input_{aurora_time:%Y%m%d%H}.nc"
-                    ds.to_netcdf(path)
-                    result.add("aurora", aurora_time.isoformat(), "ok", str(path))
+                    nc_path = self.indicator_nc_out / f"saudi_indicators_{current:%Y%m%d}.nc"
+                    
+                    # ✨ 增量检查：如果文件已存在，直接从磁盘加载
+                    if nc_path.exists():
+                        daily = xr.load_dataset(nc_path)
+                        result.add(
+                            "indicator_nc",
+                            current.isoformat(),
+                            "exists",  # 状态标记为已存在
+                            "skipped compute, loaded existing from disk",
+                            metadata=self._dataset_manifest_metadata(daily),
+                        )
+                    # 🆕 如果不存在，才老老实实调用原有的高耗时计算
+                    else:
+                        daily = self.build_daily_indicators(current)
+                        daily.to_netcdf(nc_path)
+                        result.add(
+                            "indicator_nc",
+                            current.isoformat(),
+                            "ok",
+                            str(nc_path),
+                            metadata=self._dataset_manifest_metadata(daily),
+                        )
+                    
+                    # 💡 核心关键：无论新算还是读取历史，都必须追加到下游的 Parquet 聚合中，防止 Parquet 缺数
+                    indicator_frames.append(self._daily_to_frame(daily, current))
+                    
                 except Exception as exc:
-                    result.add("aurora", aurora_time.isoformat(), "skipped", str(exc))
-                aurora_time += timedelta(hours=self.aurora_cadence_hours)
+                    result.add("indicator_nc", current.isoformat(), "error", str(exc))
+                current += timedelta(days=1)
 
-        result.write(self.aurora_out.parent / "build_manifest.json")
-        return result
+            # =====================================================================
+            # 2. 全量 Parquet 表格导出部分
+            # =====================================================================
+            if indicator_frames:
+                table = self._concat_frames(indicator_frames)
+                table_path = self._indicator_table_path(self.indicator_parquet_out, start_date, end_date)
+                try:
+                    self._write_parquet(table, table_path)
+                    result.add("indicator_table", str(start_date.year), "ok", str(table_path))
+                except Exception as exc:
+                    result.add("indicator_table", str(start_date.year), "skipped", str(exc))
 
-    def build_aurora_input(self, issue_time: datetime) -> xr.Dataset:
-        valid_utc = issue_time.astimezone(timezone.utc).replace(tzinfo=None)
-        history = [valid_utc - timedelta(hours=6), valid_utc]
-        history_index = np.array(history, dtype="datetime64[ns]")
-        start = history_index.min()
-        end = history_index.max()
-        instant = self._single_member_slice(valid_utc.year, valid_utc.month, "data_stream-oper_stepType-instant.nc", start, end)
-        aurora_surface = self._aurora_single_month_slice(valid_utc.year, valid_utc.month, start, end)
-        single = xr.merge(
-            [
-                _align_to_aurora_grid(instant[["t2m", "u10", "v10"]]),
-                _align_to_aurora_grid(aurora_surface[["msl"]]),
-            ],
-            compat="override",
-        )
-        if not set(history_index).issubset(set(single["time"].values)):
-            raise ValueError("missing required single-level history times")
-        pressure_parts = []
-        for short, long_name in {
-            "u": "u_component_of_wind",
-            "v": "v_component_of_wind",
-            "z": "geopotential",
-            "t": "temperature",
-            "q": "specific_humidity",
-        }.items():
-            ds = self._pressure_month_slice(valid_utc.year, valid_utc.month, long_name, start, end)[[short]]
-            pressure_parts.append(_align_to_aurora_grid(ds, method="linear"))
-        pressure = xr.merge(pressure_parts, compat="override")
-        if not set(history_index).issubset(set(pressure["time"].values)):
-            raise ValueError("missing required pressure-level history times")
+            # =====================================================================
+            # 3. Aurora 输入文件生成部分 (顺便也做了增量优化)
+            # =====================================================================
+            if include_aurora:
+                aurora_time = _as_day_start(start_date)
+                final_time = _as_day_start(end_date) + timedelta(hours=18)
+                while aurora_time <= final_time:
+                    try:
+                        path = self.aurora_out / f"aurora_input_{aurora_time:%Y%m%d%H}.nc"
+                        
+                        # ✨ Aurora 文件无下游依赖，可以直接安全跳过
+                        if path.exists():
+                            result.add("aurora", aurora_time.isoformat(), "exists", "skipped")
+                        else:
+                            ds = self.build_aurora_input(aurora_time)
+                            ds.to_netcdf(path)
+                            result.add("aurora", aurora_time.isoformat(), "ok", str(path))
+                    except Exception as exc:
+                        result.add("aurora", aurora_time.isoformat(), "skipped", str(exc))
+                    aurora_time += timedelta(hours=self.aurora_cadence_hours)
 
-        surf = {
-            "surf_2t": single["t2m"].sel(time=history_index),
-            "surf_10u": single["u10"].sel(time=history_index),
-            "surf_10v": single["v10"].sel(time=history_index),
-            "surf_msl": single["msl"].sel(time=history_index),
-        }
-        static = self._aurora_static(valid_utc.year, valid_utc.month)
-        atmos = {
-            "atmos_z": pressure["z"].sel(time=history_index, level=list(PRESSURE_LEVELS)),
-            "atmos_u": pressure["u"].sel(time=history_index, level=list(PRESSURE_LEVELS)),
-            "atmos_v": pressure["v"].sel(time=history_index, level=list(PRESSURE_LEVELS)),
-            "atmos_t": pressure["t"].sel(time=history_index, level=list(PRESSURE_LEVELS)),
-            "atmos_q": pressure["q"].sel(time=history_index, level=list(PRESSURE_LEVELS)),
-        }
-        data_vars: dict[str, Any] = {}
-        for name, da in surf.items():
-            data_vars[name] = (("time", "lat", "lon"), da.values.astype("float32"))
-        for source_name, output_name in (("lsm", "static_lsm"), ("z", "static_z"), ("slt", "static_slt")):
-            data_vars[output_name] = (("lat", "lon"), static[source_name].values.astype("float32"))
-        for name, da in atmos.items():
-            data_vars[name] = (("time", "level", "lat", "lon"), da.values.astype("float32"))
-        ds = xr.Dataset(
-            data_vars=data_vars,
-            coords={
-                "time": history_index,
-                "level": list(PRESSURE_LEVELS),
-                "lat": surf["surf_2t"]["lat"].values,
-                "lon": surf["surf_2t"]["lon"].values,
-            },
-            attrs={
-                "title": "Aurora direct input file",
-                "issue_time": issue_time.isoformat(),
-                "source": "ERA5 single levels + pressure levels from data/raw",
-                "history_hours": 6,
-            },
-        )
-        return ds
+            result.write(self.aurora_out.parent / "build_manifest.json")
+            return result
 
     def build_daily_indicators(self, day: date) -> xr.Dataset:
         single = self._daily_single_level_fields(day)
