@@ -263,6 +263,46 @@ def test_indicator_json_training_smoke_dry_heat():
         assert (model_dir / "dry_heat_stress.txt").exists()
 
 
+def test_indicator_csv_training_smoke_dry_heat_with_explicit_region_season_labels():
+    module = _load_training_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        source = tmp_path / "dry_heat_region_season.csv"
+        model_dir = tmp_path / "models"
+        frame = _indicator_frame(rows=18).drop(columns=["date", "latitude", "longitude"])
+        frame["region_id"] = ["asir", "qassim", "jazan"] * 6
+        frame["season"] = ["spring", "summer", "winter"] * 6
+        frame["year"] = [2021, 2022, 2023] * 6
+        frame["crop_type"] = ["wheat", "dates", "sorghum"] * 6
+        frame["yield_anomaly"] = np.linspace(-0.35, 0.4, len(frame), dtype=np.float32)
+        frame["validation_status"] = ["verified"] * len(frame)
+        frame.to_csv(source, index=False)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "train_layer4_lightgbm.py",
+            "--source",
+            str(source),
+            "--source-format",
+            "indicator-csv",
+            "--model-dir",
+            str(model_dir),
+            "--hazard-type",
+            "dry_heat_agriculture",
+        ]
+        try:
+            assert module.main() == 0
+        finally:
+            sys.argv = old_argv
+
+        summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
+        assert summary["training_target"]["target_source"] == "explicit_label"
+        assert summary["training_target"]["target_column"] == "yield_anomaly"
+        assert summary["training_target"]["sample_unit"] == "region-season"
+        assert summary["model"]["objective"] == "regression"
+        assert (model_dir / "dry_heat_stress.txt").exists()
+
+
 def test_indicator_netcdf_training_table():
     module = _load_training_module()
     ds = _indicator_dataset()
@@ -439,6 +479,21 @@ def test_build_training_table_from_frame_requires_daily_date_column():
         raise AssertionError("Expected missing date column to raise")
 
 
+def test_build_training_table_from_frame_supports_non_daily_supervision_tables():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=6).drop(columns=["date", "latitude", "longitude"])
+    frame["region_id"] = ["asir", "asir", "qassim", "qassim", "jazan", "jazan"]
+    frame["season"] = ["spring", "summer", "spring", "summer", "spring", "summer"]
+    frame["year"] = [2021, 2021, 2022, 2022, 2023, 2023]
+    frame["crop_type"] = ["wheat"] * 6
+    frame["yield_anomaly"] = np.array([-0.2, -0.1, 0.0, 0.1, 0.15, 0.3], dtype=np.float32)
+
+    features, target = module.build_training_table_from_frame(frame, "dry_heat_agriculture")
+
+    assert features.shape[0] == 6
+    assert np.allclose(target, np.array([-0.2, -0.1, 0.0, 0.1, 0.15, 0.3], dtype=np.float32))
+
+
 def test_build_training_table_from_frame_rejects_invalid_daily_dates():
     module = _load_training_module()
     frame = _indicator_frame(rows=4)
@@ -489,6 +544,26 @@ def test_summarize_frame_training_targets_reports_explicit_label_usage():
     assert summary["negative_labels"] == 2
     assert summary["label_status_counts"] == {"positive": 2, "negative": 2, "uncertain": 2}
     assert summary["label_source_mode_counts"] == {"point_buffer": 2, "no_event_day": 2}
+
+
+def test_summarize_frame_training_targets_reports_dry_heat_explicit_outcomes():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=5).drop(columns=["date", "latitude", "longitude"])
+    frame["region_id"] = ["asir", "asir", "qassim", "jazan", "jazan"]
+    frame["season"] = ["spring", "summer", "summer", "winter", "winter"]
+    frame["year"] = [2021, 2021, 2022, 2023, 2023]
+    frame["crop_type"] = ["wheat", "wheat", "dates", "sorghum", "sorghum"]
+    frame["yield_anomaly"] = np.array([-0.25, np.nan, 0.05, 0.2, 0.35], dtype=np.float32)
+    frame["validation_status"] = ["verified", "verified", "verified", "rejected", "verified"]
+
+    summary = module.summarize_frame_training_targets(frame, "dry_heat_agriculture")
+
+    assert summary["target_source"] == "explicit_label"
+    assert summary["sample_unit"] == "region-season"
+    assert summary["target_column"] == "yield_anomaly"
+    assert summary["rows_after_label_filter"] == 3
+    assert summary["rows_with_explicit_label"] == 3
+    assert summary["validation_status_counts"] == {"verified": 4, "rejected": 1}
 
 
 def test_build_flash_flood_supervised_training_table_script_exports_csv(tmp_path: Path):

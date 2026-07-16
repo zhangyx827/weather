@@ -29,6 +29,7 @@ from mazu_saudi.risk.layer4_features import (
     required_feature_names_for_hazard,
 )
 from mazu_saudi.risk.ml import LightGBMAdapter
+from mazu_saudi.risk.supervision import explicit_target_payload, has_explicit_targets, supervision_spec_for_hazard
 
 try:
     import pandas as pd
@@ -176,6 +177,10 @@ def _ensure_daily_date_column(table):
             working["date"] = _normalize_date_series(working[candidate])
             return working
     raise KeyError("daily training tables require a 'date', 'time', or 'valid_time' column")
+
+
+def _looks_like_daily_table(table) -> bool:
+    return any(name in table.columns for name in ("date", "time", "valid_time"))
 
 
 def _numeric_series(table, names, *, scale: float | None = None):
@@ -458,6 +463,13 @@ def build_daily_feature_frame(table, hazard_type: str):
     return pd.DataFrame(data)
 
 
+def build_supervised_feature_frame(table, hazard_type: str):
+    _require_pandas()
+    if _looks_like_daily_table(table):
+        return build_daily_feature_frame(table, hazard_type)
+    return table.reset_index(drop=True).copy()
+
+
 def build_training_table(dataset, hazard_type: str):
     ds = normalize_dataset(dataset)
     try:
@@ -476,58 +488,46 @@ def build_training_table(dataset, hazard_type: str):
 
 
 def summarize_frame_training_targets(table, hazard_type: str) -> dict[str, object]:
+    spec = supervision_spec_for_hazard(hazard_type)
     summary: dict[str, object] = {
         "target_source": "pseudo_target",
         "input_rows": int(len(table)),
         "rows_after_label_filter": int(len(table)),
         "rows_with_explicit_label": 0,
+        "sample_unit": spec.default_sample_unit,
     }
-    if hazard_type != "flash_flood" or "label" not in table.columns:
+    if not has_explicit_targets(table, hazard_type):
         return summary
 
-    working = table.reset_index(drop=True).copy()
-    if "label_status" in working.columns:
-        label_status = working["label_status"].astype(str).str.lower()
-        status_counts = label_status.value_counts(dropna=False).to_dict()
-        filtered = working[label_status.isin(("positive", "negative"))].copy()
-        summary["label_status_counts"] = {str(key): int(value) for key, value in status_counts.items()}
-    else:
-        filtered = working
+    filtered, labels, metadata = explicit_target_payload(table, hazard_type)
+    assert metadata is not None
+    summary["target_column"] = metadata["target_column"]
     summary["rows_after_label_filter"] = int(len(filtered))
-
-    labels = filtered["label"].astype(np.float32)
-    explicit_mask = labels.notna()
-    summary["rows_with_explicit_label"] = int(explicit_mask.sum())
-    if explicit_mask.any():
+    for column, counts in metadata["filter_details"].items():
+        summary[f"{column}_counts"] = counts
+    summary["rows_with_explicit_label"] = 0 if labels is None else int(len(labels))
+    if labels is not None and len(labels):
         summary["target_source"] = "explicit_label"
-        summary["positive_labels"] = int((labels[explicit_mask] > 0.5).sum())
-        summary["negative_labels"] = int((labels[explicit_mask] <= 0.5).sum())
+        unique_values = {float(value) for value in np.unique(labels[np.isfinite(labels)])}
+        if unique_values.issubset({0.0, 1.0}):
+            summary["positive_labels"] = int((labels > 0.5).sum())
+            summary["negative_labels"] = int((labels <= 0.5).sum())
+        else:
+            summary["target_min"] = float(labels.min())
+            summary["target_max"] = float(labels.max())
+            summary["target_mean"] = float(labels.mean())
         if "label_source_mode" in filtered.columns:
-            source_counts = (
-                filtered.loc[explicit_mask, "label_source_mode"]
-                .astype(str)
-                .value_counts(dropna=False)
-                .to_dict()
-            )
+            source_counts = filtered["label_source_mode"].astype(str).value_counts(dropna=False).to_dict()
             summary["label_source_mode_counts"] = {str(key): int(value) for key, value in source_counts.items()}
     return summary
 
 
 def build_training_table_from_frame(table, hazard_type: str):
     _require_pandas()
-    working = build_daily_feature_frame(table.reset_index(drop=True).copy(), hazard_type)
-    target = None
-    if hazard_type == "flash_flood" and "label" in working.columns:
-        labels = working["label"]
-        if "label_status" in working.columns:
-            label_status = working["label_status"].astype(str).str.lower()
-            working = working[label_status.isin(("positive", "negative"))].copy()
-            working = working.reset_index(drop=True)
-            labels = working["label"]
-        labels = labels.astype(np.float32)
-        if labels.notna().any():
-            labels = labels.reset_index(drop=True)
-            target = labels
+    working = build_supervised_feature_frame(table.reset_index(drop=True).copy(), hazard_type)
+    filtered, labels, _ = explicit_target_payload(working, hazard_type)
+    if labels is not None:
+        working = filtered
 
     frame = prepare_feature_frame(working, hazard_type=hazard_type)
     names = list(feature_names_for_hazard(hazard_type))
@@ -536,8 +536,8 @@ def build_training_table_from_frame(table, hazard_type: str):
     required_indexes = [names.index(name) for name in required_names]
     valid_mask = np.all(np.isfinite(features[:, required_indexes]), axis=1)
     features = features[valid_mask]
-    if target is not None:
-        target = target.loc[frame.index].to_numpy(dtype=np.float32)[valid_mask]
+    if labels is not None:
+        target = labels.loc[frame.index].to_numpy(dtype=np.float32)[valid_mask]
     else:
         target = build_target_from_features(features, hazard_type)
     if features.size == 0:
