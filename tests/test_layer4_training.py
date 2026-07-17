@@ -453,6 +453,47 @@ def test_build_layer4_training_table_script_is_incremental():
         assert table["source_file"].nunique() == 2
 
 
+def test_build_layer4_training_table_script_parquet_legacy_ns_precision_is_incremental():
+    if not _parquet_available():
+        return
+
+    module = _load_build_table_module()
+    ds = _indicator_dataset()
+    ds_next = ds.assign_coords(time=np.array(["2025-01-02"], dtype="datetime64[ns]"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        input_dir = tmp_path / "indicators"
+        output_dir = tmp_path / "tables"
+        input_dir.mkdir()
+
+        (input_dir / "saudi_indicators_20250101.nc").write_bytes(ds.to_netcdf())
+        (input_dir / "saudi_indicators_20250102.nc").write_bytes(ds_next.to_netcdf())
+
+        result = module.main(
+            ["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood", "--format", "parquet"]
+        )
+        assert result == 0
+
+        output_path = output_dir / "flash_flood_training.parquet"
+        table = pd.read_parquet(output_path)
+        assert table["source_file"].nunique() == 2
+
+        # Simulate a legacy parquet written without the microsecond column. Once the
+        # column widens to float64, nanosecond precision is no longer reliable.
+        legacy = table.drop(columns=["source_mtime_us"]).copy()
+        legacy["source_mtime_ns"] = legacy["source_mtime_ns"].astype(np.float64)
+        legacy.to_parquet(output_path, index=False)
+
+        result = module.main(["--input", str(input_dir), "--output-dir", str(output_dir), "--hazard-type", "flash_flood", "--format", "parquet"])
+        assert result == 0
+
+        table = pd.read_parquet(output_path)
+        assert len(table) == ds.latitude.size * ds.longitude.size * 2
+        assert table["source_file"].nunique() == 2
+        assert "source_mtime_us" not in legacy.columns
+
+
 def test_layer4_feature_schema_separates_evidence_only_fields():
     from mazu_saudi.risk.layer4_features import (
         evidence_feature_names_for_hazard,

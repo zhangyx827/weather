@@ -74,6 +74,9 @@ def _source_signature(source_path: Path) -> dict[str, Any]:
     return {
         "source_size_bytes": int(stat.st_size),
         "source_mtime_ns": int(stat.st_mtime_ns),
+        # Use microseconds for incremental matching because they fit safely in float64
+        # when older parquet rows are read back with a widened numeric dtype.
+        "source_mtime_us": int(stat.st_mtime_ns // 1_000),
         "source_mtime_utc": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
@@ -88,6 +91,7 @@ def _build_table_from_dataset(dataset: Any, source_path: Path, hazard_type: str,
     frame["degradation_metadata"] = _degradation_metadata_json(dataset)
     frame["source_size_bytes"] = source_signature["source_size_bytes"]
     frame["source_mtime_ns"] = source_signature["source_mtime_ns"]
+    frame["source_mtime_us"] = source_signature["source_mtime_us"]
     frame["source_mtime_utc"] = source_signature["source_mtime_utc"]
     return frame
 
@@ -137,6 +141,33 @@ def _incremental_merge(existing_table, new_tables):
     return pd.concat([retained, *new_tables], ignore_index=True)
 
 
+def _existing_signature_map(table: Any) -> dict[str, tuple[int, int]]:
+    if table is None or "source_file" not in table.columns or "source_size_bytes" not in table.columns:
+        return {}
+
+    df = table.dropna(subset=["source_file", "source_size_bytes"]).drop_duplicates(subset=["source_file"]).copy()
+    if "source_mtime_us" in df.columns:
+        mtime_us = df["source_mtime_us"]
+    else:
+        mtime_us = pd.Series(np.nan, index=df.index)
+
+    if "source_mtime_ns" in df.columns:
+        legacy_mtime_us = df["source_mtime_ns"] // 1_000
+        mtime_us = mtime_us.where(~mtime_us.isna(), legacy_mtime_us)
+
+    df["signature_mtime_us"] = mtime_us
+    df = df.dropna(subset=["signature_mtime_us"])
+    if df.empty:
+        return {}
+
+    return dict(
+        zip(
+            df["source_file"].astype(str),
+            zip(df["source_size_bytes"].astype(int), df["signature_mtime_us"].astype(int)),
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if pd is None:
@@ -150,23 +181,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # 优化点 1：提前读取所有灾害的历史大表，并构建高性能的签名哈希映射缓存
     existing_tables = {}
-    existing_signatures = {}  # 格式: {hazard_type: {source_file: (size, mtime)}}
+    existing_signatures = {}  # 格式: {hazard_type: {source_file: (size, mtime_us)}}
     
     for hazard_type in hazard_types:
         output_path = args.output_dir / f"{hazard_type}_training.{args.format}"
         if output_path.exists():
             table = _read_table(output_path, args.format)
             existing_tables[hazard_type] = table
-            
-            sigs = {}
-            if table is not None and "source_file" in table.columns and {"source_size_bytes", "source_mtime_ns"}.issubset(table.columns):
-                # 去重获取每个文件在历史记录中的第一条签名数据（对应原 .iloc[0] 逻辑）
-                df_dropped = table.drop_duplicates(subset=["source_file"])
-                sigs = dict(zip(
-                    df_dropped["source_file"].astype(str),
-                    zip(df_dropped["source_size_bytes"].astype(int), df_dropped["source_mtime_ns"].astype(int))
-                ))
-            existing_signatures[hazard_type] = sigs
+            existing_signatures[hazard_type] = _existing_signature_map(table)
         else:
             existing_tables[hazard_type] = None
             existing_signatures[hazard_type] = {}
@@ -185,8 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         for hazard_type in hazard_types:
             sigs = existing_signatures[hazard_type]
             if source_file in sigs:
-                prior_size, prior_mtime = sigs[source_file]
-                if prior_size == source_signature["source_size_bytes"] and prior_mtime == source_signature["source_mtime_ns"]:
+                prior_size, prior_mtime_us = sigs[source_file]
+                if prior_size == source_signature["source_size_bytes"] and prior_mtime_us == source_signature["source_mtime_us"]:
                     skipped_counts[hazard_type] += 1
                     continue
             hazards_to_process.append(hazard_type)
