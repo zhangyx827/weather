@@ -254,16 +254,25 @@ def _retrieve_with_retry(client, dataset: str, request: dict[str, object], targe
     backoff = 5
     for attempt in range(retries):
         try:
+            # 【新增】如果上次尝试留下了残余/损坏文件，先清理干净，确保全新下载
+            if target.exists():
+                target.unlink()
+
             client.retrieve(dataset, request, str(target))
             if zipfile.is_zipfile(target):
                 print(f"📦 {label} 返回了 zip，正在自动转换为 NetCDF...")
                 _rewrite_zip_as_netcdf(target)
             time.sleep(3)
             return
-        except (requests.exceptions.SSLError, MaxRetryError, requests.exceptions.HTTPError) as exc:
+        # 【修改】将 AssertionError 纳入捕获范围
+        except (requests.exceptions.SSLError, MaxRetryError, requests.exceptions.HTTPError, AssertionError) as exc:
+            # 【新增】断流或失败时，务必当场清理掉只下载了一半的坏文件，防止干扰后续判断
+            if target.exists():
+                target.unlink()
+                
             if attempt == retries - 1:
                 raise exc
-            print(f"⚠️ {label} 下载异常，{backoff}秒后重试...")
+            print(f"⚠️ {label} 下载异常或文件大小不匹配 ({type(exc).__name__})，{backoff}秒后重试...")
             time.sleep(backoff)
             backoff *= 2
 
