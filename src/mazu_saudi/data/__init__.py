@@ -25,6 +25,10 @@ from .indicator_features import (
     indicator_point_from_netcdf,
     read_indicator_dataset,
 )
+from .agriculture_supervised_training import (
+    aggregate_dry_heat_agriculture_features,
+    build_dry_heat_agriculture_supervised_training_dataset,
+)
 from .flash_flood_labels import (
     FlashFloodEvent,
     expand_flash_flood_events_to_daily_records,
@@ -38,6 +42,16 @@ from .flash_flood_event_sources import (
     merge_flash_flood_event_sources,
     standardize_flash_flood_event_records,
 )
+from .dust_storm_event_sources import (
+    DustStormEvent,
+    dust_storm_event_table,
+    dust_storm_event_records,
+    expand_dust_storm_events_to_daily_records,
+    expand_dust_storm_events_to_daily_table,
+    standardize_dust_storm_event_records,
+)
+from .dust_storm_mapping import build_dust_storm_training_labels
+from .dust_storm_training_dataset import build_dust_storm_supervised_training_dataset
 from .flash_flood_mapping import build_flash_flood_training_labels
 from .flash_flood_training_dataset import build_flash_flood_supervised_training_dataset
 from .srtm import (
@@ -68,6 +82,8 @@ __all__ = [
     "indicator_point_from_dataset",
     "indicator_point_from_netcdf",
     "read_indicator_dataset",
+    "aggregate_dry_heat_agriculture_features",
+    "build_dry_heat_agriculture_supervised_training_dataset",
     "FlashFloodEvent",
     "expand_flash_flood_events_to_daily_records",
     "expand_flash_flood_events_to_daily_table",
@@ -77,6 +93,14 @@ __all__ = [
     "merge_flash_flood_event_sources",
     "seed_flash_flood_events",
     "standardize_flash_flood_event_records",
+    "DustStormEvent",
+    "dust_storm_event_table",
+    "dust_storm_event_records",
+    "expand_dust_storm_events_to_daily_records",
+    "expand_dust_storm_events_to_daily_table",
+    "standardize_dust_storm_event_records",
+    "build_dust_storm_training_labels",
+    "build_dust_storm_supervised_training_dataset",
     "build_flash_flood_training_labels",
     "build_flash_flood_supervised_training_dataset",
     "SRTMElevationIndex",

@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "examples" / "train_layer4_lightgbm.py"
 BUILD_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_layer4_training_table.py"
 BUILD_SUPERVISED_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_flash_flood_supervised_training_table.py"
+BUILD_DRY_HEAT_SUPERVISED_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_dry_heat_agriculture_supervised_training_table.py"
+BUILD_DUST_STORM_SUPERVISED_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_dust_storm_supervised_training_table.py"
 DEMO_SUPERVISED_SCRIPT_PATH = ROOT / "examples" / "demo_flash_flood_supervised_training.py"
 
 
@@ -37,6 +39,30 @@ def _load_build_table_module():
 
 def _load_build_supervised_table_module():
     spec = importlib.util.spec_from_file_location("build_flash_flood_supervised_training_table", BUILD_SUPERVISED_TABLE_SCRIPT_PATH)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_build_dry_heat_supervised_table_module():
+    spec = importlib.util.spec_from_file_location(
+        "build_dry_heat_agriculture_supervised_training_table",
+        BUILD_DRY_HEAT_SUPERVISED_TABLE_SCRIPT_PATH,
+    )
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_build_dust_storm_supervised_table_module():
+    spec = importlib.util.spec_from_file_location(
+        "build_dust_storm_supervised_training_table",
+        BUILD_DUST_STORM_SUPERVISED_TABLE_SCRIPT_PATH,
+    )
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -103,6 +129,19 @@ def _indicator_frame(rows: int = 512) -> pd.DataFrame:
             "flash_flood_risk": rng.integers(0, 4, rows).astype(np.int16),
             "daily_precip_anomaly": rng.uniform(-10.0, 30.0, rows).astype(np.float32),
         }
+    )
+
+
+def _dry_heat_daily_region_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"date": "2024-01-15", "region_id": "asir", "temp_c": 31.0, "tmax_c": 37.0, "heat_index_c": 33.0, "vpd_kpa": 1.6, "wind_speed_mps": 3.2, "relative_humidity_percent": 40.0, "t2m_anomaly_c": 0.5, "heatwave_day_flag": 0, "heatwave_duration_days": 0},
+            {"date": "2024-04-10", "region_id": "asir", "temp_c": 35.0, "tmax_c": 41.0, "heat_index_c": 38.0, "vpd_kpa": 2.1, "wind_speed_mps": 4.0, "relative_humidity_percent": 31.0, "t2m_anomaly_c": 1.2, "heatwave_day_flag": 1, "heatwave_duration_days": 2},
+            {"date": "2024-08-02", "region_id": "asir", "temp_c": 39.0, "tmax_c": 45.0, "heat_index_c": 42.0, "vpd_kpa": 3.2, "wind_speed_mps": 5.0, "relative_humidity_percent": 24.0, "t2m_anomaly_c": 2.5, "heatwave_day_flag": 1, "heatwave_duration_days": 4},
+            {"date": "2024-02-05", "region_id": "qassim", "temp_c": 28.0, "tmax_c": 34.0, "heat_index_c": 30.0, "vpd_kpa": 1.2, "wind_speed_mps": 2.8, "relative_humidity_percent": 45.0, "t2m_anomaly_c": -0.3, "heatwave_day_flag": 0, "heatwave_duration_days": 0},
+            {"date": "2024-07-12", "region_id": "qassim", "temp_c": 41.0, "tmax_c": 47.0, "heat_index_c": 44.0, "vpd_kpa": 3.6, "wind_speed_mps": 6.1, "relative_humidity_percent": 20.0, "t2m_anomaly_c": 3.1, "heatwave_day_flag": 1, "heatwave_duration_days": 5},
+            {"date": "2025-03-03", "region_id": "asir", "temp_c": 32.0, "tmax_c": 38.0, "heat_index_c": 34.0, "vpd_kpa": 1.8, "wind_speed_mps": 3.5, "relative_humidity_percent": 36.0, "t2m_anomaly_c": 0.7, "heatwave_day_flag": 0, "heatwave_duration_days": 1},
+        ]
     )
 
 
@@ -566,6 +605,105 @@ def test_summarize_frame_training_targets_reports_dry_heat_explicit_outcomes():
     assert summary["validation_status_counts"] == {"verified": 4, "rejected": 1}
 
 
+def test_summarize_frame_training_targets_infers_region_year_sample_unit():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=4).drop(columns=["date", "latitude", "longitude"])
+    frame["region_id"] = ["asir", "qassim", "jazan", "hail"]
+    frame["year"] = [2021, 2021, 2022, 2023]
+    frame["crop_type"] = ["wheat", "wheat", "dates", "sorghum"]
+    frame["yield_anomaly"] = np.array([-0.2, 0.1, 0.0, 0.25], dtype=np.float32)
+    frame["validation_status"] = ["verified"] * len(frame)
+
+    summary = module.summarize_frame_training_targets(frame, "dry_heat_agriculture")
+
+    assert summary["target_source"] == "explicit_label"
+    assert summary["sample_unit"] == "region-year"
+    assert summary["target_column"] == "yield_anomaly"
+
+
+def test_build_dry_heat_agriculture_supervised_training_dataset_aggregates_region_year():
+    from mazu_saudi.data import build_dry_heat_agriculture_supervised_training_dataset
+
+    features = _dry_heat_daily_region_frame()
+    labels = pd.DataFrame(
+        [
+            {"region_id": "asir", "year": 2024, "crop_type": "wheat", "yield_anomaly": -0.15, "yield_value": 2.4, "harvest_area": 10.0, "source_name": "FAOSTAT", "source_url": "https://example.test/faostat", "validation_status": "verified"},
+            {"region_id": "qassim", "year": 2024, "crop_type": "wheat", "yield_anomaly": 0.2, "yield_value": 3.1, "harvest_area": 8.0, "source_name": "MOA", "source_url": "https://example.test/moa", "validation_status": "verified"},
+            {"region_id": "asir", "year": 2025, "crop_type": "wheat", "yield_anomaly": 0.05, "yield_value": 2.8, "harvest_area": 11.0, "source_name": "FAOSTAT", "source_url": "https://example.test/faostat-2025", "validation_status": "verified"},
+        ]
+    )
+
+    merged = build_dry_heat_agriculture_supervised_training_dataset(features, labels, sample_unit="region-year")
+
+    assert len(merged) == 3
+    assert set(["sample_unit", "aggregation_start_date", "aggregation_end_date", "feature_row_count", "temp_c_mean", "tmax_c_days_ge_45", "vpd_kpa_days_ge_3", "yield_anomaly", "crop_type"]).issubset(merged.columns)
+    asir_2024 = merged[(merged["region_id"] == "asir") & (merged["year"] == 2024)].iloc[0]
+    assert asir_2024["sample_unit"] == "region-year"
+    assert asir_2024["aggregation_start_date"] == "2024-01-15"
+    assert asir_2024["aggregation_end_date"] == "2024-08-02"
+    assert asir_2024["feature_row_count"] == 3.0
+    assert np.isclose(asir_2024["temp_c_mean"], (31.0 + 35.0 + 39.0) / 3.0)
+    assert asir_2024["temp_c_days_ge_35"] == 2.0
+    assert asir_2024["tmax_c_days_ge_45"] == 1.0
+    assert asir_2024["vpd_kpa_days_ge_3"] == 1.0
+    assert bool(asir_2024["is_labeled"])
+
+
+def test_build_dry_heat_agriculture_supervised_training_dataset_infers_season_keys():
+    from mazu_saudi.data import build_dry_heat_agriculture_supervised_training_dataset
+
+    features = _dry_heat_daily_region_frame()
+    labels = pd.DataFrame(
+        [
+            {"region_id": "asir", "year": 2024, "season": "winter", "crop_type": "wheat", "yield_anomaly": -0.05, "validation_status": "verified"},
+            {"region_id": "asir", "year": 2024, "season": "spring", "crop_type": "wheat", "yield_anomaly": -0.12, "validation_status": "verified"},
+            {"region_id": "asir", "year": 2024, "season": "summer", "crop_type": "wheat", "yield_anomaly": -0.25, "validation_status": "verified"},
+        ]
+    )
+
+    merged = build_dry_heat_agriculture_supervised_training_dataset(features, labels, sample_unit="region-season")
+
+    assert len(merged) == 3
+    assert set(merged["season"]) == {"winter", "spring", "summer"}
+    assert set(merged["sample_unit"]) == {"region-season"}
+
+
+def test_build_dry_heat_agriculture_supervised_training_table_script_exports_csv(tmp_path: Path):
+    module = _load_build_dry_heat_supervised_table_module()
+    features = _dry_heat_daily_region_frame()
+    labels = pd.DataFrame(
+        [
+            {"region_id": "asir", "year": 2024, "crop_type": "wheat", "yield_anomaly": -0.15, "validation_status": "verified"},
+            {"region_id": "qassim", "year": 2024, "crop_type": "wheat", "yield_anomaly": 0.2, "validation_status": "verified"},
+            {"region_id": "asir", "year": 2025, "crop_type": "wheat", "yield_anomaly": 0.05, "validation_status": "verified"},
+        ]
+    )
+
+    feature_path = tmp_path / "dry_heat_features.csv"
+    label_path = tmp_path / "dry_heat_labels.csv"
+    output_path = tmp_path / "dry_heat_supervised.csv"
+    features.to_csv(feature_path, index=False)
+    labels.to_csv(label_path, index=False)
+
+    result = module.main(
+        [
+            "--features",
+            str(feature_path),
+            "--labels",
+            str(label_path),
+            "--output",
+            str(output_path),
+            "--sample-unit",
+            "region-year",
+        ]
+    )
+    assert result == 0
+
+    merged = pd.read_csv(output_path)
+    assert len(merged) == 3
+    assert set(["region_id", "year", "yield_anomaly", "temp_c_mean", "training_join_key"]).issubset(merged.columns)
+
+
 def test_build_flash_flood_supervised_training_table_script_exports_csv(tmp_path: Path):
     module = _load_build_supervised_table_module()
     features = pd.DataFrame(
@@ -625,6 +763,64 @@ def test_build_flash_flood_supervised_training_table_script_exports_csv(tmp_path
     assert merged["label_status"].tolist() == ["positive", "negative"]
     assert merged["training_join_mode"].nunique() == 1
     assert merged["training_join_mode"].iloc[0] == "grid_day"
+
+
+def test_build_dust_storm_supervised_training_table_script_exports_csv(tmp_path: Path):
+    module = _load_build_dust_storm_supervised_table_module()
+    features = pd.DataFrame(
+        [
+            {"date": "2025-05-04", "hazard_type": "dust_storm", "province_name": "Qassim", "dust_aod": 0.45},
+            {"date": "2025-05-04", "hazard_type": "dust_storm", "province_name": "Madinah", "dust_aod": 0.12},
+            {"date": "2025-05-06", "hazard_type": "dust_storm", "province_name": "Madinah", "dust_aod": 0.08},
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2025-05-04",
+                "hazard_type": "dust_storm",
+                "province_name": "Qassim",
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "region_day_text",
+                "matched_event_ids": "dust_20250504_qassim_riyadh",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2025-05-04",
+                "hazard_type": "dust_storm",
+                "province_name": "Madinah",
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "outside_event_regions",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2025-05-06",
+                "hazard_type": "dust_storm",
+                "province_name": "Madinah",
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "no_event_day",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+        ]
+    )
+
+    feature_path = tmp_path / "features.csv"
+    label_path = tmp_path / "labels.csv"
+    output_path = tmp_path / "merged.csv"
+    features.to_csv(feature_path, index=False)
+    labels.to_csv(label_path, index=False)
+
+    assert module.main(["--features", str(feature_path), "--labels", str(label_path), "--output", str(output_path)]) == 0
+
+    merged = pd.read_csv(output_path)
+    assert merged["label_status"].tolist() == ["positive", "negative", "negative"]
+    assert merged["training_join_mode"].nunique() == 1
+    assert merged["training_join_mode"].iloc[0] == "region_day:province_name"
 
 
 def test_demo_flash_flood_supervised_training_builds_balanced_dataset(tmp_path: Path):

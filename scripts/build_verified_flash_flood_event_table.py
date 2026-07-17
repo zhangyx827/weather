@@ -23,17 +23,34 @@ from mazu_saudi.data import (
 
 
 FORMATS = ("csv", "json", "parquet")
+DEFAULT_VERIFIED_INPUT_DIR = ROOT / "data" / "raw" / "flash_flood_verified"
+DEFAULT_OUTPUT = ROOT / "data" / "processed" / "real_flash_flood_chain" / "flash_flood_events_verified_combined.csv"
+DEFAULT_DAILY_OUTPUT = ROOT / "data" / "processed" / "real_flash_flood_chain" / "flash_flood_events_verified_combined_daily.csv"
+DEFAULT_SUMMARY_OUTPUT = ROOT / "data" / "processed" / "real_flash_flood_chain" / "flash_flood_events_verified_summary.json"
+
+
+def _default_verified_inputs() -> list[Path]:
+    return sorted(
+        path
+        for path in DEFAULT_VERIFIED_INPUT_DIR.iterdir()
+        if path.is_file() and path.suffix.lower().lstrip(".") in FORMATS and not path.name.startswith("sample_")
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a combined flash-flood event table from handoff seed events and one verified external source."
+        description="Build a combined flash-flood event table from handoff seed events and one or more verified external sources."
     )
-    parser.add_argument("--verified-input", type=Path, required=True, help="Verified event table path in csv/json/parquet format.")
+    parser.add_argument(
+        "--verified-input",
+        type=Path,
+        action="append",
+        help="Verified event table path in csv/json/parquet format. Repeat to ingest multiple verified source files. Defaults to all bundled non-sample files under data/raw/flash_flood_verified/.",
+    )
     parser.add_argument("--verified-format", choices=FORMATS, help="Optional input format override for the verified event table.")
     parser.add_argument(
         "--source-name",
-        default="verified_source",
+        default="web_verified",
         help="Source name written into standardized verified event provenance when rows do not provide one.",
     )
     parser.add_argument(
@@ -44,20 +61,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "data" / "processed" / "labels" / "flash_flood_events_verified_combined.csv",
+        default=DEFAULT_OUTPUT,
         help="Output path for the normalized combined event table.",
     )
     parser.add_argument("--format", choices=FORMATS, default="csv", help="Output format for the normalized combined event table.")
     parser.add_argument(
         "--daily-output",
         type=Path,
-        default=ROOT / "data" / "processed" / "labels" / "flash_flood_events_verified_combined_daily.csv",
+        default=DEFAULT_DAILY_OUTPUT,
         help="Output path for the inclusive daily expansion table.",
     )
     parser.add_argument("--daily-format", choices=FORMATS, default="csv", help="Output format for the daily expansion table.")
     parser.add_argument(
         "--summary-output",
         type=Path,
+        default=DEFAULT_SUMMARY_OUTPUT,
         help="Optional JSON path for ingestion summary metadata and provenance coverage counts.",
     )
     return parser.parse_args(argv)
@@ -109,9 +127,17 @@ def _non_empty_count(table, column: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    verified_format = _infer_format(args.verified_input, args.verified_format)
-    verified_records = _read_table(args.verified_input, verified_format)
-    verified_events = standardize_flash_flood_event_records(verified_records, source_name=args.source_name)
+    verified_inputs = args.verified_input or _default_verified_inputs()
+    if not verified_inputs:
+        raise FileNotFoundError(f"No verified event tables were found under: {DEFAULT_VERIFIED_INPUT_DIR}")
+
+    verified_events = []
+    for verified_input in verified_inputs:
+        if not verified_input.exists():
+            raise FileNotFoundError(f"Verified event table does not exist: {verified_input}")
+        verified_format = _infer_format(verified_input, args.verified_format)
+        verified_records = _read_table(verified_input, verified_format)
+        verified_events.extend(standardize_flash_flood_event_records(verified_records, source_name=args.source_name))
     events = verified_events if args.verified_only else merge_flash_flood_event_sources(
         seed_events=seed_flash_flood_events(),
         verified_events=verified_events,
@@ -131,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         for key, value in event_table["source_name"].value_counts(dropna=False).to_dict().items()
     }
     summary = {
-        "verified_input": str(args.verified_input),
+        "verified_inputs": [str(path) for path in verified_inputs],
         "verified_rows": int(len(verified_events)),
         "seed_rows_included": 0 if args.verified_only else int(len(seed_flash_flood_events())),
         "combined_rows": int(len(event_table)),

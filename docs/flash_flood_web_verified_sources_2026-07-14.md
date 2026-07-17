@@ -25,6 +25,10 @@ Source quality notes:
 
 Recommended interpretation:
 
-- Treat this CSV as `web_verified_candidate` quality rather than a final official bulletin baseline.
+- Treat this CSV as preserved `verified` web evidence rather than a final official bulletin baseline.
 - Keep provenance fields intact during ingestion.
 - Prefer upgrading each row later with a direct official or primary-media citation when available.
+
+See also:
+
+- `data/raw/flash_flood_verified/web_verified_events_2024_2026-07-16.csv` for the current preserved 2024 flash-flood expansion rows.

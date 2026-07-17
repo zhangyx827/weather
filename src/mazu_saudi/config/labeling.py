@@ -54,3 +54,42 @@ class FlashFloodLabelMappingConfig:
             min_spatial_confidence=os.getenv("MAZU_FLASH_FLOOD_MIN_SPATIAL_CONFIDENCE", "medium").strip().lower() or "medium",
             positive_validation_statuses=_env_csv_set("MAZU_FLASH_FLOOD_POSITIVE_VALIDATION_STATUSES", ("seed", "verified")),
         )
+
+
+@dataclass(frozen=True)
+class DustStormLabelMappingConfig:
+    emit_event_day_negatives: bool = True
+    positive_validation_statuses: tuple[str, ...] = ("verified",)
+    location_aliases: dict[str, str] = field(
+        default_factory=lambda: {
+            "asir": "asir",
+            "aseer": "asir",
+            "dammam": "eastern_province",
+            "eastern": "eastern_province",
+            "eastern province": "eastern_province",
+            "eastern_region": "eastern_province",
+            "easternprovince": "eastern_province",
+            "hafar al-batin": "eastern_province",
+            "hail": "hail",
+            "hafar al batin": "eastern_province",
+            "hejaz": "hijaz",
+            "hijaz": "hijaz",
+            "jizan": "jizan",
+            "madinah": "madinah",
+            "medina": "madinah",
+            "najran": "najran",
+            "northern borders": "northern_borders",
+            "northern_borders": "northern_borders",
+            "qassim": "qassim",
+            "qaseem": "qassim",
+            "rafha": "northern_borders",
+            "riyadh": "riyadh",
+        }
+    )
+
+    @classmethod
+    def from_env(cls) -> "DustStormLabelMappingConfig":
+        return cls(
+            emit_event_day_negatives=_env_flag("MAZU_DUST_STORM_EMIT_EVENT_DAY_NEGATIVES", True),
+            positive_validation_statuses=_env_csv_set("MAZU_DUST_STORM_POSITIVE_VALIDATION_STATUSES", ("verified",)),
+        )

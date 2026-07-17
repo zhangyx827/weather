@@ -17,6 +17,8 @@ except Exception:  # pragma: no cover - optional dependency
 def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
+    if isinstance(value, float) and value != value:
+        return ""
     return str(value).strip()
 
 

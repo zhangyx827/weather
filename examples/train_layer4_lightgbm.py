@@ -467,6 +467,8 @@ def build_supervised_feature_frame(table, hazard_type: str):
     _require_pandas()
     if _looks_like_daily_table(table):
         return build_daily_feature_frame(table, hazard_type)
+    if hazard_type in {"extreme_heat", "flash_flood"}:
+        raise KeyError("daily training tables require a 'date', 'time', or 'valid_time' column")
     return table.reset_index(drop=True).copy()
 
 
@@ -502,6 +504,7 @@ def summarize_frame_training_targets(table, hazard_type: str) -> dict[str, objec
     filtered, labels, metadata = explicit_target_payload(table, hazard_type)
     assert metadata is not None
     summary["target_column"] = metadata["target_column"]
+    summary["sample_unit"] = metadata["sample_unit"]
     summary["rows_after_label_filter"] = int(len(filtered))
     for column, counts in metadata["filter_details"].items():
         summary[f"{column}_counts"] = counts

@@ -11,6 +11,7 @@ Current training code can fit hazard-specific LightGBM models, but the shipped t
 | Hazard | Recommended supervision unit | Priority | Current status |
 | --- | --- | --- | --- |
 | `flash_flood` | `grid-day` or `province-day` event label | Highest | Ready for event-table + mapping implementation |
+| `dust_storm` | `province-day` or `region-day` event label | High | 2025 user event facts preserved; ingestion, label mapping, and supervised join paths now exist |
 | `extreme_heat` | `impact-region-day` focused on Hajj / Makkah | Medium | Needs impact table design and region scope definition |
 | `dry_heat_agriculture` | `region-season` or `region-year` outcome label | Medium | Needs task redefinition before model training |
 
@@ -37,6 +38,14 @@ These are handoff-approved seed events for the first table build:
 | 2017-11-21 | Jeddah | flash flood |
 | 2022-11-24 | Jeddah | flash flood |
 | 2022-12-23 | Mecca | flash flood |
+
+### Preserved verified raw files
+
+- `data/raw/flash_flood_verified/web_verified_events_2026-07-14.csv`
+- `data/raw/flash_flood_verified/web_verified_events_2024_2026-07-16.csv`
+- `data/raw/flash_flood_verified/user_leads_2025_flash_flood_events.csv`
+
+The verified flash-flood build script now ingests all bundled non-sample files under `data/raw/flash_flood_verified/` by default so the preserved 2024 and 2025 facts participate in the normal combined event artifact. The current 2024 preserved rows are `Eastern Province` and `Dammam` on `2024-04-17`.
 
 ### Required event-table schema
 
@@ -113,6 +122,49 @@ Do not frame this as nationwide daily grid classification yet. The first real-la
 - `source_name`
 - `source_url`
 - `validation_status`
+
+## Dust Storm
+
+### Candidate sources
+
+| Source family | Type | Expected coverage | Notes |
+| --- | --- | --- | --- |
+| Saudi NCM alerts | Official warning bulletins | Province / event-specific | Best first source for red-alert timing and area coverage |
+| Airport and highway disruption bulletins | Operational impact evidence | City / corridor specific | Good for visibility and transport impact confirmation |
+| Peer-reviewed or post-event summaries | Secondary validation | Event-specific | Useful when official bulletins are incomplete |
+| User-provided 2025 event list | User-confirmed event facts | Event-specific | Preserved in repo as explicit event rows with provenance |
+
+### Current preserved verified fact file
+
+- `data/raw/dust_storm_verified/user_leads_2025_dust_events.csv`
+
+### Required event-table schema
+
+- `event_id`
+- `hazard_type`
+- `start_date`
+- `end_date`
+- `location_name`
+- `country_code`
+- `latitude`
+- `longitude`
+- `geometry_wkt`
+- `spatial_confidence`
+- `temporal_confidence`
+- `source_name`
+- `source_url`
+- `source_record_id`
+- `validation_status`
+- `severity`
+- `notes`
+
+### Current policy
+
+- preserve user-confirmed events as `verified`
+- keep provenance explicit via `source_name`, `source_url`, `source_record_id`, and `notes`
+- expand to inclusive daily rows for downstream mapping
+- map resolved text coverage into deterministic `province-day` or `region-day` labels
+- keep unresolved event-day rows as `label_status=uncertain` unless explicit negative emission is enabled
 
 ## Dry Heat Agriculture
 

@@ -74,6 +74,27 @@ def find_explicit_target_column(table, hazard_type: str) -> str | None:
     return None
 
 
+def infer_sample_unit(table, hazard_type: str) -> str:
+    spec = supervision_spec_for_hazard(hazard_type)
+    columns = set(table.columns)
+    if hazard_type == "flash_flood":
+        if {"date", "latitude", "longitude"}.issubset(columns):
+            return "grid-day"
+        if "date" in columns:
+            return "province-day"
+        return spec.default_sample_unit
+    if hazard_type == "extreme_heat":
+        if {"date", "region_id"}.issubset(columns):
+            return "impact-region-day"
+        return spec.default_sample_unit
+    if hazard_type == "dry_heat_agriculture":
+        if {"region_id", "year", "season"}.issubset(columns):
+            return "region-season"
+        if {"region_id", "year"}.issubset(columns):
+            return "region-year"
+    return spec.default_sample_unit
+
+
 def has_explicit_targets(table, hazard_type: str) -> bool:
     return find_explicit_target_column(table, hazard_type) is not None
 
@@ -104,7 +125,7 @@ def explicit_target_payload(table, hazard_type: str):
     labels = labels.loc[explicit_mask].astype("float32")
     metadata = {
         "target_column": target_column,
-        "sample_unit": spec.default_sample_unit,
+        "sample_unit": infer_sample_unit(working, hazard_type),
         "filter_details": filter_details,
     }
     return working.reset_index(drop=True), labels.reset_index(drop=True), metadata

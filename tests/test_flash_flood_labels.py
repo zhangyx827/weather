@@ -19,6 +19,11 @@ from mazu_saudi.data import (
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "build_flash_flood_event_table.py"
 VERIFIED_SCRIPT_PATH = ROOT / "scripts" / "build_verified_flash_flood_event_table.py"
+DEFAULT_VERIFIED_INPUTS = [
+    ROOT / "data" / "raw" / "flash_flood_verified" / "user_leads_2025_flash_flood_events.csv",
+    ROOT / "data" / "raw" / "flash_flood_verified" / "web_verified_events_2024_2026-07-16.csv",
+    ROOT / "data" / "raw" / "flash_flood_verified" / "web_verified_events_2026-07-14.csv",
+]
 
 
 def _load_script_module():
@@ -265,3 +270,50 @@ def test_build_verified_flash_flood_event_table_script_merges_seed_and_verified(
     assert summary["provenance_field_coverage"]["source_url_non_empty"] == 2
     assert summary["provenance_field_coverage"]["source_record_id_non_empty"] == 7
     assert summary["provenance_field_coverage"]["validation_status_non_empty"] == 7
+
+
+def test_build_verified_flash_flood_event_table_script_uses_bundled_real_verified_input_by_default(tmp_path: Path):
+    module = _load_verified_script_module()
+    output = tmp_path / "flash_flood_events_verified_combined.csv"
+    daily_output = tmp_path / "flash_flood_events_verified_combined_daily.csv"
+    summary_output = tmp_path / "flash_flood_events_verified_summary.json"
+
+    assert all(path.exists() for path in DEFAULT_VERIFIED_INPUTS)
+    assert module.main(
+        [
+            "--source-name",
+            "web_verified",
+            "--output",
+            str(output),
+            "--daily-output",
+            str(daily_output),
+            "--summary-output",
+            str(summary_output),
+        ]
+    ) == 0
+
+    events = pd.read_csv(output)
+    daily = pd.read_csv(daily_output)
+    summary = json.loads(summary_output.read_text(encoding="utf-8"))
+
+    assert len(events) == 14
+    assert len(daily) == 18
+    assert set(events["validation_status"]) == {"verified"}
+    assert "Dammam" in set(events["location_name"])
+    assert "Eastern Province" in set(events["location_name"])
+    assert "Jeddah" in set(events["location_name"])
+    assert "Mecca" in set(events["location_name"])
+    assert [Path(path).name for path in summary["verified_inputs"]] == [path.name for path in DEFAULT_VERIFIED_INPUTS]
+    assert summary["verified_rows"] == 14
+    assert summary["combined_rows"] == 14
+    assert summary["daily_rows"] == 18
+    assert summary["validation_status_counts"] == {"verified": 14}
+    assert summary["source_name_counts"] == {
+        "user_session_handoff": 5,
+        "web_verified": 7,
+        "web_verified_2024": 2,
+    }
+    assert summary["provenance_field_coverage"]["source_name_non_empty"] == 14
+    assert summary["provenance_field_coverage"]["source_url_non_empty"] == 9
+    assert summary["provenance_field_coverage"]["source_record_id_non_empty"] == 14
+    assert summary["provenance_field_coverage"]["validation_status_non_empty"] == 14

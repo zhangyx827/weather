@@ -143,12 +143,13 @@ def run_demo(
         "label_path": str(label_path),
     }
 
-    if not train_model:
-        summary["training_skipped_reason"] = "train_model_disabled"
-        return summary
     if _parquet_available():
         supervised.to_parquet(supervised_path, index=False)
         summary["supervised_path"] = str(supervised_path)
+
+    if not train_model:
+        summary["training_skipped_reason"] = "train_model_disabled"
+        return summary
     if not _lightgbm_available():
         summary["training_skipped_reason"] = "lightgbm_unavailable"
         return summary

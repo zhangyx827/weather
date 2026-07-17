@@ -53,6 +53,18 @@ Verified flash-flood source ingestion contract:
 
 ```bash
 cat docs/flash_flood_verified_ingestion.md
+python3 scripts/build_verified_flash_flood_event_table.py
+```
+
+The default flash-flood verified build now ingests all bundled non-sample files under `data/raw/flash_flood_verified/`, including the preserved 2025 user facts and two explicit 2024 web-verified rows for `Eastern Province` and `Dammam`.
+
+2025 dust-storm verified ingestion contract:
+
+```bash
+cat docs/dust_storm_verified_ingestion.md
+python3 scripts/build_dust_storm_event_table.py
+python3 scripts/build_dust_storm_training_labels.py --samples /path/to/dust_samples.csv
+python3 scripts/build_dust_storm_supervised_training_table.py --features /path/to/dust_features.csv --labels /path/to/dust_labels.csv
 ```
 
 Run API after installing dependencies:
