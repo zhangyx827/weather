@@ -24,6 +24,9 @@ Recent history mixes Conventional Commit prefixes (`feat:`) with short free-form
 ## Data & Configuration Notes
 Treat files under `data/raw/` and large NetCDF outputs as inputs or generated artifacts, not hand-edited source. Keep reusable configuration in `src/mazu_saudi/config/`, and avoid hard-coding absolute paths in examples, scripts, or tests.
 
+## Merge Discipline
+When a user says "merge into" a file, do not assume they want row removal or deduplication. Confirm the merge direction from the source content, and preserve the existing file unless the user explicitly asks for a reduction or replacement.
+
 ## Architecture Evolution Notes
 
 ### Runtime Physical Grounding

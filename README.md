@@ -25,6 +25,18 @@ python3 examples/run_api_client_demo.py
 python3 examples/export_kg_ttl.py
 ```
 
+Train the Layer-4 LightGBM models:
+
+```bash
+./scripts/run_train_layer4_lightgbm.sh --source data/processed/layer4_training_tables/flash_flood_training.parquet --source-format indicator-parquet --hazard-type flash_flood --model-dir models/layer4
+```
+
+If you want to call the Python entrypoint directly, use:
+
+```bash
+python3 examples/train_layer4_lightgbm.py --source /path/to/dataset --source-format auto --hazard-type extreme_heat --model-dir models/layer4
+```
+
 Convert the bundled NIS SRTM elevation tiles into a model-ready Saudi grid:
 
 ```bash
