@@ -20,11 +20,17 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 _CONFIDENCE_LEVELS = {"low": 1, "medium": 2, "high": 3}
+_SUPPORTED_EVENT_MAPPING_MODES = {"geometry_wkt", "point_buffer", "province_day"}
 
 
 def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
+    try:
+        if value != value:
+            return ""
+    except Exception:
+        pass
     return str(value).strip().lower()
 
 
@@ -147,11 +153,40 @@ def _point_in_wkt_geometry(latitude: float, longitude: float, geometry_wkt: Any)
 def _has_usable_geometry(event: Any) -> bool:
     geometry = _normalize_text(event.get("geometry_wkt"))
     if not geometry:
-        return False
+        geometry_source = _normalize_text(event.get("geometry_source"))
+        if geometry_source:
+            return True
+        latitude = event.get("latitude")
+        longitude = event.get("longitude")
+        return pd.notna(latitude) and pd.notna(longitude)
     try:
         return bool(_parse_wkt_polygons(geometry))
     except Exception:
         return False
+
+
+def _event_geometry_source(event: Any) -> str:
+    geometry_source = _normalize_text(event.get("geometry_source"))
+    if geometry_source:
+        return geometry_source
+    if _has_usable_geometry(event):
+        geometry = _normalize_text(event.get("geometry_wkt"))
+        if geometry:
+            return "source_geometry"
+        latitude = event.get("latitude")
+        longitude = event.get("longitude")
+        if pd.notna(latitude) and pd.notna(longitude):
+            return "derived_point_buffer"
+    return ""
+
+
+def _matched_geometry_source(event: Any, matched_mode: str) -> str:
+    source = _event_geometry_source(event)
+    if source:
+        return source
+    if matched_mode == "province_day":
+        return "province_boundary"
+    return ""
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -224,8 +259,13 @@ def _event_mapping_mode(event: Any, config: FlashFloodLabelMappingConfig) -> str
         return "unsupported"
     if not _confidence_at_least(spatial_confidence, config.min_spatial_confidence):
         return "uncertain"
-    if _has_usable_geometry(event):
-        return "geometry_wkt"
+    geometry = _normalize_text(event.get("geometry_wkt"))
+    if geometry:
+        try:
+            if _parse_wkt_polygons(geometry):
+                return "geometry_wkt"
+        except Exception:
+            pass
     latitude = event.get("latitude")
     longitude = event.get("longitude")
     if pd.notna(latitude) and pd.notna(longitude):
@@ -233,6 +273,13 @@ def _event_mapping_mode(event: Any, config: FlashFloodLabelMappingConfig) -> str
     if config.province_fallback_enabled and _resolved_province_names(event, config):
         return "province_day"
     return "uncertain"
+
+
+def _day_event_mode_counts(day_events: list[dict[str, Any]], config: FlashFloodLabelMappingConfig) -> tuple[list[str], list[str], list[str]]:
+    day_event_mapping_modes = [_event_mapping_mode(event, config) for event in day_events]
+    supported_modes = [mode for mode in day_event_mapping_modes if mode in _SUPPORTED_EVENT_MAPPING_MODES]
+    unsupported_modes = [mode for mode in day_event_mapping_modes if mode not in _SUPPORTED_EVENT_MAPPING_MODES]
+    return day_event_mapping_modes, supported_modes, unsupported_modes
 
 
 def _sample_matches_event(sample: Any, event: Any, config: FlashFloodLabelMappingConfig) -> tuple[bool, str | None]:
@@ -273,7 +320,7 @@ def _supports_event_day_negative(sample_columns: Any, day_events: list[dict[str,
         supported_modes.update({"point_buffer", "province_day"})
     if not supported_modes:
         return False
-    return all(_event_mapping_mode(event, config) in supported_modes for event in day_events)
+    return any(_event_mapping_mode(event, config) in supported_modes for event in day_events)
 
 
 def _default_provenance_json(
@@ -281,16 +328,26 @@ def _default_provenance_json(
     date_value: str,
     day_events: list[dict[str, Any]],
     day_event_mapping_modes: list[str],
+    day_supported_event_count: int,
+    day_unsupported_event_count: int,
     config: FlashFloodLabelMappingConfig,
 ) -> str:
     return json.dumps(
         {
             "date": date_value,
             "event_count_for_day": len(day_events),
+            "day_supported_event_count": day_supported_event_count,
+            "day_unsupported_event_count": day_unsupported_event_count,
+            "day_has_supported_event": day_supported_event_count > 0,
             "matched_event_ids": [],
             "matched_location_names": [],
             "mapping_modes": [],
+            "matched_geometry_sources": [],
             "day_event_mapping_modes": day_event_mapping_modes,
+            "day_supported_event_mapping_modes": [],
+            "day_unsupported_event_mapping_modes": [],
+            "day_geometry_event_count": 0,
+            "day_point_event_count": 0,
             "matched_geometry_wkts": [],
             "point_buffer_km": config.point_buffer_km,
             "province_fallback_enabled": config.province_fallback_enabled,
@@ -367,6 +424,8 @@ def build_flash_flood_training_labels(
             date_value=date_value,
             day_events=[],
             day_event_mapping_modes=[],
+            day_supported_event_count=0,
+            day_unsupported_event_count=0,
             config=active_config,
         )
         for date_value in normalized_samples.loc[~has_event_mask, "date"].drop_duplicates().tolist()
@@ -397,7 +456,16 @@ def build_flash_flood_training_labels(
             if not day_mask.any():
                 continue
             day_positions = np.flatnonzero(day_mask.to_numpy())
-            day_event_mapping_modes = [_event_mapping_mode(event, active_config) for event in day_events]
+            day_event_mapping_modes, day_supported_event_mapping_modes, day_unsupported_event_mapping_modes = _day_event_mode_counts(
+                day_events,
+                active_config,
+            )
+            day_geometry_event_count = sum(1 for event in day_events if _has_usable_geometry(event))
+            day_point_event_count = sum(
+                1
+                for event in day_events
+                if pd.notna(event.get("latitude")) and pd.notna(event.get("longitude"))
+            )
 
             for event in day_events:
                 mode = _event_mapping_mode(event, active_config)
@@ -455,9 +523,7 @@ def build_flash_flood_training_labels(
                     matched_lists[absolute_pos].append(event)
                     mode_lists[absolute_pos].append(matched_mode)
 
-            allow_event_day_negatives = _supports_event_day_negative(sample_columns, day_events, active_config) and all(
-                mode in {"point_buffer", "province_day", "geometry_wkt"} for mode in day_event_mapping_modes
-            )
+            allow_event_day_negatives = _supports_event_day_negative(sample_columns, day_events, active_config)
             for absolute_pos in day_positions.tolist():
                 matches = matched_lists[absolute_pos]
                 modes = mode_lists[absolute_pos]
@@ -473,20 +539,68 @@ def build_flash_flood_training_labels(
                     event_samples.iat[absolute_pos, event_samples.columns.get_loc("label_status")] = "negative"
                     event_samples.iat[absolute_pos, event_samples.columns.get_loc("label_source_mode")] = "outside_event_footprint"
 
+        day_provenance: dict[str, dict[str, Any]] = {}
+        for date_value in sorted(events_by_date):
+            day_events = events_by_date.get(date_value, [])
+            day_event_mapping_modes, day_supported_event_mapping_modes, day_unsupported_event_mapping_modes = _day_event_mode_counts(
+                day_events,
+                active_config,
+            )
+            day_provenance[date_value] = {
+                "date": date_value,
+                "event_count_for_day": len(day_events),
+                "day_supported_event_count": len(day_supported_event_mapping_modes),
+                "day_unsupported_event_count": len(day_unsupported_event_mapping_modes),
+                "day_has_supported_event": bool(day_supported_event_mapping_modes),
+                "day_event_mapping_modes": day_event_mapping_modes,
+                "day_supported_event_mapping_modes": day_supported_event_mapping_modes,
+                "day_unsupported_event_mapping_modes": day_unsupported_event_mapping_modes,
+                "day_geometry_event_count": sum(1 for event in day_events if _has_usable_geometry(event)),
+                "day_point_event_count": sum(
+                    1
+                    for event in day_events
+                    if pd.notna(event.get("latitude")) and pd.notna(event.get("longitude"))
+                ),
+            }
+
         provenance_values: list[str] = []
         for date_value, matches, modes in zip(event_sample_dates, matched_lists, mode_lists):
             day_events = events_by_date.get(date_value, [])
-            day_event_mapping_modes = [_event_mapping_mode(event, active_config) for event in day_events]
+            day_event_mapping_modes, day_supported_event_mapping_modes, day_unsupported_event_mapping_modes = _day_event_mode_counts(
+                day_events,
+                active_config,
+            )
+            day_metadata = day_provenance.get(
+                date_value,
+                {
+                    "date": date_value,
+                    "event_count_for_day": len(day_events),
+                    "day_supported_event_count": len(day_supported_event_mapping_modes),
+                    "day_unsupported_event_count": len(day_unsupported_event_mapping_modes),
+                    "day_has_supported_event": bool(day_supported_event_mapping_modes),
+                    "day_event_mapping_modes": day_event_mapping_modes,
+                    "day_supported_event_mapping_modes": day_supported_event_mapping_modes,
+                    "day_unsupported_event_mapping_modes": day_unsupported_event_mapping_modes,
+                    "day_geometry_event_count": 0,
+                    "day_point_event_count": 0,
+                    "matched_geometry_sources": [],
+                },
+            )
             provenance_values.append(
                 json.dumps(
                     {
-                        "date": date_value,
-                        "event_count_for_day": len(day_events),
+                        **day_metadata,
                         "matched_event_ids": [event["event_id"] for event in matches],
                         "matched_location_names": [event.get("location_name", "") for event in matches],
                         "mapping_modes": sorted(set(modes)),
-                        "day_event_mapping_modes": day_event_mapping_modes,
-                        "matched_geometry_wkts": [event.get("geometry_wkt") for event in matches if _normalize_text(event.get("geometry_wkt"))],
+                        "matched_geometry_sources": [
+                            geometry_source
+                            for event, matched_mode in zip(matches, modes)
+                            if (geometry_source := _matched_geometry_source(event, matched_mode))
+                        ],
+                        "matched_geometry_wkts": [
+                            event.get("geometry_wkt") for event in matches if _normalize_text(event.get("geometry_wkt"))
+                        ],
                         "point_buffer_km": active_config.point_buffer_km,
                         "province_fallback_enabled": active_config.province_fallback_enabled,
                         "emit_event_day_negatives": active_config.emit_event_day_negatives,

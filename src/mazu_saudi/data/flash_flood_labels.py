@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
+import math
 from typing import Any
 
 try:
@@ -40,6 +41,38 @@ class FlashFloodEvent:
 
 def _parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _buffer_point_geometry_wkt(latitude: float, longitude: float, radius_km: float, *, segments: int = 32) -> str:
+    if segments < 4:
+        raise ValueError("segments must be at least 4")
+    if radius_km <= 0:
+        raise ValueError("radius_km must be positive")
+
+    latitude = float(latitude)
+    longitude = float(longitude)
+    latitude_scale_km = 110.574
+    longitude_scale_km = 111.320 * max(math.cos(math.radians(latitude)), 1e-6)
+    latitude_delta = radius_km / latitude_scale_km
+    longitude_delta = radius_km / longitude_scale_km
+
+    points: list[str] = []
+    for index in range(segments):
+        angle = (2.0 * math.pi * index) / segments
+        buffered_latitude = latitude + latitude_delta * math.sin(angle)
+        buffered_longitude = longitude + longitude_delta * math.cos(angle)
+        points.append(f"{buffered_longitude:.6f} {buffered_latitude:.6f}")
+    points.append(points[0])
+    return f"POLYGON(({', '.join(points)}))"
+
+
+def _event_geometry_record(event: FlashFloodEvent, *, point_buffer_km: float) -> tuple[str | None, str, float | None]:
+    geometry_wkt = event.geometry_wkt
+    if geometry_wkt:
+        return geometry_wkt, "source_geometry", None
+    if event.latitude is not None and event.longitude is not None:
+        return _buffer_point_geometry_wkt(event.latitude, event.longitude, point_buffer_km), "derived_point_buffer", point_buffer_km
+    return None, "", None
 
 
 def seed_flash_flood_events() -> list[FlashFloodEvent]:
@@ -113,17 +146,33 @@ def seed_flash_flood_events() -> list[FlashFloodEvent]:
     ]
 
 
-def flash_flood_event_records(events: list[FlashFloodEvent] | None = None) -> list[dict[str, Any]]:
-    return [event.to_record() for event in (events or seed_flash_flood_events())]
+def flash_flood_event_records(
+    events: list[FlashFloodEvent] | None = None,
+    *,
+    point_buffer_km: float = 25.0,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for event in events or seed_flash_flood_events():
+        payload = event.to_record()
+        geometry_wkt, geometry_source, geometry_buffer_km = _event_geometry_record(event, point_buffer_km=point_buffer_km)
+        payload["geometry_wkt"] = geometry_wkt
+        payload["geometry_source"] = geometry_source
+        payload["geometry_buffer_km"] = geometry_buffer_km
+        records.append(payload)
+    return records
 
 
-def flash_flood_event_table(events: list[FlashFloodEvent] | None = None):
+def flash_flood_event_table(events: list[FlashFloodEvent] | None = None, *, point_buffer_km: float = 25.0):
     if pd is None:
         raise RuntimeError("pandas is required for flash-flood event-table creation")
-    return pd.DataFrame(flash_flood_event_records(events))
+    return pd.DataFrame(flash_flood_event_records(events, point_buffer_km=point_buffer_km))
 
 
-def expand_flash_flood_events_to_daily_records(events: list[FlashFloodEvent] | None = None) -> list[dict[str, Any]]:
+def expand_flash_flood_events_to_daily_records(
+    events: list[FlashFloodEvent] | None = None,
+    *,
+    point_buffer_km: float = 25.0,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for event in events or seed_flash_flood_events():
         current = event.start_date
@@ -138,6 +187,18 @@ def expand_flash_flood_events_to_daily_records(events: list[FlashFloodEvent] | N
                     "latitude": event.latitude,
                     "longitude": event.longitude,
                     "geometry_wkt": event.geometry_wkt,
+                    "geometry_source": (
+                        "source_geometry"
+                        if event.geometry_wkt
+                        else "derived_point_buffer"
+                        if event.latitude is not None and event.longitude is not None
+                        else ""
+                    ),
+                    "geometry_buffer_km": (
+                        None
+                        if event.geometry_wkt or event.latitude is None or event.longitude is None
+                        else point_buffer_km
+                    ),
                     "spatial_confidence": event.spatial_confidence,
                     "temporal_confidence": event.temporal_confidence,
                     "source_name": event.source_name,
@@ -152,7 +213,11 @@ def expand_flash_flood_events_to_daily_records(events: list[FlashFloodEvent] | N
     return records
 
 
-def expand_flash_flood_events_to_daily_table(events: list[FlashFloodEvent] | None = None):
+def expand_flash_flood_events_to_daily_table(
+    events: list[FlashFloodEvent] | None = None,
+    *,
+    point_buffer_km: float = 25.0,
+):
     if pd is None:
         raise RuntimeError("pandas is required for flash-flood daily table creation")
-    return pd.DataFrame(expand_flash_flood_events_to_daily_records(events))
+    return pd.DataFrame(expand_flash_flood_events_to_daily_records(events, point_buffer_km=point_buffer_km))

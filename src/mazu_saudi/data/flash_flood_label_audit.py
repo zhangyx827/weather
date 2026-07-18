@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from mazu_saudi.config import FlashFloodLabelMappingConfig
+from mazu_saudi.data.flash_flood_audit import count_flash_flood_geometry_backed_positive_rows
 from mazu_saudi.data.flash_flood_mapping import (
     _event_mapping_mode,
     _normalize_date_column,
@@ -81,6 +82,10 @@ def _canonicalize_for_audit(value: Any) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
 
 
+def _is_supported_mapping_mode(value: Any) -> bool:
+    return str(value).strip() in {"geometry_wkt", "point_buffer", "province_day"}
+
+
 def _manual_annotation_residual_tokens(
     location_name: Any,
     resolved_province_names: tuple[str, ...],
@@ -113,8 +118,12 @@ def _classify_unresolved_candidate_event(
     mapping_mode: str,
     resolved_province_names: tuple[str, ...],
     location_name: Any,
+    day_supported_event_count: int,
+    day_unsupported_event_count: int,
     config: FlashFloodLabelMappingConfig,
 ) -> tuple[str, list[str]]:
+    if day_supported_event_count > 0 and day_unsupported_event_count > 0:
+        return ("mixed_supported_and_unsupported", [])
     if mapping_mode in {"point_buffer", "geometry_wkt"}:
         return ("policy_conservative", [])
     if mapping_mode == "uncertain" and not resolved_province_names:
@@ -125,6 +134,26 @@ def _classify_unresolved_candidate_event(
             return ("manual_annotation_candidate", residual_tokens)
         return ("policy_conservative", [])
     return ("source_too_vague", [])
+
+
+def _has_geometry_evidence(row: Any) -> bool:
+    geometry_source = row.get("geometry_source")
+    if geometry_source is not None:
+        try:
+            if pd is not None and pd.notna(geometry_source) and str(geometry_source).strip():
+                return True
+        except Exception:
+            pass
+    value = row.get("geometry_wkt")
+    if value is None:
+        return False
+    try:
+        if pd is not None and pd.isna(value):
+            return False
+    except Exception:
+        pass
+    text = str(value).strip().lower()
+    return text not in {"", "nan", "none", "null"}
 
 
 def audit_flash_flood_province_day_labels(
@@ -163,6 +192,7 @@ def audit_flash_flood_province_day_labels(
     summary: dict[str, Any] = {
         "rows": int(len(labels)),
         "positive_rows": int(len(positive)),
+        "geometry_backed_positive_rows": int(count_flash_flood_geometry_backed_positive_rows(labels)),
         "uncertain_rows": int((labels["label_status"].astype(str) == "uncertain").sum()),
         "unresolved_rows": int(len(unresolved)),
         "unresolved_fraction": float(len(unresolved) / len(labels)) if len(labels) else None,
@@ -203,6 +233,22 @@ def audit_flash_flood_province_day_labels(
                 lambda row: _event_mapping_mode(row.to_dict(), active_config),
                 axis=1,
             )
+            candidate_events["day_supported_event_count"] = candidate_events.groupby("date")["mapping_mode"].transform(
+                lambda series: int(series.map(_is_supported_mapping_mode).sum())
+            )
+            candidate_events["day_unsupported_event_count"] = candidate_events.groupby("date")["mapping_mode"].transform(
+                lambda series: int((~series.map(_is_supported_mapping_mode)).sum())
+            )
+            candidate_events["day_event_category"] = candidate_events.apply(
+                lambda row: (
+                    "mixed_supported_and_unsupported"
+                    if int(row["day_supported_event_count"]) > 0 and int(row["day_unsupported_event_count"]) > 0
+                    else "supported_only"
+                    if int(row["day_supported_event_count"]) > 0
+                    else "unsupported_only"
+                ),
+                axis=1,
+            )
             candidate_events["resolved_province_names"] = candidate_events.apply(
                 lambda row: _resolved_province_names(row.to_dict(), active_config),
                 axis=1,
@@ -217,6 +263,8 @@ def audit_flash_flood_province_day_labels(
                     mapping_mode=str(row["mapping_mode"]),
                     resolved_province_names=tuple(row["resolved_province_names"]),
                     location_name=row.get("location_name"),
+                    day_supported_event_count=int(row["day_supported_event_count"]),
+                    day_unsupported_event_count=int(row["day_unsupported_event_count"]),
                     config=active_config,
                 ),
                 axis=1,
@@ -224,6 +272,11 @@ def audit_flash_flood_province_day_labels(
             candidate_events["unresolved_bucket"] = candidate_events["unresolved_bucket_payload"].map(lambda payload: payload[0])
             candidate_events["manual_annotation_residual_tokens"] = candidate_events["unresolved_bucket_payload"].map(
                 lambda payload: payload[1]
+            )
+            candidate_events["has_geometry_source"] = candidate_events.apply(_has_geometry_evidence, axis=1)
+            candidate_events["has_point_source"] = candidate_events.apply(
+                lambda row: pd.notna(row.get("latitude")) and pd.notna(row.get("longitude")),
+                axis=1,
             )
             grouped = (
                 candidate_events.groupby(
@@ -242,6 +295,11 @@ def audit_flash_flood_province_day_labels(
                     first_date=("date", "min"),
                     last_date=("date", "max"),
                     manual_annotation_residual_tokens=("manual_annotation_residual_tokens", "first"),
+                    day_geometry_event_count=("has_geometry_source", "sum"),
+                    day_point_event_count=("has_point_source", "sum"),
+                    day_supported_event_count=("day_supported_event_count", "max"),
+                    day_unsupported_event_count=("day_unsupported_event_count", "max"),
+                    day_event_category=("day_event_category", "first"),
                 )
                 .reset_index()
                 .sort_values(["unresolved_rows", "unresolved_date_count", "event_id"], ascending=[False, False, True])
@@ -250,6 +308,9 @@ def audit_flash_flood_province_day_labels(
             summary["top_unresolved_candidate_events"] = grouped.to_dict(orient="records")
             summary["unresolved_candidate_mapping_mode_counts"] = {
                 str(key): int(value) for key, value in candidate_events["mapping_mode"].value_counts(dropna=False).to_dict().items()
+            }
+            summary["unresolved_day_category_counts"] = {
+                str(key): int(value) for key, value in candidate_events["day_event_category"].value_counts(dropna=False).to_dict().items()
             }
             summary["unresolved_candidate_bucket_counts"] = {
                 str(key): int(value)
@@ -274,6 +335,11 @@ def audit_flash_flood_province_day_labels(
                         first_date=("date", "min"),
                         last_date=("date", "max"),
                         manual_annotation_residual_tokens=("manual_annotation_residual_tokens", "first"),
+                        day_geometry_event_count=("has_geometry_source", "sum"),
+                        day_point_event_count=("has_point_source", "sum"),
+                        day_supported_event_count=("day_supported_event_count", "max"),
+                        day_unsupported_event_count=("day_unsupported_event_count", "max"),
+                        day_event_category=("day_event_category", "first"),
                     )
                     .reset_index()
                     .sort_values(["unresolved_rows", "unresolved_date_count", "event_id"], ascending=[False, False, True])
@@ -283,6 +349,7 @@ def audit_flash_flood_province_day_labels(
         else:
             summary["top_unresolved_candidate_events"] = []
             summary["unresolved_candidate_mapping_mode_counts"] = {}
+            summary["unresolved_day_category_counts"] = {}
             summary["unresolved_candidate_bucket_counts"] = {}
             summary["top_unresolved_candidate_events_by_bucket"] = {}
 

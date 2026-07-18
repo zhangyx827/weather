@@ -20,6 +20,7 @@ from mazu_saudi.data import (
     seed_flash_flood_events,
     standardize_flash_flood_event_records,
 )
+from mazu_saudi.config import FlashFloodLabelMappingConfig
 
 
 FORMATS = ("csv", "json", "parquet")
@@ -140,8 +141,22 @@ def _value_counts(table, column: str) -> dict[str, int]:
     }
 
 
+def _point_row_count(table) -> int:
+    if "latitude" not in table.columns or "longitude" not in table.columns:
+        return 0
+    return int((table["latitude"].notna() & table["longitude"].notna()).sum())
+
+
+def _text_only_row_count(table) -> int:
+    if "geometry_source" in table.columns:
+        return int(table["geometry_source"].fillna("").astype(str).str.strip().eq("").sum())
+    point_rows = _point_row_count(table)
+    return int(len(table) - _non_empty_count(table, "geometry_wkt") - point_rows)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    config = FlashFloodLabelMappingConfig.from_env()
     verified_inputs = args.verified_input or _default_verified_inputs()
     if not verified_inputs:
         raise FileNotFoundError(f"No verified event tables were found under: {DEFAULT_VERIFIED_INPUT_DIR}")
@@ -158,8 +173,8 @@ def main(argv: list[str] | None = None) -> int:
         verified_events=verified_events,
     )
 
-    event_table = flash_flood_event_table(events)
-    daily_table = expand_flash_flood_events_to_daily_table(events)
+    event_table = flash_flood_event_table(events, point_buffer_km=config.point_buffer_km)
+    daily_table = expand_flash_flood_events_to_daily_table(events, point_buffer_km=config.point_buffer_km)
     _write_table(event_table, args.output, args.format)
     _write_table(daily_table, args.daily_output, args.daily_format)
 
@@ -181,24 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         "source_name_counts": source_name_counts,
         "spatial_mode_counts": {
             "geometry_wkt_rows": _non_empty_count(event_table, "geometry_wkt"),
-            "point_rows": int(
-                (
-                    event_table.get("latitude").notna() & event_table.get("longitude").notna()
-                    if "latitude" in event_table.columns and "longitude" in event_table.columns
-                    else 0
-                ).sum()
-            ),
-            "text_only_rows": int(
-                len(event_table)
-                - _non_empty_count(event_table, "geometry_wkt")
-                - int(
-                    (
-                        event_table.get("latitude").notna() & event_table.get("longitude").notna()
-                        if "latitude" in event_table.columns and "longitude" in event_table.columns
-                        else 0
-                    ).sum()
-                )
-            ),
+            "point_rows": _point_row_count(event_table),
+            "text_only_rows": _text_only_row_count(event_table),
         },
         "daily_label_source_mode_counts": _value_counts(daily_table, "label_source_mode"),
         "provenance_field_coverage": {
@@ -207,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             "source_record_id_non_empty": _non_empty_count(event_table, "source_record_id"),
             "validation_status_non_empty": _non_empty_count(event_table, "validation_status"),
         },
+        "geometry_provenance_counts": _value_counts(event_table, "geometry_source"),
         "output": str(args.output),
         "daily_output": str(args.daily_output),
     }

@@ -16,7 +16,13 @@ if str(SRC) not in sys.path:
 
 from mazu_saudi.config import FlashFloodLabelMappingConfig
 from mazu_saudi.data import build_flash_flood_supervised_training_dataset
-from mazu_saudi.data.flash_flood_audit import summarize_flash_flood_supervision_quality
+from mazu_saudi.data.flash_flood_audit import (
+    count_flash_flood_boundary_grounded_positive_rows,
+    count_flash_flood_explicit_geometry_positive_rows,
+    count_flash_flood_geometry_backed_positive_rows,
+    summarize_flash_flood_geometry_backed_positive_rows,
+    summarize_flash_flood_supervision_quality,
+)
 
 
 FORMATS = ("csv", "json", "parquet")
@@ -89,13 +95,73 @@ def _empty_summary(output: Path) -> dict[str, object]:
         "positive_rows": 0,
         "negative_rows": 0,
         "uncertain_rows": 0,
+        "event_day_negative_rows": 0,
+        "event_day_unresolved_rows": 0,
         "labeled_rows": 0,
         "rows_with_matched_event_ids": 0,
         "geometry_positive_rows": 0,
+        "boundary_grounded_positive_rows": 0,
+        "explicit_geometry_positive_rows": 0,
+        "geometry_positive_source_counts": {},
         "outside_event_footprint_negative_rows": 0,
         "label_source_mode_counts": {},
+        "label_input_audit": {},
         "output": str(output),
     }
+
+
+def _empty_label_input_audit() -> dict[str, object]:
+    return {
+        "input_rows": 0,
+        "input_rows_with_matched_event_ids": 0,
+        "input_label_status_counts": {},
+        "input_label_source_mode_counts": {},
+        "input_uncertain_rows": 0,
+        "input_event_day_unresolved_rows": 0,
+    }
+
+
+def _summarize_label_input_table(label_table) -> dict[str, object]:
+    summary = _empty_label_input_audit()
+    if "label_status" in label_table.columns:
+        status_counts = label_table["label_status"].astype(str).value_counts(dropna=False).to_dict()
+        summary["input_label_status_counts"] = {str(key): int(value) for key, value in status_counts.items()}
+        summary["input_uncertain_rows"] = int(status_counts.get("uncertain", 0))
+    if "label_source_mode" in label_table.columns:
+        source_counts = label_table["label_source_mode"].astype(str).value_counts(dropna=False).to_dict()
+        summary["input_label_source_mode_counts"] = {str(key): int(value) for key, value in source_counts.items()}
+        summary["input_event_day_unresolved_rows"] = int(source_counts.get("event_day_unresolved", 0))
+    if "matched_event_ids" in label_table.columns:
+        summary["input_rows_with_matched_event_ids"] = int(
+            label_table["matched_event_ids"].fillna("").astype(str).str.strip().ne("").sum()
+        )
+    summary["input_rows"] = int(len(label_table))
+    return summary
+
+
+def _merge_label_input_audit(summary: dict[str, object], batch_audit: dict[str, object]) -> None:
+    summary["input_rows"] = int(summary.get("input_rows", 0)) + int(batch_audit.get("input_rows", 0))
+    summary["input_rows_with_matched_event_ids"] = int(summary.get("input_rows_with_matched_event_ids", 0)) + int(
+        batch_audit.get("input_rows_with_matched_event_ids", 0)
+    )
+    summary["input_uncertain_rows"] = int(summary.get("input_uncertain_rows", 0)) + int(batch_audit.get("input_uncertain_rows", 0))
+    summary["input_event_day_unresolved_rows"] = int(summary.get("input_event_day_unresolved_rows", 0)) + int(
+        batch_audit.get("input_event_day_unresolved_rows", 0)
+    )
+    for key, value in batch_audit.get("input_label_status_counts", {}).items():
+        current = summary["input_label_status_counts"].get(str(key), 0)
+        summary["input_label_status_counts"][str(key)] = int(current) + int(value)
+    for key, value in batch_audit.get("input_label_source_mode_counts", {}).items():
+        current = summary["input_label_source_mode_counts"].get(str(key), 0)
+        summary["input_label_source_mode_counts"][str(key)] = int(current) + int(value)
+
+
+def _summary_path(output: Path) -> Path:
+    return output.with_suffix(".summary.json")
+
+
+def _write_summary(summary: dict[str, object], output: Path) -> None:
+    _summary_path(output).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _summarize_merged_table(merged, output: Path) -> dict[str, object]:
@@ -107,17 +173,30 @@ def _summarize_merged_table(merged, output: Path) -> dict[str, object]:
         }
 
     summary = _empty_summary(output)
+    geometry_positive_rows = count_flash_flood_geometry_backed_positive_rows(merged)
+    boundary_grounded_positive_rows = count_flash_flood_boundary_grounded_positive_rows(merged)
+    explicit_geometry_positive_rows = count_flash_flood_explicit_geometry_positive_rows(merged)
+    geometry_positive_source_counts = summarize_flash_flood_geometry_backed_positive_rows(merged)
     summary.update(
         {
             "rows": int(len(merged)),
             "positive_rows": int((merged["label_status"] == "positive").sum()) if "label_status" in merged.columns else 0,
             "negative_rows": int((merged["label_status"] == "negative").sum()) if "label_status" in merged.columns else 0,
             "uncertain_rows": int((merged["label_status"] == "uncertain").sum()) if "label_status" in merged.columns else 0,
+            "event_day_negative_rows": int((merged["label_source_mode"] == "outside_event_footprint").sum())
+            if "label_source_mode" in merged.columns
+            else 0,
+            "event_day_unresolved_rows": int((merged["label_source_mode"] == "event_day_unresolved").sum())
+            if "label_source_mode" in merged.columns
+            else 0,
             "labeled_rows": int(merged["is_labeled"].sum()) if "is_labeled" in merged.columns else 0,
             "rows_with_matched_event_ids": int(merged["matched_event_ids"].fillna("").astype(str).str.strip().ne("").sum())
             if "matched_event_ids" in merged.columns
             else 0,
-            "geometry_positive_rows": int((merged["label_source_mode"] == "geometry_wkt").sum()) if "label_source_mode" in merged.columns else 0,
+            "geometry_positive_rows": int(geometry_positive_rows),
+            "boundary_grounded_positive_rows": int(boundary_grounded_positive_rows),
+            "explicit_geometry_positive_rows": int(explicit_geometry_positive_rows),
+            "geometry_positive_source_counts": geometry_positive_source_counts,
             "outside_event_footprint_negative_rows": int((merged["label_source_mode"] == "outside_event_footprint").sum())
             if "label_source_mode" in merged.columns
             else 0,
@@ -135,7 +214,12 @@ def _finalize_summary(summary: dict[str, object]) -> dict[str, object]:
         uncertain_rows=int(summary["uncertain_rows"]),
         rows_with_matched_event_ids=int(summary["rows_with_matched_event_ids"]),
         geometry_positive_rows=int(summary["geometry_positive_rows"]),
+        geometry_positive_source_counts=dict(summary["geometry_positive_source_counts"]),
+        boundary_grounded_positive_rows=int(summary["boundary_grounded_positive_rows"]),
+        explicit_geometry_positive_rows=int(summary["explicit_geometry_positive_rows"]),
         outside_event_footprint_negative_rows=int(summary["outside_event_footprint_negative_rows"]),
+        event_day_negative_rows=int(summary["event_day_negative_rows"]),
+        event_day_unresolved_rows=int(summary["event_day_unresolved_rows"]),
     )
     return summary
 
@@ -216,12 +300,16 @@ def _build_passthrough_supervised_table(label_path: Path, output: Path, *, drop_
     temp_output = output.with_name(f"{output.name}.tmp")
     writer = None
     summary = _empty_summary(output)
+    label_input_audit = _empty_label_input_audit()
     label_source_mode_counts: Counter[str] = Counter()
+    geometry_positive_source_counts: Counter[str] = Counter()
 
     try:
         for record_batch in label_file.iter_batches(batch_size=batch_rows):
+            batch_table = record_batch.to_pandas()
+            _merge_label_input_audit(label_input_audit, _summarize_label_input_table(batch_table))
             merged = _prepare_passthrough_batch(
-                record_batch.to_pandas(),
+                batch_table,
                 drop_uncertain=drop_uncertain,
                 coordinate_precision=coordinate_precision,
             )
@@ -240,15 +328,30 @@ def _build_passthrough_supervised_table(label_path: Path, output: Path, *, drop_
             summary["positive_rows"] = int(summary["positive_rows"]) + int(batch_summary["positive_rows"])
             summary["negative_rows"] = int(summary["negative_rows"]) + int(batch_summary["negative_rows"])
             summary["uncertain_rows"] = int(summary["uncertain_rows"]) + int(batch_summary["uncertain_rows"])
+            summary["event_day_negative_rows"] = int(summary["event_day_negative_rows"]) + int(
+                batch_summary["event_day_negative_rows"]
+            )
+            summary["event_day_unresolved_rows"] = int(summary["event_day_unresolved_rows"]) + int(
+                batch_summary["event_day_unresolved_rows"]
+            )
             summary["labeled_rows"] = int(summary["labeled_rows"]) + int(batch_summary["labeled_rows"])
             summary["rows_with_matched_event_ids"] = int(summary["rows_with_matched_event_ids"]) + int(
                 batch_summary["rows_with_matched_event_ids"]
             )
             summary["geometry_positive_rows"] = int(summary["geometry_positive_rows"]) + int(batch_summary["geometry_positive_rows"])
+            summary["boundary_grounded_positive_rows"] = int(summary["boundary_grounded_positive_rows"]) + int(
+                batch_summary["boundary_grounded_positive_rows"]
+            )
+            summary["explicit_geometry_positive_rows"] = int(summary["explicit_geometry_positive_rows"]) + int(
+                batch_summary["explicit_geometry_positive_rows"]
+            )
             summary["outside_event_footprint_negative_rows"] = int(summary["outside_event_footprint_negative_rows"]) + int(
                 batch_summary["outside_event_footprint_negative_rows"]
             )
             label_source_mode_counts.update({str(key): int(value) for key, value in batch_summary["label_source_mode_counts"].items()})
+            geometry_positive_source_counts.update(
+                {str(key): int(value) for key, value in batch_summary["geometry_positive_source_counts"].items()}
+            )
 
         if writer is None:
             raise ValueError(f"No flash_flood rows were written from label parquet: {label_path}")
@@ -264,6 +367,15 @@ def _build_passthrough_supervised_table(label_path: Path, output: Path, *, drop_
         raise
 
     summary["label_source_mode_counts"] = dict(sorted(label_source_mode_counts.items()))
+    summary["geometry_positive_source_counts"] = dict(sorted(geometry_positive_source_counts.items()))
+    summary["label_input_audit"] = {
+        "input_rows": int(label_input_audit["input_rows"]),
+        "input_rows_with_matched_event_ids": int(label_input_audit["input_rows_with_matched_event_ids"]),
+        "input_label_status_counts": dict(sorted(label_input_audit["input_label_status_counts"].items())),
+        "input_label_source_mode_counts": dict(sorted(label_input_audit["input_label_source_mode_counts"].items())),
+        "input_uncertain_rows": int(label_input_audit["input_uncertain_rows"]),
+        "input_event_day_unresolved_rows": int(label_input_audit["input_event_day_unresolved_rows"]),
+    }
     return _finalize_summary(summary)
 
 
@@ -286,10 +398,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         features = _read_table(args.features)
         labels = _read_table(args.labels)
+        label_input_audit = _summarize_label_input_table(labels)
         merged = build_flash_flood_supervised_training_dataset(
             features,
             labels,
-            config=FlashFloodLabelMappingConfig(),
+            config=FlashFloodLabelMappingConfig.from_env(),
             drop_uncertain=not args.keep_uncertain,
             coordinate_precision=args.coordinate_precision,
         )
@@ -298,6 +411,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _write_table(merged, args.output, output_format)
         summary = _finalize_summary(_summarize_merged_table(merged, args.output))
+        summary["label_input_audit"] = label_input_audit
+    _write_summary(summary, args.output)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

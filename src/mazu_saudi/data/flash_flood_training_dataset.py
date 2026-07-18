@@ -23,6 +23,8 @@ def _normalize_date(series: Any):
 def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
+    if isinstance(value, float) and value != value:
+        return ""
     return str(value).strip().lower()
 
 

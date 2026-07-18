@@ -79,6 +79,14 @@ def _canonical_event_key(event: FlashFloodEvent) -> tuple[Any, ...]:
     )
 
 
+def _spatial_specificity_score(event: FlashFloodEvent) -> int:
+    if _normalize_text(event.geometry_wkt):
+        return 2
+    if event.latitude is not None and event.longitude is not None:
+        return 1
+    return 0
+
+
 def standardize_flash_flood_event_records(
     records: Any,
     *,
@@ -148,6 +156,11 @@ def merge_flash_flood_event_sources(
         current_status = _normalize_text(current.validation_status).lower()
         incoming_status = _normalize_text(event.validation_status).lower()
         if current_status != "verified" and incoming_status == "verified":
+            merged[key] = event
+            continue
+        current_spatial_specificity = _spatial_specificity_score(current)
+        incoming_spatial_specificity = _spatial_specificity_score(event)
+        if incoming_spatial_specificity > current_spatial_specificity:
             merged[key] = event
             continue
         if event.source_record_id and not current.source_record_id:

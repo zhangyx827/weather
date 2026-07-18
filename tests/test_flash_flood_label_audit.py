@@ -229,3 +229,130 @@ def test_audit_flash_flood_province_day_labels_classifies_locality_tail_as_manua
     assert summary["top_unresolved_candidate_events_by_bucket"]["manual_annotation_candidate"][0]["event_id"] == (
         "extreme_weather_flash_flood_tabuk_20211120"
     )
+
+
+def test_audit_flash_flood_province_day_labels_ignores_nan_geometry_sources():
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-12-23",
+                "province_name": "riyadh",
+                "label_status": "uncertain",
+                "label_source_mode": "event_day_unresolved",
+                "matched_event_ids": "",
+                "label_provenance": json.dumps({"date": "2022-12-23", "event_count_for_day": 1, "day_event_mapping_modes": ["uncertain"]}),
+            }
+        ]
+    )
+    events = pd.DataFrame(
+        [
+            {
+                "event_id": "ff_nan_geometry",
+                "hazard_type": "flash_flood",
+                "date": "2022-12-23",
+                "location_name": "Unknown",
+                "latitude": None,
+                "longitude": None,
+                "geometry_wkt": float("nan"),
+                "spatial_confidence": "medium",
+                "validation_status": "verified",
+            }
+        ]
+    )
+
+    summary = audit_flash_flood_province_day_labels(labels, event_daily_table=events, top_n=5)
+
+    assert summary["top_unresolved_candidate_events"][0]["day_geometry_event_count"] == 0
+
+
+def test_audit_flash_flood_province_day_labels_counts_derived_point_buffer_geometry_evidence():
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-11-24",
+                "province_name": "makkah",
+                "label_status": "uncertain",
+                "label_source_mode": "event_day_unresolved",
+                "matched_event_ids": "",
+                "label_provenance": json.dumps({"date": "2022-11-24", "event_count_for_day": 1, "day_event_mapping_modes": ["point_buffer"]}),
+            }
+        ]
+    )
+    events = pd.DataFrame(
+        [
+            {
+                "event_id": "ff_jeddah_20221124",
+                "hazard_type": "flash_flood",
+                "date": "2022-11-24",
+                "location_name": "Jeddah",
+                "latitude": 21.4858,
+                "longitude": 39.1925,
+                "geometry_wkt": None,
+                "geometry_source": "derived_point_buffer",
+                "spatial_confidence": "high",
+                "validation_status": "verified",
+            }
+        ]
+    )
+
+    summary = audit_flash_flood_province_day_labels(labels, event_daily_table=events, top_n=5)
+
+    assert summary["top_unresolved_candidate_events"][0]["day_geometry_event_count"] == 1
+
+
+def test_audit_flash_flood_province_day_labels_separates_mixed_supported_and_unsupported_days():
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-11-24",
+                "province_name": "makkah",
+                "label_status": "uncertain",
+                "label_source_mode": "event_day_unresolved",
+                "matched_event_ids": "",
+                "label_provenance": json.dumps(
+                    {
+                        "date": "2022-11-24",
+                        "event_count_for_day": 2,
+                        "day_event_mapping_modes": ["point_buffer", "uncertain"],
+                        "day_supported_event_count": 1,
+                        "day_unsupported_event_count": 1,
+                        "day_has_supported_event": True,
+                    }
+                ),
+            }
+        ]
+    )
+    events = pd.DataFrame(
+        [
+            {
+                "event_id": "ff_jeddah_20221124",
+                "hazard_type": "flash_flood",
+                "date": "2022-11-24",
+                "location_name": "Jeddah",
+                "latitude": 21.4858,
+                "longitude": 39.1925,
+                "geometry_wkt": None,
+                "geometry_source": "derived_point_buffer",
+                "spatial_confidence": "high",
+                "validation_status": "verified",
+            },
+            {
+                "event_id": "ff_mixed_unsupported_20221124",
+                "hazard_type": "flash_flood",
+                "date": "2022-11-24",
+                "location_name": "Saudi Arabia (multiple provinces)",
+                "latitude": None,
+                "longitude": None,
+                "geometry_wkt": None,
+                "geometry_source": "",
+                "spatial_confidence": "medium",
+                "validation_status": "verified",
+            },
+        ]
+    )
+
+    summary = audit_flash_flood_province_day_labels(labels, event_daily_table=events, top_n=5)
+
+    assert summary["unresolved_candidate_bucket_counts"]["mixed_supported_and_unsupported"] == 2
+    assert summary["unresolved_day_category_counts"]["mixed_supported_and_unsupported"] == 2
+    assert summary["top_unresolved_candidate_events"][0]["day_event_category"] == "mixed_supported_and_unsupported"

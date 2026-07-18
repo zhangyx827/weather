@@ -16,7 +16,13 @@ if str(SRC) not in sys.path:
 
 from mazu_saudi.config import FlashFloodLabelMappingConfig
 from mazu_saudi.data import build_flash_flood_training_labels, expand_flash_flood_events_to_daily_table
-from mazu_saudi.data.flash_flood_audit import summarize_flash_flood_supervision_quality
+from mazu_saudi.data.flash_flood_audit import (
+    count_flash_flood_boundary_grounded_positive_rows,
+    count_flash_flood_explicit_geometry_positive_rows,
+    count_flash_flood_geometry_backed_positive_rows,
+    summarize_flash_flood_geometry_backed_positive_rows,
+    summarize_flash_flood_supervision_quality,
+)
 
 
 FORMATS = ("csv", "json", "parquet")
@@ -93,8 +99,13 @@ def _empty_summary(output: Path) -> dict[str, object]:
         "positive_rows": 0,
         "negative_rows": 0,
         "uncertain_rows": 0,
+        "event_day_negative_rows": 0,
+        "event_day_unresolved_rows": 0,
         "rows_with_matched_event_ids": 0,
         "geometry_positive_rows": 0,
+        "boundary_grounded_positive_rows": 0,
+        "explicit_geometry_positive_rows": 0,
+        "geometry_positive_source_counts": {},
         "outside_event_footprint_negative_rows": 0,
         "label_source_mode_counts": {},
         "output": str(output),
@@ -106,6 +117,10 @@ def _summarize_labeled_table(labeled, output: Path) -> dict[str, object]:
         str(key): int(value)
         for key, value in labeled["label_source_mode"].astype(str).value_counts(dropna=False).to_dict().items()
     }
+    geometry_positive_rows = count_flash_flood_geometry_backed_positive_rows(labeled)
+    boundary_grounded_positive_rows = count_flash_flood_boundary_grounded_positive_rows(labeled)
+    explicit_geometry_positive_rows = count_flash_flood_explicit_geometry_positive_rows(labeled)
+    geometry_positive_source_counts = summarize_flash_flood_geometry_backed_positive_rows(labeled)
     summary = _empty_summary(output)
     summary.update(
         {
@@ -113,8 +128,13 @@ def _summarize_labeled_table(labeled, output: Path) -> dict[str, object]:
             "positive_rows": int((labeled["label_status"] == "positive").sum()),
             "negative_rows": int((labeled["label_status"] == "negative").sum()),
             "uncertain_rows": int((labeled["label_status"] == "uncertain").sum()),
+            "event_day_negative_rows": int((labeled["label_source_mode"] == "outside_event_footprint").sum()),
+            "event_day_unresolved_rows": int((labeled["label_source_mode"] == "event_day_unresolved").sum()),
             "rows_with_matched_event_ids": int(labeled["matched_event_ids"].fillna("").astype(str).str.strip().ne("").sum()),
-            "geometry_positive_rows": int((labeled["label_source_mode"] == "geometry_wkt").sum()),
+            "geometry_positive_rows": int(geometry_positive_rows),
+            "boundary_grounded_positive_rows": int(boundary_grounded_positive_rows),
+            "explicit_geometry_positive_rows": int(explicit_geometry_positive_rows),
+            "geometry_positive_source_counts": geometry_positive_source_counts,
             "outside_event_footprint_negative_rows": int((labeled["label_source_mode"] == "outside_event_footprint").sum()),
             "label_source_mode_counts": label_source_mode_counts,
         }
@@ -130,7 +150,12 @@ def _finalize_summary(summary: dict[str, object]) -> dict[str, object]:
         uncertain_rows=int(summary["uncertain_rows"]),
         rows_with_matched_event_ids=int(summary["rows_with_matched_event_ids"]),
         geometry_positive_rows=int(summary["geometry_positive_rows"]),
+        geometry_positive_source_counts=dict(summary["geometry_positive_source_counts"]),
+        boundary_grounded_positive_rows=int(summary["boundary_grounded_positive_rows"]),
+        explicit_geometry_positive_rows=int(summary["explicit_geometry_positive_rows"]),
         outside_event_footprint_negative_rows=int(summary["outside_event_footprint_negative_rows"]),
+        event_day_negative_rows=int(summary["event_day_negative_rows"]),
+        event_day_unresolved_rows=int(summary["event_day_unresolved_rows"]),
     )
     return summary
 
@@ -174,6 +199,7 @@ def _build_labels_streaming(samples_path: Path, events_daily, output: Path, *, b
     writer = None
     summary = _empty_summary(output)
     label_source_mode_counts: Counter[str] = Counter()
+    geometry_positive_source_counts: Counter[str] = Counter()
 
     try:
         for batch in parquet_file.iter_batches(batch_size=batch_rows):
@@ -181,7 +207,7 @@ def _build_labels_streaming(samples_path: Path, events_daily, output: Path, *, b
             labeled = build_flash_flood_training_labels(
                 samples,
                 event_daily_table=events_daily,
-                config=FlashFloodLabelMappingConfig(),
+                config=FlashFloodLabelMappingConfig.from_env(),
             )
             arrow_table = pa.Table.from_pandas(labeled, preserve_index=False)
             if writer is None:
@@ -196,14 +222,29 @@ def _build_labels_streaming(samples_path: Path, events_daily, output: Path, *, b
             summary["positive_rows"] = int(summary["positive_rows"]) + int(batch_summary["positive_rows"])
             summary["negative_rows"] = int(summary["negative_rows"]) + int(batch_summary["negative_rows"])
             summary["uncertain_rows"] = int(summary["uncertain_rows"]) + int(batch_summary["uncertain_rows"])
+            summary["event_day_negative_rows"] = int(summary["event_day_negative_rows"]) + int(
+                batch_summary["event_day_negative_rows"]
+            )
+            summary["event_day_unresolved_rows"] = int(summary["event_day_unresolved_rows"]) + int(
+                batch_summary["event_day_unresolved_rows"]
+            )
             summary["rows_with_matched_event_ids"] = int(summary["rows_with_matched_event_ids"]) + int(
                 batch_summary["rows_with_matched_event_ids"]
             )
             summary["geometry_positive_rows"] = int(summary["geometry_positive_rows"]) + int(batch_summary["geometry_positive_rows"])
+            summary["boundary_grounded_positive_rows"] = int(summary["boundary_grounded_positive_rows"]) + int(
+                batch_summary["boundary_grounded_positive_rows"]
+            )
+            summary["explicit_geometry_positive_rows"] = int(summary["explicit_geometry_positive_rows"]) + int(
+                batch_summary["explicit_geometry_positive_rows"]
+            )
             summary["outside_event_footprint_negative_rows"] = int(summary["outside_event_footprint_negative_rows"]) + int(
                 batch_summary["outside_event_footprint_negative_rows"]
             )
             label_source_mode_counts.update({str(key): int(value) for key, value in batch_summary["label_source_mode_counts"].items()})
+            geometry_positive_source_counts.update(
+                {str(key): int(value) for key, value in batch_summary["geometry_positive_source_counts"].items()}
+            )
 
         if writer is None:
             raise ValueError(f"No rows were read from parquet input: {samples_path}")
@@ -219,6 +260,7 @@ def _build_labels_streaming(samples_path: Path, events_daily, output: Path, *, b
         raise
 
     summary["label_source_mode_counts"] = dict(sorted(label_source_mode_counts.items()))
+    summary["geometry_positive_source_counts"] = dict(sorted(geometry_positive_source_counts.items()))
     return _finalize_summary(summary)
 
 
@@ -230,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = _build_labels_streaming(args.samples, events_daily, args.output, batch_rows=args.batch_rows)
     else:
         samples = _read_table(args.samples)
-        labeled = build_flash_flood_training_labels(samples, event_daily_table=events_daily, config=FlashFloodLabelMappingConfig())
+        labeled = build_flash_flood_training_labels(samples, event_daily_table=events_daily, config=FlashFloodLabelMappingConfig.from_env())
         if output_format == "parquet":
             _write_verified_parquet(labeled, args.output)
         else:

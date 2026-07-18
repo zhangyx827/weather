@@ -6,14 +6,22 @@ from pathlib import Path
 
 import pandas as pd
 
+from mazu_saudi.config import FlashFloodLabelMappingConfig
 from mazu_saudi.data import (
     FlashFloodEvent,
+    build_flash_flood_training_labels,
     expand_flash_flood_events_to_daily_records,
     flash_flood_event_table_from_sources,
     flash_flood_event_records,
     merge_flash_flood_event_sources,
     seed_flash_flood_events,
     standardize_flash_flood_event_records,
+)
+from mazu_saudi.data.flash_flood_audit import (
+    count_flash_flood_boundary_grounded_positive_rows,
+    count_flash_flood_explicit_geometry_positive_rows,
+    count_flash_flood_geometry_backed_positive_rows,
+    summarize_flash_flood_geometry_backed_positive_rows,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +78,110 @@ def test_flash_flood_daily_expansion_is_inclusive():
     assert rows[-1]["date"] == "2022-12-23"
 
 
+def test_build_flash_flood_training_labels_summarizes_geometry_sources_by_type():
+    samples = pd.DataFrame(
+        [
+            {"date": "2022-11-24", "latitude": 21.49, "longitude": 39.20},
+            {"date": "2022-11-25", "latitude": 21.49, "longitude": 39.20},
+        ]
+    )
+    events = pd.DataFrame(
+        [
+            {
+                "event_id": "ff_jeddah_20221124",
+                "hazard_type": "flash_flood",
+                "date": "2022-11-24",
+                "location_name": "Jeddah",
+                "country_code": "SAU",
+                "latitude": 21.4858,
+                "longitude": 39.1925,
+                "geometry_wkt": None,
+                "spatial_confidence": "high",
+                "temporal_confidence": "high",
+                "source_name": "test",
+                "source_url": "",
+                "source_record_id": "seed",
+                "validation_status": "verified",
+                "label_status": "positive",
+                "notes": "",
+            },
+            {
+                "event_id": "ff_jeddah_poly_20221125",
+                "hazard_type": "flash_flood",
+                "date": "2022-11-25",
+                "location_name": "Jeddah",
+                "country_code": "SAU",
+                "latitude": None,
+                "longitude": None,
+                "geometry_wkt": "POLYGON((39.10 21.40, 39.30 21.40, 39.30 21.60, 39.10 21.60, 39.10 21.40))",
+                "spatial_confidence": "high",
+                "temporal_confidence": "high",
+                "source_name": "test",
+                "source_url": "",
+                "source_record_id": "seed",
+                "validation_status": "verified",
+                "label_status": "positive",
+                "notes": "",
+            },
+        ]
+    )
+
+    labeled = build_flash_flood_training_labels(
+        samples,
+        event_daily_table=events,
+        config=FlashFloodLabelMappingConfig(emit_event_day_negatives=False),
+    )
+
+    assert count_flash_flood_geometry_backed_positive_rows(labeled) == 2
+    assert summarize_flash_flood_geometry_backed_positive_rows(labeled) == {
+        "derived_point_buffer": 1,
+        "source_geometry": 1,
+    }
+
+
+def test_boundary_grounded_positive_rows_are_tracked_separately_from_explicit_geometry():
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-11-24",
+                "label_status": "positive",
+                "label_source_mode": "province_day",
+                "matched_event_ids": "ff_boundary",
+                "label_provenance": json.dumps(
+                    {
+                        "date": "2022-11-24",
+                        "matched_event_ids": ["ff_boundary"],
+                        "matched_geometry_sources": ["province_boundary"],
+                        "matched_geometry_wkts": [],
+                    }
+                ),
+            },
+            {
+                "date": "2022-11-24",
+                "label_status": "positive",
+                "label_source_mode": "point_buffer",
+                "matched_event_ids": "ff_point",
+                "label_provenance": json.dumps(
+                    {
+                        "date": "2022-11-24",
+                        "matched_event_ids": ["ff_point"],
+                        "matched_geometry_sources": ["derived_point_buffer"],
+                        "matched_geometry_wkts": [],
+                    }
+                ),
+            },
+        ]
+    )
+
+    assert count_flash_flood_geometry_backed_positive_rows(labels) == 2
+    assert count_flash_flood_boundary_grounded_positive_rows(labels) == 1
+    assert count_flash_flood_explicit_geometry_positive_rows(labels) == 1
+    assert summarize_flash_flood_geometry_backed_positive_rows(labels) == {
+        "derived_point_buffer": 1,
+        "province_boundary": 1,
+    }
+
+
 def test_build_flash_flood_event_table_script_exports_csv(tmp_path: Path):
     module = _load_script_module()
     output = tmp_path / "flash_flood_events.csv"
@@ -94,6 +206,7 @@ def test_standardize_flash_flood_event_records_preserves_verified_provenance():
                 "location": "Jeddah",
                 "lat": 21.49,
                 "lon": 39.19,
+                "geometry_wkt": "POLYGON((39.10 21.40, 39.30 21.40, 39.30 21.60, 39.10 21.60, 39.10 21.40))",
                 "source_url": "https://example.test/event/1",
                 "notes": "verified case study",
             }
@@ -106,6 +219,28 @@ def test_standardize_flash_flood_event_records_preserves_verified_provenance():
     assert events[0].source_record_id == "emdat-001"
     assert events[0].validation_status == "verified"
     assert events[0].location_name == "Jeddah"
+    assert events[0].geometry_wkt.startswith("POLYGON((")
+
+
+def test_standardize_flash_flood_event_records_treats_nan_geometry_as_missing():
+    events = standardize_flash_flood_event_records(
+        [
+            {
+                "record_id": "emdat-002",
+                "date": "2022-11-24",
+                "location": "Jeddah",
+                "lat": 21.49,
+                "lon": 39.19,
+                "geometry_wkt": float("nan"),
+                "source_url": "https://example.test/event/2",
+                "notes": "verified case study",
+            }
+        ],
+        source_name="emdat",
+    )
+
+    assert len(events) == 1
+    assert events[0].geometry_wkt is None
 
 
 def test_standardize_flash_flood_event_records_skips_non_flash_flood_rows():
@@ -156,6 +291,37 @@ def test_merge_flash_flood_event_sources_prefers_verified_duplicate():
     assert len(matching) == 1
     assert matching[0].validation_status == "verified"
     assert matching[0].source_name == "emdat"
+
+
+def test_merge_flash_flood_event_sources_prefers_more_specific_verified_spatial_data():
+    seed_event = FlashFloodEvent(
+        event_id="seed_text_only",
+        hazard_type="flash_flood",
+        start_date=pd.Timestamp("2022-11-24").date(),
+        end_date=pd.Timestamp("2022-11-24").date(),
+        location_name="Jeddah",
+        validation_status="seed",
+    )
+    verified_event = FlashFloodEvent(
+        event_id="verified_point",
+        hazard_type="flash_flood",
+        start_date=pd.Timestamp("2022-11-24").date(),
+        end_date=pd.Timestamp("2022-11-24").date(),
+        location_name="Jeddah",
+        latitude=21.4858,
+        longitude=39.1925,
+        source_name="emdat",
+        source_record_id="verified-point-001",
+        validation_status="verified",
+    )
+
+    merged = merge_flash_flood_event_sources(seed_events=[seed_event], verified_events=[verified_event])
+
+    assert len(merged) == 1
+    assert merged[0].event_id == "verified_point"
+    assert merged[0].latitude == 21.4858
+    assert merged[0].longitude == 39.1925
+    assert merged[0].source_name == "emdat"
 
 
 def test_merge_flash_flood_event_sources_ignores_coordinate_drift_for_same_location_duplicate():
@@ -297,10 +463,12 @@ def test_build_verified_flash_flood_event_table_script_merges_seed_and_verified(
     assert summary["validation_status_counts"] == {"seed": 5, "verified": 2}
     assert summary["source_name_counts"]["emdat"] == 2
     assert summary["spatial_mode_counts"] == {
-        "geometry_wkt_rows": 0,
+        "geometry_wkt_rows": 7,
         "point_rows": 7,
         "text_only_rows": 0,
     }
+    assert summary["geometry_provenance_counts"] == {"derived_point_buffer": 7}
+    assert daily["geometry_source"].fillna("").astype(str).value_counts().to_dict() == {"derived_point_buffer": 7}
     assert summary["daily_label_source_mode_counts"] == {}
     assert summary["provenance_field_coverage"]["source_name_non_empty"] == 7
     assert summary["provenance_field_coverage"]["source_url_non_empty"] == 2
@@ -447,4 +615,5 @@ def test_build_verified_flash_flood_event_table_script_reports_geometry_rows(tmp
         "point_rows": 0,
         "text_only_rows": 0,
     }
+    assert summary["geometry_provenance_counts"] == {"source_geometry": 1}
     assert summary["summary_output"] == str(summary_output)

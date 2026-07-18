@@ -20,6 +20,8 @@ def _require_pandas() -> None:
 def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
+    if isinstance(value, float) and value != value:
+        return ""
     return str(value).strip().lower()
 
 

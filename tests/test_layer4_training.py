@@ -693,6 +693,48 @@ def test_summarize_frame_training_targets_reports_explicit_label_usage():
     assert summary["rows_with_multi_event_groups"] == 0
 
 
+def test_summarize_frame_training_targets_reports_boundary_grounding_dominance():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=4)
+    frame["date"] = ["2025-01-01", "2025-01-01", "2025-01-02", "2025-01-02"]
+    frame["label"] = np.array([1.0, 1.0, 0.0, np.nan], dtype=np.float32)
+    frame["label_status"] = ["positive", "positive", "negative", "uncertain"]
+    frame["label_source_mode"] = [
+        "province_day",
+        "province_day",
+        "no_event_day",
+        "event_day_unresolved",
+    ]
+    frame["matched_event_ids"] = ["ff_a", "ff_b", "", ""]
+    frame["label_provenance"] = [
+        json.dumps(
+            {
+                "date": "2025-01-01",
+                "matched_event_ids": ["ff_a"],
+                "matched_geometry_sources": ["province_boundary"],
+                "matched_geometry_wkts": [],
+            }
+        ),
+        json.dumps(
+            {
+                "date": "2025-01-01",
+                "matched_event_ids": ["ff_b"],
+                "matched_geometry_sources": ["province_boundary"],
+                "matched_geometry_wkts": [],
+            }
+        ),
+        "{}",
+        "{}",
+    ]
+
+    summary = module.summarize_frame_training_targets(frame, "flash_flood")
+
+    quality = summary["supervision_quality"]
+    assert quality["boundary_grounded_positive_rows"] == 2
+    assert quality["explicit_geometry_positive_rows"] == 0
+    assert "boundary_grounding_dominates" in quality["warnings"]
+
+
 def test_summarize_frame_training_targets_reports_dry_heat_explicit_outcomes():
     module = _load_training_module()
     frame = _indicator_frame(rows=5).drop(columns=["date", "latitude", "longitude"])
@@ -868,9 +910,13 @@ def test_build_flash_flood_supervised_training_table_script_exports_csv(tmp_path
     assert module.main(["--features", str(feature_path), "--labels", str(label_path), "--output", str(output_path)]) == 0
 
     merged = pd.read_csv(output_path)
+    summary = json.loads(output_path.with_suffix(".summary.json").read_text(encoding="utf-8"))
     assert merged["label_status"].tolist() == ["positive", "negative"]
     assert merged["training_join_mode"].nunique() == 1
     assert merged["training_join_mode"].iloc[0] == "grid_day"
+    assert summary["label_input_audit"]["input_rows"] == 3
+    assert summary["label_input_audit"]["input_label_status_counts"] == {"positive": 1, "uncertain": 1, "negative": 1}
+    assert summary["label_input_audit"]["input_event_day_unresolved_rows"] == 1
 
 
 def test_build_flash_flood_supervised_training_table_script_reports_supervision_quality(tmp_path: Path):
@@ -922,6 +968,176 @@ def test_build_flash_flood_supervised_training_table_script_reports_supervision_
     assert summary["supervision_quality"]["status"] == "warning"
     assert "no_geometry_backed_positives" in summary["supervision_quality"]["warnings"]
     assert summary["supervision_quality"]["matched_event_fraction"] == 0.5
+    assert summary["geometry_positive_source_counts"] == {}
+
+
+def test_indicator_csv_training_summary_loads_source_label_audit_from_sidecar():
+    module = _load_training_module()
+    build_module = _load_build_supervised_table_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        features = _indicator_frame(rows=32)
+        labels = pd.DataFrame(
+            [
+                {
+                    "date": features.loc[0, "date"],
+                    "hazard_type": "flash_flood",
+                    "latitude": features.loc[0, "latitude"],
+                    "longitude": features.loc[0, "longitude"],
+                    "label": 1.0,
+                    "label_status": "positive",
+                    "label_source_mode": "point_buffer",
+                    "matched_event_ids": "ff_event_a",
+                    "label_provenance": "{}",
+                },
+                {
+                    "date": features.loc[1, "date"],
+                    "hazard_type": "flash_flood",
+                    "latitude": features.loc[1, "latitude"],
+                    "longitude": features.loc[1, "longitude"],
+                    "label": np.nan,
+                    "label_status": "uncertain",
+                    "label_source_mode": "event_day_unresolved",
+                    "matched_event_ids": "",
+                    "label_provenance": "{}",
+                },
+                {
+                    "date": features.loc[2, "date"],
+                    "hazard_type": "flash_flood",
+                    "latitude": features.loc[2, "latitude"],
+                    "longitude": features.loc[2, "longitude"],
+                    "label": 0.0,
+                    "label_status": "negative",
+                    "label_source_mode": "no_event_day",
+                    "matched_event_ids": "",
+                    "label_provenance": "{}",
+                },
+            ]
+        )
+
+        labels = pd.concat(
+            [
+                labels,
+                pd.DataFrame(
+                    [
+                        {
+                            "date": features.loc[index, "date"],
+                            "hazard_type": "flash_flood",
+                            "latitude": features.loc[index, "latitude"],
+                            "longitude": features.loc[index, "longitude"],
+                            "label": 1.0 if index % 2 == 0 else 0.0,
+                            "label_status": "positive" if index % 2 == 0 else "negative",
+                            "label_source_mode": "point_buffer" if index % 2 == 0 else "no_event_day",
+                            "matched_event_ids": f"ff_event_{index}",
+                            "label_provenance": "{}",
+                        }
+                        for index in range(3, len(features))
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+
+        feature_path = tmp_path / "features.csv"
+        label_path = tmp_path / "labels.csv"
+        supervised_path = tmp_path / "supervised.csv"
+        model_dir = tmp_path / "models"
+        features.to_csv(feature_path, index=False)
+        labels.to_csv(label_path, index=False)
+
+        assert (
+            build_module.main(
+                [
+                    "--features",
+                    str(feature_path),
+                    "--labels",
+                    str(label_path),
+                    "--output",
+                    str(supervised_path),
+                ]
+            )
+            == 0
+        )
+
+        old_argv = sys.argv
+        sys.argv = [
+            "train_layer4_lightgbm.py",
+            "--source",
+            str(supervised_path),
+            "--source-format",
+            "indicator-csv",
+            "--model-dir",
+            str(model_dir),
+            "--hazard-type",
+            "flash_flood",
+        ]
+        try:
+            assert module.main() == 0
+        finally:
+            sys.argv = old_argv
+
+        summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
+        assert summary["training_target"]["source_label_audit"]["input_rows"] == 32
+        assert summary["training_target"]["source_label_audit"]["input_event_day_unresolved_rows"] == 1
+
+
+def test_build_flash_flood_supervised_training_table_uses_geometry_provenance_for_quality_audit(tmp_path: Path):
+    module = _load_build_supervised_table_module()
+    features = pd.DataFrame(
+        [
+            {"date": "2022-11-24", "hazard_type": "flash_flood", "latitude": 21.50, "longitude": 39.20, "flash_flood_risk": 3},
+            {"date": "2022-11-24", "hazard_type": "flash_flood", "latitude": 24.71, "longitude": 46.67, "flash_flood_risk": 1},
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 21.50,
+                "longitude": 39.20,
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "point_buffer",
+                "matched_event_ids": "ff_event_a",
+                "label_provenance": json.dumps(
+                    {
+                        "date": "2022-11-24",
+                        "matched_event_ids": ["ff_event_a"],
+                        "matched_geometry_sources": ["derived_point_buffer"],
+                        "matched_geometry_wkts": [],
+                    }
+                ),
+            },
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 24.71,
+                "longitude": 46.67,
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "no_event_day",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+        ]
+    )
+
+    feature_path = tmp_path / "features.csv"
+    label_path = tmp_path / "labels.csv"
+    output_path = tmp_path / "merged.csv"
+    features.to_csv(feature_path, index=False)
+    labels.to_csv(label_path, index=False)
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        assert module.main(["--features", str(feature_path), "--labels", str(label_path), "--output", str(output_path)]) == 0
+
+    summary = json.loads(stdout.getvalue())
+    assert summary["supervision_quality"]["status"] == "ok"
+    assert "no_geometry_backed_positives" not in summary["supervision_quality"]["warnings"]
+    assert summary["supervision_quality"]["geometry_positive_fraction_of_positives"] == 1.0
+    assert summary["geometry_positive_source_counts"] == {"derived_point_buffer": 1}
 
 
 def test_build_flash_flood_supervised_training_table_rejects_missing_positive_labels(tmp_path: Path):

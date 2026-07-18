@@ -16,6 +16,12 @@ import numpy as np
 
 from mazu_saudi.data import read_netcdf_dataset
 from mazu_saudi.data.flash_flood_audit import summarize_flash_flood_supervision_quality
+from mazu_saudi.data.flash_flood_audit import (
+    count_flash_flood_boundary_grounded_positive_rows,
+    count_flash_flood_explicit_geometry_positive_rows,
+    count_flash_flood_geometry_backed_positive_rows,
+    summarize_flash_flood_geometry_backed_positive_rows,
+)
 from mazu_saudi.indicators.physical import (
     compute_cape_placeholder,
     compute_dry_heat_stress_score,
@@ -526,14 +532,23 @@ def summarize_frame_training_targets(table, hazard_type: str) -> dict[str, objec
         if hazard_type == "flash_flood":
             summary.update(_summarize_flash_flood_group_audit(filtered))
             label_status_counts = summary.get("label_status_counts", {})
+            label_source_mode_counts = summary.get("label_source_mode_counts", {})
+            geometry_positive_source_counts = summarize_flash_flood_geometry_backed_positive_rows(filtered)
+            boundary_grounded_positive_rows = count_flash_flood_boundary_grounded_positive_rows(filtered)
+            explicit_geometry_positive_rows = count_flash_flood_explicit_geometry_positive_rows(filtered)
             summary["supervision_quality"] = summarize_flash_flood_supervision_quality(
                 total_rows=int(summary["rows_after_label_filter"]),
                 positive_rows=int(summary.get("positive_labels", 0)),
                 negative_rows=int(summary.get("negative_labels", 0)),
                 uncertain_rows=int(label_status_counts.get("uncertain", 0)),
                 rows_with_matched_event_ids=int(summary.get("rows_with_matched_event_ids", 0)),
-                geometry_positive_rows=int(summary.get("label_source_mode_counts", {}).get("geometry_wkt", 0)),
-                outside_event_footprint_negative_rows=int(summary.get("label_source_mode_counts", {}).get("outside_event_footprint", 0)),
+                geometry_positive_rows=int(count_flash_flood_geometry_backed_positive_rows(filtered)),
+                geometry_positive_source_counts=geometry_positive_source_counts,
+                boundary_grounded_positive_rows=int(boundary_grounded_positive_rows),
+                explicit_geometry_positive_rows=int(explicit_geometry_positive_rows),
+                outside_event_footprint_negative_rows=int(label_source_mode_counts.get("outside_event_footprint", 0)),
+                event_day_negative_rows=int(label_source_mode_counts.get("outside_event_footprint", 0)),
+                event_day_unresolved_rows=int(label_status_counts.get("uncertain", 0)),
                 event_group_count=int(summary.get("event_group_count", 0)),
                 fallback_date_group_count=int(summary.get("fallback_date_group_count", 0)),
                 rows_using_fallback_date_groups=int(summary.get("rows_using_fallback_date_groups", 0)),
@@ -612,6 +627,20 @@ def _summarize_flash_flood_group_audit(table) -> dict[str, int]:
         "rows_using_fallback_date_groups": int(len(fallback_date_keys)),
         "rows_with_multi_event_groups": int(multi_event_rows),
     }
+
+
+def _source_summary_path(path: Path) -> Path:
+    return path.with_suffix(".summary.json")
+
+
+def _load_source_summary(path: Path) -> dict[str, object] | None:
+    summary_path = _source_summary_path(path)
+    if not summary_path.exists():
+        return None
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def build_training_payload_from_frame(table, hazard_type: str):
@@ -702,6 +731,7 @@ def main() -> int:
     model_dir.mkdir(parents=True, exist_ok=True)
 
     dataset, resolved_source_format = load_training_source(source, args.source_format)
+    source_summary = _load_source_summary(source)
     target_summary = None
     training_payload = None
     if resolved_source_format in {"indicator-parquet", "indicator-csv", "indicator-json"}:
@@ -751,6 +781,12 @@ def main() -> int:
     }
     if target_summary is not None:
         summary["training_target"] = target_summary
+        if source_summary is not None:
+            source_label_audit = source_summary.get("label_input_audit")
+            if source_label_audit is not None:
+                summary["training_target"]["source_label_audit"] = source_label_audit
+            if "supervision_quality" in source_summary and "supervision_quality" not in summary["training_target"]:
+                summary["training_target"]["source_supervision_quality"] = source_summary["supervision_quality"]
     if training_payload is not None and "split_group_audit" in training_payload:
         split_group_audit = dict(training_payload["split_group_audit"])
         summary["model"].update(split_group_audit)

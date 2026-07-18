@@ -32,7 +32,7 @@ def _env_csv_set(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
 class FlashFloodLabelMappingConfig:
     point_buffer_km: float = 25.0
     province_fallback_enabled: bool = True
-    emit_event_day_negatives: bool = False
+    emit_event_day_negatives: bool = True
     min_spatial_confidence: str = "medium"
     positive_validation_statuses: tuple[str, ...] = ("seed", "verified")
     location_to_province: dict[str, str] = field(
@@ -83,6 +83,8 @@ class FlashFloodLabelMappingConfig:
             "duba": "tabuk",
             "wajh": "tabuk",
             "umluj": "tabuk",
+            "hafar al-batin": "eastern province",
+            "hafar al batin": "eastern province",
             "najran": "najran",
             "najran region": "najran",
             "sharurah": "najran",
@@ -115,7 +117,7 @@ class FlashFloodLabelMappingConfig:
         return cls(
             point_buffer_km=_env_float("MAZU_FLASH_FLOOD_POINT_BUFFER_KM", 25.0),
             province_fallback_enabled=_env_flag("MAZU_FLASH_FLOOD_PROVINCE_FALLBACK_ENABLED", True),
-            emit_event_day_negatives=_env_flag("MAZU_FLASH_FLOOD_EMIT_EVENT_DAY_NEGATIVES", False),
+            emit_event_day_negatives=_env_flag("MAZU_FLASH_FLOOD_EMIT_EVENT_DAY_NEGATIVES", True),
             min_spatial_confidence=os.getenv("MAZU_FLASH_FLOOD_MIN_SPATIAL_CONFIDENCE", "medium").strip().lower() or "medium",
             positive_validation_statuses=_env_csv_set("MAZU_FLASH_FLOOD_POSITIVE_VALIDATION_STATUSES", ("seed", "verified")),
         )

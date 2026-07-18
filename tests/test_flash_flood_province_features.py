@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from mazu_saudi.config import FlashFloodLabelMappingConfig
 from mazu_saudi.data import (
     aggregate_flash_flood_features_to_province_day,
     build_flash_flood_supervised_training_dataset,
@@ -18,10 +19,20 @@ from mazu_saudi.data import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "build_flash_flood_province_day_feature_table.py"
+SUPERVISED_SCRIPT_PATH = ROOT / "scripts" / "build_flash_flood_supervised_training_table.py"
 
 
 def _load_script_module():
     spec = importlib.util.spec_from_file_location("build_flash_flood_province_day_feature_table", SCRIPT_PATH)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_supervised_script_module():
+    spec = importlib.util.spec_from_file_location("build_flash_flood_supervised_training_table", SUPERVISED_SCRIPT_PATH)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -184,7 +195,7 @@ def test_province_day_features_support_text_only_flash_flood_labels():
     assert supervised["training_join_mode"].iloc[0] == "province_day:province_name"
     status_by_province = dict(zip(supervised["province_name"], supervised["label_status"]))
     assert status_by_province["makkah"] == "positive"
-    assert status_by_province["riyadh"] == "uncertain"
+    assert status_by_province["riyadh"] == "negative"
 
 
 def test_province_day_features_record_province_day_mode_for_point_events_without_coordinates():
@@ -219,8 +230,8 @@ def test_province_day_features_record_province_day_mode_for_point_events_without
 
     labels = build_flash_flood_training_labels(features, event_daily_table=events)
 
-    assert labels["label_status"].tolist() == ["positive", "uncertain"]
-    assert labels["label_source_mode"].tolist() == ["province_day", "event_day_unresolved"]
+    assert labels["label_status"].tolist() == ["positive", "negative"]
+    assert labels["label_source_mode"].tolist() == ["province_day", "outside_event_footprint"]
 
 
 def test_build_flash_flood_province_day_feature_table_script_enriches_and_exports_csv(tmp_path: Path):
@@ -319,3 +330,80 @@ def test_build_flash_flood_province_day_feature_table_script_streams_parquet(tmp
     assert summary["province_day_rows"] == 2
     assert exported["province_name"].tolist() == ["makkah", "riyadh"]
     assert exported["grid_cell_count"].tolist() == [2, 1]
+
+
+def test_build_flash_flood_supervised_training_table_main_uses_env_config(tmp_path: Path, monkeypatch):
+    module = _load_supervised_script_module()
+    base_config = FlashFloodLabelMappingConfig()
+    custom_config = FlashFloodLabelMappingConfig(
+        location_to_province={**base_config.location_to_province, "special zone": "makkah"}
+    )
+    monkeypatch.setattr(module.FlashFloodLabelMappingConfig, "from_env", classmethod(lambda cls: custom_config))
+
+    features = pd.DataFrame(
+        [
+            {
+                "date": "2022-12-23",
+                "hazard_type": "flash_flood",
+                "province_name": "special zone",
+                "daily_precip_total": 40.0,
+            },
+            {
+                "date": "2022-12-23",
+                "hazard_type": "flash_flood",
+                "province_name": "riyadh",
+                "daily_precip_total": 5.0,
+            },
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-12-23",
+                "hazard_type": "flash_flood",
+                "province_name": "makkah",
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "province_day",
+                "matched_event_ids": "ff_mecca_text_20221223",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2022-12-23",
+                "hazard_type": "flash_flood",
+                "province_name": "riyadh",
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "no_event_day",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+        ]
+    )
+
+    feature_path = tmp_path / "features.csv"
+    label_path = tmp_path / "labels.csv"
+    output_path = tmp_path / "supervised.csv"
+    features.to_csv(feature_path, index=False)
+    labels.to_csv(label_path, index=False)
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        assert (
+            module.main(
+                [
+                    "--features",
+                    str(feature_path),
+                    "--labels",
+                    str(label_path),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+            == 0
+        )
+
+    merged = pd.read_csv(output_path)
+    status_by_province = dict(zip(merged["province_name"], merged["label_status"]))
+    assert status_by_province["special zone"] == "positive"
+    assert merged.loc[merged["province_name"] == "special zone", "training_join_mode"].iloc[0] == "province_day:province_name"

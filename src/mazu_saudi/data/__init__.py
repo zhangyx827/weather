@@ -59,6 +59,12 @@ from .flash_flood_province_features import (
     province_day_numeric_feature_columns,
 )
 from .flash_flood_province_audit import audit_flash_flood_province_lookup
+from .flash_flood_audit import (
+    count_flash_flood_boundary_grounded_positive_rows,
+    count_flash_flood_explicit_geometry_positive_rows,
+    count_flash_flood_geometry_backed_positive_rows,
+    summarize_flash_flood_geometry_backed_positive_rows,
+)
 from .flash_flood_label_audit import audit_flash_flood_province_day_labels
 from .flash_flood_province_lookup import build_flash_flood_province_lookup
 from .flash_flood_training_dataset import build_flash_flood_supervised_training_dataset
@@ -115,6 +121,10 @@ __all__ = [
     "province_day_numeric_feature_columns",
     "audit_flash_flood_province_lookup",
     "audit_flash_flood_province_day_labels",
+    "count_flash_flood_boundary_grounded_positive_rows",
+    "count_flash_flood_explicit_geometry_positive_rows",
+    "count_flash_flood_geometry_backed_positive_rows",
+    "summarize_flash_flood_geometry_backed_positive_rows",
     "build_flash_flood_province_lookup",
     "build_flash_flood_supervised_training_dataset",
     "SRTMElevationIndex",
