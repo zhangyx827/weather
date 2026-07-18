@@ -75,7 +75,8 @@ def convert_month(surface_dir: Path, pressure_dir: Path, missing_dir: Path, outp
 
         timestamps = surface_ds.valid_time.values
         count = 0
-        for ts_idx, ts_value in enumerate(timestamps):
+        
+        for ts_value in timestamps:
             stamp = np.datetime_as_string(ts_value, unit="h")
             date_part, hour_part = stamp.split("T")
             year_part = date_part[:4]
@@ -83,20 +84,67 @@ def convert_month(surface_dir: Path, pressure_dir: Path, missing_dir: Path, outp
             surface_base = output_dir / "single" / year_part / date_part
             time_prefix = f"{hour_part}:00:00-"
 
+            # ==========================================
+            # 1. 检查断点续传：判断该时次的所有输出是否已经存在
+            # ==========================================
+            all_files_exist = True
+            
+            # 检查气压层文件
+            for short_name in PRESSURE_VARIABLES.keys():
+                for level in PRESSURE_LEVELS:
+                    expected_path = pressure_base / f"{time_prefix}{short_name}-{level}.npy"
+                    if not expected_path.exists():
+                        all_files_exist = False
+                        break
+                if not all_files_exist:
+                    break
+            
+            # 检查地面文件
+            if all_files_exist:
+                for short_name in SURFACE_VARIABLES:
+                    expected_path = surface_base / f"{time_prefix}{short_name}.npy"
+                    if not expected_path.exists():
+                        all_files_exist = False
+                        break
+
+            if all_files_exist:
+                # 所有目标文件已存在，安全跳过
+                count += 1
+                continue
+
+            # ==========================================
+            # 2. 检查时间对齐：确保该时间戳在所有气压层数据中都存在
+            # ==========================================
+            missing_pressure_ts = False
             for short_name, pressure_field in pressure_by_var.items():
-                selected = pressure_field.isel(valid_time=ts_idx)
+                if ts_value not in pressure_field.valid_time.values:
+                    print(f"Warning: Timestamp {stamp} not found in pressure field for '{short_name}'. Skipping.")
+                    missing_pressure_ts = True
+                    break
+            
+            if missing_pressure_ts:
+                continue
+
+            # ==========================================
+            # 3. 处理并写入文件
+            # ==========================================
+            # 写入气压层数据 (使用 .sel 确保时间完全对齐)
+            for short_name, pressure_field in pressure_by_var.items():
+                selected = pressure_field.sel(valid_time=ts_value)
                 for level in PRESSURE_LEVELS:
                     level_field = selected.sel(pressure_level=level)
                     array = _sanitize_field(level_field)
                     _write_array(pressure_base / f"{time_prefix}{short_name}-{level}.npy", array)
 
+            # 写入地面数据 (同样使用 .sel 确保安全)
             for short_name in SURFACE_VARIABLES:
                 if short_name not in surface_ds:
                     raise ValueError(f"Surface variable {short_name} not found in monthly dataset")
-                array = _sanitize_field(surface_ds[short_name].isel(valid_time=ts_idx))
+                array = _sanitize_field(surface_ds[short_name].sel(valid_time=ts_value))
                 _write_array(surface_base / f"{time_prefix}{short_name}.npy", array)
 
             count += 1
+            
         return count
 
 
@@ -120,7 +168,7 @@ def main() -> None:
             year=args.year,
             month=month,
         )
-    print(f"Converted {total} timestamps into {args.output_dir}")
+    print(f"Converted/Verified {total} timestamps into {args.output_dir}")
 
 
 if __name__ == "__main__":

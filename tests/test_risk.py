@@ -118,6 +118,33 @@ class RiskModelTests(unittest.TestCase):
             self.assertGreaterEqual(reloaded_prediction, 0.0)
             self.assertLessEqual(reloaded_prediction, 1.0)
 
+    def test_lightgbm_adapter_supports_grouped_validation_split(self):
+        adapter = LightGBMAdapter()
+        rng = np.random.default_rng(7)
+        features = rng.normal(size=(24, 3)).astype(np.float32)
+        labels = np.array(([1.0] * 6) + ([0.0] * 6) + ([1.0] * 6) + ([0.0] * 6), dtype=np.float32)
+        split_groups = np.array(
+            (["event_a"] * 6) + (["event_b"] * 6) + (["date:2025-01-03"] * 6) + (["date:2025-01-04"] * 6),
+            dtype=object,
+        )
+
+        summary = adapter.train(
+            {
+                "features": features,
+                "labels": labels,
+                "feature_names": ["temp_c", "rh2m", "wind10_speed"],
+                "split_groups": split_groups,
+            },
+            validation_fraction=0.25,
+            seed=11,
+        )
+
+        self.assertEqual(summary["split_strategy"], "group_shuffle")
+        self.assertEqual(summary["split_group_count"], 4)
+        self.assertGreaterEqual(summary["validation_group_count"], 1)
+        self.assertGreater(summary["train_rows"], 0)
+        self.assertGreater(summary["validation_rows"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

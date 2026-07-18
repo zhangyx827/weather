@@ -20,6 +20,7 @@ Supported input columns:
 - `location` or `location_name`: human-readable location name
 - `lat` or `latitude`: optional latitude
 - `lon` or `longitude`: optional longitude
+- `geometry_wkt`: optional polygon or multipolygon footprint used for geometry-backed mapping
 - `source_url`: optional upstream citation URL
 - `source_name`: optional upstream source family or file-specific provenance name
 - `validation_status`: optional, defaults to `verified`
@@ -35,7 +36,7 @@ Artifacts:
 
 - combined event table: seed + verified rows with verified provenance preferred on duplicates
 - daily expansion table: inclusive day-level event expansion for label joins
-- summary JSON: row counts plus `source_name`, `source_url`, `source_record_id`, and `validation_status` coverage
+- summary JSON: row counts plus provenance coverage, geometry-vs-point-vs-text spatial coverage, and daily `label_source_mode` counts
 
 Notes:
 

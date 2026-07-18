@@ -24,17 +24,23 @@ from mazu_saudi.data import (
 
 FORMATS = ("csv", "json", "parquet")
 DEFAULT_VERIFIED_INPUT_DIR = ROOT / "data" / "raw" / "flash_flood_verified"
+DEFAULT_CROSS_HAZARD_VERIFIED_INPUT = (
+    ROOT / "data" / "raw" / "extreme_weather_verified" / "verified_extreme_weather_inventory.csv"
+)
 DEFAULT_OUTPUT = ROOT / "data" / "processed" / "real_flash_flood_chain" / "flash_flood_events_verified_combined.csv"
 DEFAULT_DAILY_OUTPUT = ROOT / "data" / "processed" / "real_flash_flood_chain" / "flash_flood_events_verified_combined_daily.csv"
 DEFAULT_SUMMARY_OUTPUT = ROOT / "data" / "processed" / "real_flash_flood_chain" / "flash_flood_events_verified_summary.json"
 
 
 def _default_verified_inputs() -> list[Path]:
-    return sorted(
+    discovered = sorted(
         path
         for path in DEFAULT_VERIFIED_INPUT_DIR.iterdir()
         if path.is_file() and path.suffix.lower().lstrip(".") in FORMATS and not path.name.startswith("sample_")
     )
+    if DEFAULT_CROSS_HAZARD_VERIFIED_INPUT.exists():
+        discovered.append(DEFAULT_CROSS_HAZARD_VERIFIED_INPUT)
+    return sorted(dict.fromkeys(discovered))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -45,7 +51,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--verified-input",
         type=Path,
         action="append",
-        help="Verified event table path in csv/json/parquet format. Repeat to ingest multiple verified source files. Defaults to all bundled non-sample files under data/raw/flash_flood_verified/.",
+        help="Verified event table path in csv/json/parquet format. Repeat to ingest multiple verified source files. Defaults to all bundled non-sample files under data/raw/flash_flood_verified/ plus the cross-hazard verified inventory when present.",
     )
     parser.add_argument("--verified-format", choices=FORMATS, help="Optional input format override for the verified event table.")
     parser.add_argument(
@@ -125,6 +131,15 @@ def _non_empty_count(table, column: str) -> int:
     return int(values.fillna("").astype(str).str.strip().ne("").sum())
 
 
+def _value_counts(table, column: str) -> dict[str, int]:
+    if column not in table.columns:
+        return {}
+    return {
+        str(key): int(value)
+        for key, value in table[column].fillna("").astype(str).value_counts(dropna=False).to_dict().items()
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     verified_inputs = args.verified_input or _default_verified_inputs()
@@ -164,6 +179,28 @@ def main(argv: list[str] | None = None) -> int:
         "daily_rows": int(len(daily_table)),
         "validation_status_counts": validation_status_counts,
         "source_name_counts": source_name_counts,
+        "spatial_mode_counts": {
+            "geometry_wkt_rows": _non_empty_count(event_table, "geometry_wkt"),
+            "point_rows": int(
+                (
+                    event_table.get("latitude").notna() & event_table.get("longitude").notna()
+                    if "latitude" in event_table.columns and "longitude" in event_table.columns
+                    else 0
+                ).sum()
+            ),
+            "text_only_rows": int(
+                len(event_table)
+                - _non_empty_count(event_table, "geometry_wkt")
+                - int(
+                    (
+                        event_table.get("latitude").notna() & event_table.get("longitude").notna()
+                        if "latitude" in event_table.columns and "longitude" in event_table.columns
+                        else 0
+                    ).sum()
+                )
+            ),
+        },
+        "daily_label_source_mode_counts": _value_counts(daily_table, "label_source_mode"),
         "provenance_field_coverage": {
             "source_name_non_empty": _non_empty_count(event_table, "source_name"),
             "source_url_non_empty": _non_empty_count(event_table, "source_url"),
@@ -174,9 +211,9 @@ def main(argv: list[str] | None = None) -> int:
         "daily_output": str(args.daily_output),
     }
     if args.summary_output is not None:
+        summary["summary_output"] = str(args.summary_output)
         args.summary_output.parent.mkdir(parents=True, exist_ok=True)
         args.summary_output.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        summary["summary_output"] = str(args.summary_output)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

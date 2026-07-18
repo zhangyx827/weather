@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -243,6 +246,7 @@ def test_indicator_csv_training_smoke():
         frame["label"] = np.array([1.0, 0.0] * 8, dtype=np.float32)
         frame["label_status"] = ["positive", "negative"] * 8
         frame["label_source_mode"] = ["point_buffer", "no_event_day"] * 8
+        frame["matched_event_ids"] = ["ff_event_a", "", "ff_event_a", "", "ff_event_b", "", "ff_event_b", ""] * 2
         frame.to_csv(source, index=False)
 
         old_argv = sys.argv
@@ -266,8 +270,48 @@ def test_indicator_csv_training_smoke():
         assert summary["source_format"] == "indicator-csv"
         assert summary["hazard_type"] == "flash_flood"
         assert summary["model"]["objective"] == "binary"
+        assert summary["model"]["split_strategy"] == "group_shuffle"
         assert summary["training_target"]["target_source"] == "explicit_label"
         assert (model_dir / "flash_flood.txt").exists()
+
+
+def test_indicator_csv_training_summary_surfaces_weak_supervision_flags():
+    module = _load_training_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        source = tmp_path / "flash_flood_supervised.csv"
+        model_dir = tmp_path / "models"
+        frame = _indicator_frame(rows=8)
+        frame["label"] = np.array([1.0, 0.0] * 4, dtype=np.float32)
+        frame["label_status"] = ["positive", "negative"] * 4
+        frame["label_source_mode"] = ["point_buffer", "no_event_day"] * 4
+        frame["matched_event_ids"] = ["ff_event_a", "", "ff_event_a", "", "", "", "", ""]
+        frame.to_csv(source, index=False)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "train_layer4_lightgbm.py",
+            "--source",
+            str(source),
+            "--source-format",
+            "indicator-csv",
+            "--model-dir",
+            str(model_dir),
+            "--hazard-type",
+            "flash_flood",
+        ]
+        try:
+            assert module.main() == 0
+        finally:
+            sys.argv = old_argv
+
+        summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
+        quality = summary["training_target"]["supervision_quality"]
+        assert quality["status"] == "warning"
+        assert "no_geometry_backed_positives" in quality["warnings"]
+        assert "few_event_groups" in quality["warnings"]
+        assert "fallback_date_groups_dominate" in quality["warnings"]
+        assert summary["model"]["supervision_quality"] == quality
 
 
 def test_indicator_json_training_smoke_dry_heat():
@@ -534,6 +578,21 @@ def test_build_training_table_from_frame_uses_explicit_flash_flood_labels():
     assert target.tolist() == [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
 
 
+def test_build_training_payload_from_frame_adds_flash_flood_split_groups():
+    module = _load_training_module()
+    frame = _indicator_frame(rows=6)
+    frame["date"] = ["2025-01-01", "2025-01-01", "2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"]
+    frame["label"] = np.array([1.0, 0.0, 1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    frame["label_status"] = ["positive", "negative", "positive", "negative", "negative", "positive"]
+    frame["matched_event_ids"] = ["ff_a", "", "ff_b", "", "", "ff_c"]
+
+    payload = module.build_training_payload_from_frame(frame, "flash_flood")
+
+    assert payload["features"].shape[0] == 6
+    assert payload["labels"].tolist() == [1.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+    assert payload["split_groups"].tolist() == ["ff_a", "date:2025-01-01", "ff_b", "date:2025-01-02", "date:2025-01-03", "ff_c"]
+
+
 def test_build_training_table_from_frame_filters_rows_with_missing_required_features():
     module = _load_training_module()
     frame = _indicator_frame(rows=4)
@@ -603,6 +662,7 @@ def test_build_training_table_from_frame_rejects_subdaily_timestamps():
 def test_summarize_frame_training_targets_reports_explicit_label_usage():
     module = _load_training_module()
     frame = _indicator_frame(rows=6)
+    frame["date"] = ["2025-01-01", "2025-01-01", "2025-01-02", "2025-01-02", "2025-01-03", "2025-01-03"]
     frame["label"] = np.array([1.0, 0.0, np.nan, 1.0, np.nan, 0.0], dtype=np.float32)
     frame["label_status"] = ["positive", "negative", "uncertain", "positive", "uncertain", "negative"]
     frame["label_source_mode"] = [
@@ -613,6 +673,7 @@ def test_summarize_frame_training_targets_reports_explicit_label_usage():
         "event_day_unresolved",
         "no_event_day",
     ]
+    frame["matched_event_ids"] = ["ff_a", "", "", "ff_b", "", ""]
 
     summary = module.summarize_frame_training_targets(frame, "flash_flood")
 
@@ -624,6 +685,12 @@ def test_summarize_frame_training_targets_reports_explicit_label_usage():
     assert summary["negative_labels"] == 2
     assert summary["label_status_counts"] == {"positive": 2, "negative": 2, "uncertain": 2}
     assert summary["label_source_mode_counts"] == {"point_buffer": 2, "no_event_day": 2}
+    assert summary["split_group_count"] == 4
+    assert summary["event_group_count"] == 2
+    assert summary["fallback_date_group_count"] == 2
+    assert summary["rows_with_matched_event_ids"] == 2
+    assert summary["rows_using_fallback_date_groups"] == 2
+    assert summary["rows_with_multi_event_groups"] == 0
 
 
 def test_summarize_frame_training_targets_reports_dry_heat_explicit_outcomes():
@@ -806,6 +873,179 @@ def test_build_flash_flood_supervised_training_table_script_exports_csv(tmp_path
     assert merged["training_join_mode"].iloc[0] == "grid_day"
 
 
+def test_build_flash_flood_supervised_training_table_script_reports_supervision_quality(tmp_path: Path):
+    module = _load_build_supervised_table_module()
+    features = pd.DataFrame(
+        [
+            {"date": "2022-11-24", "hazard_type": "flash_flood", "latitude": 21.50, "longitude": 39.20, "flash_flood_risk": 3},
+            {"date": "2022-11-24", "hazard_type": "flash_flood", "latitude": 24.71, "longitude": 46.67, "flash_flood_risk": 1},
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 21.50,
+                "longitude": 39.20,
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "point_buffer",
+                "matched_event_ids": "ff_event_a",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 24.71,
+                "longitude": 46.67,
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "no_event_day",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+        ]
+    )
+
+    feature_path = tmp_path / "features.csv"
+    label_path = tmp_path / "labels.csv"
+    output_path = tmp_path / "merged.csv"
+    features.to_csv(feature_path, index=False)
+    labels.to_csv(label_path, index=False)
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        assert module.main(["--features", str(feature_path), "--labels", str(label_path), "--output", str(output_path)]) == 0
+
+    summary = json.loads(stdout.getvalue())
+    assert summary["supervision_quality"]["status"] == "warning"
+    assert "no_geometry_backed_positives" in summary["supervision_quality"]["warnings"]
+    assert summary["supervision_quality"]["matched_event_fraction"] == 0.5
+
+
+def test_build_flash_flood_supervised_training_table_rejects_missing_positive_labels(tmp_path: Path):
+    module = _load_build_supervised_table_module()
+    features = pd.DataFrame(
+        [
+            {"date": "2022-11-24", "hazard_type": "flash_flood", "latitude": 21.50, "longitude": 39.20, "flash_flood_risk": 3},
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 21.50,
+                "longitude": 39.20,
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "point_buffer",
+                "matched_event_ids": "ff_event_a",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 24.71,
+                "longitude": 46.67,
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "point_buffer",
+                "matched_event_ids": "ff_event_b",
+                "label_provenance": "{}",
+            },
+        ]
+    )
+
+    feature_path = tmp_path / "features.csv"
+    label_path = tmp_path / "labels.csv"
+    output_path = tmp_path / "merged.csv"
+    features.to_csv(feature_path, index=False)
+    labels.to_csv(label_path, index=False)
+
+    with pytest.raises(RuntimeError, match=r"missing 1 positive label rows"):
+        module.main(["--features", str(feature_path), "--labels", str(label_path), "--output", str(output_path)])
+
+
+def test_build_flash_flood_supervised_training_table_script_streams_compatible_label_parquet(tmp_path: Path):
+    module = _load_build_supervised_table_module()
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 21.49004,
+                "longitude": 39.19996,
+                "daily_precip_total": 30.0,
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "point_buffer",
+                "matched_event_ids": "ff_jeddah_20221124",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2022-11-24",
+                "hazard_type": "flash_flood",
+                "latitude": 24.71004,
+                "longitude": 46.67004,
+                "daily_precip_total": 1.0,
+                "label": np.nan,
+                "label_status": "uncertain",
+                "label_source_mode": "event_day_unresolved",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2022-11-25",
+                "hazard_type": "flash_flood",
+                "latitude": 24.71004,
+                "longitude": 46.67004,
+                "daily_precip_total": 0.0,
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "no_event_day",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+        ]
+    )
+    features = labels.drop(columns=["label", "label_status", "label_source_mode", "matched_event_ids", "label_provenance"]).copy()
+
+    feature_path = tmp_path / "features.parquet"
+    label_path = tmp_path / "labels.parquet"
+    output_path = tmp_path / "merged.parquet"
+    features.to_parquet(feature_path, index=False)
+    labels.to_parquet(label_path, index=False)
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        assert (
+            module.main(
+                [
+                    "--features",
+                    str(feature_path),
+                    "--labels",
+                    str(label_path),
+                    "--output",
+                    str(output_path),
+                    "--batch-rows",
+                    "1",
+                ]
+            )
+            == 0
+        )
+
+    summary = json.loads(stdout.getvalue())
+    merged = pd.read_parquet(output_path)
+
+    assert merged["label_status"].tolist() == ["positive", "negative"]
+    assert merged["training_join_mode"].nunique() == 1
+    assert merged["training_join_mode"].iloc[0] == "grid_day"
+    assert summary["rows"] == 2
+    assert summary["labeled_rows"] == 2
+
+
 def test_build_dust_storm_supervised_training_table_script_exports_csv(tmp_path: Path):
     module = _load_build_dust_storm_supervised_table_module()
     features = pd.DataFrame(
@@ -897,3 +1137,7 @@ def test_demo_flash_flood_supervised_training_trains_with_adapter(tmp_path: Path
     assert train_summary["model"]["objective"] == "binary"
     assert train_summary["model"]["metric"] == "binary_logloss"
     assert train_summary["training_target"]["target_source"] == "explicit_label"
+    assert train_summary["model"]["split_group_count"] >= 1
+    assert train_summary["model"]["event_group_count"] >= 1
+    assert train_summary["model"]["rows_with_matched_event_ids"] >= 1
+    assert "training_split_group_audit" in train_summary["training_target"]

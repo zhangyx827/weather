@@ -66,9 +66,11 @@ Verified flash-flood source ingestion contract:
 ```bash
 cat docs/flash_flood_verified_ingestion.md
 python3 scripts/build_verified_flash_flood_event_table.py
+python3 scripts/build_flash_flood_training_labels.py --samples /path/to/flash_flood_samples.csv
+python3 scripts/build_flash_flood_supervised_training_table.py --features /path/to/flash_flood_features.parquet --labels /path/to/flash_flood_labels.parquet
 ```
 
-The default flash-flood verified build now ingests all bundled non-sample files under `data/raw/flash_flood_verified/`, including the preserved 2025 user facts and two explicit 2024 web-verified rows for `Eastern Province` and `Dammam`.
+The default flash-flood verified build now ingests all bundled non-sample files under `data/raw/flash_flood_verified/`, including the preserved 2025 user facts and two explicit 2024 web-verified rows for `Eastern Province` and `Dammam`. The verified-event summary now reports geometry-backed vs point/text-only coverage, and the label/training-table builders report label-source-mode and matched-event audit counts.
 
 2025 dust-storm verified ingestion contract:
 

@@ -46,9 +46,19 @@ LAYER4_SUPERVISION_SPECS: dict[str, HazardSupervisionSpec] = {
     ),
     "flash_flood": HazardSupervisionSpec(
         hazard_type="flash_flood",
-        default_sample_unit="grid-day",
+        default_sample_unit="province-day",
         explicit_target_columns=("label",),
-        explicit_metadata_columns=("date", "latitude", "longitude", "label_source_mode", "matched_event_ids", "label_provenance"),
+        explicit_metadata_columns=(
+            "date",
+            "province_name",
+            "admin1_name",
+            "region_name",
+            "latitude",
+            "longitude",
+            "label_source_mode",
+            "matched_event_ids",
+            "label_provenance",
+        ),
         explicit_filter_columns=("label_status",),
     ),
 }

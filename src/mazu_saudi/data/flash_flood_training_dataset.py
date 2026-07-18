@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 from mazu_saudi.config import FlashFloodLabelMappingConfig
@@ -44,6 +45,100 @@ def _prepare_province_join_keys(table: Any, column: str, config: FlashFloodLabel
     return normalized
 
 
+def _flash_flood_join_context(
+    feature_frame: Any,
+    label_frame: Any,
+    *,
+    active_config: FlashFloodLabelMappingConfig,
+    coordinate_precision: int,
+) -> tuple[Any, Any, list[str], str, str | None]:
+    feature_has_grid = {"latitude", "longitude"}.issubset(feature_frame.columns)
+    label_has_grid = {"latitude", "longitude"}.issubset(label_frame.columns)
+
+    if feature_has_grid and label_has_grid:
+        left = _prepare_grid_join_keys(feature_frame, coordinate_precision=coordinate_precision)
+        right = _prepare_grid_join_keys(label_frame, coordinate_precision=coordinate_precision)
+        return left, right, ["date", "latitude", "longitude"], "grid_day", None
+
+    shared_province_columns = [column for column in _PROVINCE_COLUMNS if column in feature_frame.columns and column in label_frame.columns]
+    if not shared_province_columns:
+        raise KeyError(
+            "flash-flood supervised join requires either shared latitude/longitude columns "
+            f"or one shared province column from {_PROVINCE_COLUMNS}"
+        )
+
+    province_column = shared_province_columns[0]
+    left = _prepare_province_join_keys(feature_frame, province_column, active_config)
+    right = _prepare_province_join_keys(label_frame, province_column, active_config)
+    return left, right, ["date", "_province_join_key"], f"province_day:{province_column}", province_column
+
+
+def _join_key_counts(table: Any, join_columns: list[str], *, positive_only: bool) -> Counter[tuple[Any, ...]]:
+    if positive_only:
+        table = table.loc[table["label_status"].astype(str) == "positive"].copy()
+    if table.empty:
+        return Counter()
+    return Counter(tuple(values) for values in table.loc[:, join_columns].itertuples(index=False, name=None))
+
+
+def _flash_flood_positive_alignment_summary(
+    feature_table: Any,
+    label_table: Any,
+    merged: Any,
+    *,
+    config: FlashFloodLabelMappingConfig | None = None,
+    coordinate_precision: int = 4,
+) -> dict[str, object]:
+    active_config = config or FlashFloodLabelMappingConfig()
+    _, normalized_labels, join_columns, join_mode, province_column = _flash_flood_join_context(
+        feature_table,
+        label_table,
+        active_config=active_config,
+        coordinate_precision=coordinate_precision,
+    )
+
+    label_positive_counts = _join_key_counts(normalized_labels, join_columns, positive_only=True)
+    merged_positive_counts = _join_key_counts(merged, join_columns, positive_only=True)
+    missing_positive_rows = 0
+    extra_positive_rows = 0
+    missing_positive_keys: list[dict[str, object]] = []
+    extra_positive_keys: list[dict[str, object]] = []
+
+    for key, label_count in label_positive_counts.items():
+        merged_count = merged_positive_counts.get(key, 0)
+        if label_count > merged_count:
+            missing = label_count - merged_count
+            missing_positive_rows += missing
+            missing_positive_keys.append({"join_key": "|".join(str(part) for part in key), "missing_rows": int(missing)})
+
+    for key, merged_count in merged_positive_counts.items():
+        label_count = label_positive_counts.get(key, 0)
+        if merged_count > label_count:
+            extra = merged_count - label_count
+            extra_positive_rows += extra
+            extra_positive_keys.append({"join_key": "|".join(str(part) for part in key), "extra_rows": int(extra)})
+
+    missing_positive_keys.sort(key=lambda item: (-int(item["missing_rows"]), str(item["join_key"])))
+    extra_positive_keys.sort(key=lambda item: (-int(item["extra_rows"]), str(item["join_key"])))
+
+    summary: dict[str, object] = {
+        "status": "ok" if missing_positive_rows == 0 and extra_positive_rows == 0 else "mismatch",
+        "ok": missing_positive_rows == 0 and extra_positive_rows == 0,
+        "join_mode": join_mode,
+        "join_key_columns": join_columns,
+        "province_column": province_column,
+        "label_positive_rows": int(sum(label_positive_counts.values())),
+        "supervised_positive_rows": int(sum(merged_positive_counts.values())),
+        "missing_positive_rows": int(missing_positive_rows),
+        "extra_positive_rows": int(extra_positive_rows),
+        "missing_positive_key_count": int(len(missing_positive_keys)),
+        "extra_positive_key_count": int(len(extra_positive_keys)),
+        "sample_missing_positive_keys": missing_positive_keys[:10],
+        "sample_extra_positive_keys": extra_positive_keys[:10],
+    }
+    return summary
+
+
 def build_flash_flood_supervised_training_dataset(
     feature_table: Any,
     label_table: Any,
@@ -76,27 +171,12 @@ def build_flash_flood_supervised_training_dataset(
         raise ValueError("feature_table has no flash_flood rows to join")
     if label_frame.empty:
         raise ValueError("label_table has no flash_flood rows to join")
-
-    feature_has_grid = {"latitude", "longitude"}.issubset(feature_frame.columns)
-    label_has_grid = {"latitude", "longitude"}.issubset(label_frame.columns)
-
-    if feature_has_grid and label_has_grid:
-        left = _prepare_grid_join_keys(feature_frame, coordinate_precision=coordinate_precision)
-        right = _prepare_grid_join_keys(label_frame, coordinate_precision=coordinate_precision)
-        join_columns = ["date", "latitude", "longitude"]
-        join_mode = "grid_day"
-    else:
-        shared_province_columns = [column for column in _PROVINCE_COLUMNS if column in feature_frame.columns and column in label_frame.columns]
-        if not shared_province_columns:
-            raise KeyError(
-                "flash-flood supervised join requires either shared latitude/longitude columns "
-                f"or one shared province column from {_PROVINCE_COLUMNS}"
-            )
-        province_column = shared_province_columns[0]
-        left = _prepare_province_join_keys(feature_frame, province_column, active_config)
-        right = _prepare_province_join_keys(label_frame, province_column, active_config)
-        join_columns = ["date", "_province_join_key"]
-        join_mode = f"province_day:{province_column}"
+    left, right, join_columns, join_mode, _ = _flash_flood_join_context(
+        feature_frame,
+        label_frame,
+        active_config=active_config,
+        coordinate_precision=coordinate_precision,
+    )
 
     label_columns = ["label", "label_status", "label_source_mode", "matched_event_ids", "label_provenance"]
     missing_label_columns = [name for name in label_columns if name not in right.columns]
@@ -113,5 +193,32 @@ def build_flash_flood_supervised_training_dataset(
     if drop_uncertain:
         merged = merged[merged["label_status"].isin(("positive", "negative"))].copy()
         merged["is_labeled"] = True
+
+    alignment_summary = _flash_flood_positive_alignment_summary(
+        feature_frame,
+        label_frame,
+        merged,
+        config=active_config,
+        coordinate_precision=coordinate_precision,
+    )
+    if not alignment_summary["ok"]:
+        missing_sample = alignment_summary["sample_missing_positive_keys"]
+        extra_sample = alignment_summary["sample_extra_positive_keys"]
+        details: list[str] = []
+        if alignment_summary["missing_positive_rows"]:
+            details.append(
+                f"missing {alignment_summary['missing_positive_rows']} positive label rows across "
+                f"{alignment_summary['missing_positive_key_count']} join keys"
+            )
+            if missing_sample:
+                details.append("sample missing keys: " + ", ".join(item["join_key"] for item in missing_sample[:3]))
+        if alignment_summary["extra_positive_rows"]:
+            details.append(
+                f"extra {alignment_summary['extra_positive_rows']} positive supervised rows across "
+                f"{alignment_summary['extra_positive_key_count']} join keys"
+            )
+            if extra_sample:
+                details.append("sample extra keys: " + ", ".join(item["join_key"] for item in extra_sample[:3]))
+        raise RuntimeError("flash-flood supervised training alignment check failed: " + "; ".join(details))
 
     return merged.reset_index(drop=True)

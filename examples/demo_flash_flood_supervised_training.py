@@ -156,14 +156,12 @@ def run_demo(
 
     train_module = _load_training_module()
     target_summary = train_module.summarize_frame_training_targets(supervised, "flash_flood")
-    features_matrix, target = train_module.build_training_table_from_frame(supervised, "flash_flood")
+    training_payload = train_module.build_training_payload_from_frame(supervised, "flash_flood")
+    features_matrix = training_payload["features"]
+    target = training_payload["labels"]
     adapter = LightGBMAdapter()
     training_summary = adapter.train(
-        {
-            "features": features_matrix,
-            "labels": target,
-            "feature_names": list(feature_names_for_hazard("flash_flood")),
-        },
+        training_payload,
         validation_fraction=0.1,
         seed=seed,
         num_boost_round=250,
@@ -187,9 +185,14 @@ def run_demo(
             "metric": training_summary["metric"],
             "validation_metric": training_summary["validation_metric"],
             "best_iteration": training_summary["best_iteration"],
+            "split_strategy": training_summary["split_strategy"],
         },
         "training_target": target_summary,
     }
+    if "split_group_audit" in training_payload:
+        split_group_audit = dict(training_payload["split_group_audit"])
+        train_summary["model"].update(split_group_audit)
+        train_summary["training_target"]["training_split_group_audit"] = split_group_audit
     train_summary_path = model_dir / "train_summary.json"
     train_summary_path.write_text(json.dumps(train_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["model_path"] = str(model_path)

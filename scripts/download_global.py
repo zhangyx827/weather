@@ -22,8 +22,8 @@ PRESSURE_LEVELS = [
 ]
 
 # 目标存储文件夹
-single_dir = './era5_global_single_2022_6h'
-pressure_dir = './era5_global_pressure_2022_6h'
+single_dir = './era5_global_single_2015_6h'
+pressure_dir = './era5_global_pressure_2015_6h'
 
 os.makedirs(single_dir, exist_ok=True)
 os.makedirs(pressure_dir, exist_ok=True)
@@ -55,25 +55,18 @@ def preprocess_era5(ds):
     """
     ERA5/ERA5T 数据预处理：融合并消除 expver 维度，避免后续合并冲突
     """
-    # 1. 如果 expver 作为一个多值维度存在
     if 'expver' in ds.dims:
         if len(ds.expver) > 1:
             try:
-                # 💡 关键改动：使用 drop=True 彻底丢弃 expver 标量坐标，防止 combine_first 时发生冲突
                 ds_1 = ds.sel(expver=1, drop=True)
                 ds_5 = ds.sel(expver=5, drop=True)
                 ds = ds_1.combine_first(ds_5)
             except KeyError:
-                # 备用方案：若 sel 失败则直接取第一个并丢弃该维度坐标
                 ds = ds.isel(expver=0, drop=True)
         else:
-            # 如果只有单个值，直接 squeeze 压缩掉该维度并彻底丢弃
             ds = ds.squeeze('expver', drop=True)
-            
-    # 2. 彻底清理可能残留的 expver 和 number 坐标/变量
     drop_vars = ['expver', 'number']
     ds = ds.drop_vars([v for v in drop_vars if v in ds.coords or v in ds.variables], errors='ignore')
-        
     return ds
 
 
@@ -109,31 +102,31 @@ def safe_retrieve(dataset_name, request_params, output_path, max_retries=5):
                 os.remove(tmp_path)
                 
             if attempt < max_retries:
-                sleep_time = attempt * 30  # 递增等待时长，给服务器缓冲时间
+                sleep_time = attempt * 30  # 递增等待时长
                 time.sleep(sleep_time)
             else:
                 return False
 
 
 # ========================================================
-# 步骤一：下载全球地面数据（数据量小，直接下载单月，不进行拆分）
+# 步骤一：下载全球地面数据（整月，不分段）
 # ========================================================
 print(f"====== 开始下载地面数据集 (分辨率: {GRID_RESOLUTION}) ======")
 for month in range(1, 13):
     month_str = f"{month:02d}"
-    output_filename = os.path.join(single_dir, f"era5_global_single_2022_{month_str}.nc")
+    output_filename = os.path.join(single_dir, f"era5_global_single_2015_{month_str}.nc")
     
     if os.path.exists(output_filename):
         print(f"【跳过】地面数据已存在: {output_filename}")
         continue
         
-    print(f"\n>>>> 正在请求 2022年{month_str}月 全球地面变量...")
+    print(f"\n>>>> 正在请求 2015年{month_str}月 全球地面变量...")
     
     params = {
         'product_type': 'reanalysis',
         'data_format': 'netcdf', 
         'variable': SURFACE_VARS,
-        'year': '2022',
+        'year': '2015',
         'month': month_str,
         'day': [f"{d:02d}" for d in range(1, 32)],
         'time': HOURS_6H,
@@ -144,92 +137,47 @@ for month in range(1, 13):
 
 
 # ========================================================
-# 步骤二：下载全球高空数据（采用“隐式拆分 + 自动清洗合并”策略）
+# 步骤二：下载全球高空数据（整月，不分段，直接请求全部日期）
 # ========================================================
 print(f"\n====== 开始下载高空数据集 (分辨率: {GRID_RESOLUTION}) ======")
-DAY_CHUNKS = [
-    ("part1", [f"{d:02d}" for d in range(1, 16)]),
-    ("part2", [f"{d:02d}" for d in range(16, 32)])
-]
-
 for month in range(1, 13):
     month_str = f"{month:02d}"
     for var in ATMOS_VARS:
-        final_filename = os.path.join(pressure_dir, f"era5_global_pl_2022_{month_str}_{var}.nc")
+        final_filename = os.path.join(pressure_dir, f"era5_global_pl_2015_{month_str}_{var}.nc")
         
-        # 如果最终合并后的标准单月文件已存在，直接跳过整个月的该变量
+        # 如果最终文件已存在，跳过
         if os.path.exists(final_filename):
             print(f"【跳过】完整高空文件已存在: {month_str}月 【{var}】")
             continue
             
-        print(f"\n>>>> 正在处理 2022年{month_str}月 【{var}】...")
-        
-        p1_path = final_filename.replace('.nc', '_part1.nc')
-        p2_path = final_filename.replace('.nc', '_part2.nc')
-        
-        success = True
-        # 分段下载前半月和后半月
-        for part_label, days in DAY_CHUNKS:
-            part_path = p1_path if part_label == "part1" else p2_path
-            
-            # 如果分段文件已经存在，无需重复下载
-            if os.path.exists(part_path):
-                print(f" 📥 [分段已存在] {part_label} (天数: {days[0]}~{days[-1]})")
-                continue
-            
-            print(f" 📥 正在下载 {part_label} (天数: {days[0]}~{days[-1]})...")
-            params = {
-                'product_type': 'reanalysis',
-                'data_format': 'netcdf',
-                'variable': [var], 
-                'pressure_level': PRESSURE_LEVELS,
-                'year': '2022',
-                'month': month_str,
-                'day': days,
-                'time': HOURS_6H,
-                'grid': [GRID_RESOLUTION, GRID_RESOLUTION],
-            }
-            if not safe_retrieve('reanalysis-era5-pressure-levels', params, part_path):
-                success = False
-                break
-        
-        # 两部分均下载完成，开始现场清洗、合并及清理垃圾
-        if success and os.path.exists(p1_path) and os.path.exists(p2_path):
-            print(f" 🧬 两部分下载完成，正在现场清洗并融合成完整月文件...")
+        print(f"\n>>>> 正在下载 2015年{month_str}月 【{var}】完整月份...")
+        params = {
+            'product_type': 'reanalysis',
+            'data_format': 'netcdf',
+            'variable': [var],
+            'pressure_level': PRESSURE_LEVELS,
+            'year': '2015',
+            'month': month_str,
+            'day': [f"{d:02d}" for d in range(1, 32)],   # 一次性请求全部日期
+            'time': HOURS_6H,
+            'grid': [GRID_RESOLUTION, GRID_RESOLUTION],
+        }
+        success = safe_retrieve('reanalysis-era5-pressure-levels', params, final_filename)
+
+        # 若下载成功，可对文件进行可选的 expver 清洗
+        if success:
             try:
-                # 1. 加载临时文件
-                ds1 = xr.open_dataset(p1_path)
-                ds2 = xr.open_dataset(p2_path)
+                # 使用 with 语句并在内部 .load()，确保退出 block 时文件句柄已被完全释放
+                with xr.open_dataset(final_filename) as ds:
+                    ds_clean = preprocess_era5(ds).load() 
                 
-                # 2. 调用预处理函数，强行统一并消除坐标污染
-                ds1_clean = preprocess_era5(ds1)
-                ds2_clean = preprocess_era5(ds2)
-                
-                # 3. 在时间维度上融合
-                # 💡 关键改动：加入 compat='override' 和 combine_attrs='override' 强行绕过任何潜在的非对齐冲突
-                ds_combined = xr.concat(
-                    [ds1_clean, ds2_clean], 
-                    dim='time', 
-                    data_vars='minimal', 
-                    coords='minimal',
-                    compat='override',
-                    combine_attrs='override'
-                )
-                
-                # 4. 写入最终目标 NC 文件
-                ds_combined.to_netcdf(final_filename)
-                
-                # 5. 关闭句柄，释放内存
-                ds1.close()
-                ds2.close()
-                ds_combined.close()
-                
-                # 6. 过河拆桥：删除两部分临时的切分文件，保持目录绝对干净
-                os.remove(p1_path)
-                os.remove(p2_path)
-                print(f" 🎉 【成功】完整文件已就位，临时垃圾已清理！")
-                
+                # 此时文件已解锁，可以安全覆盖写入
+                ds_clean.to_netcdf(final_filename)
+                ds_clean.close()
+                print(f"   ✅ 【{var}】下载完成并已清洗。")
             except Exception as e:
-                print(f" ❌ 现场合并失败: {e}")
+                print(f"   ⚠️ 清洗时发生错误: {e}")
+        else:
+            print(f"   ❌ 【{var}】下载失败，请检查网络或稍后重试。")
 
 print("\n====== ✨ STCast 全球数据集一体化流水线执行完毕！ ======")

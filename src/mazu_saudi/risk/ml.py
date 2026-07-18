@@ -18,16 +18,69 @@ def _metadata_sidecar_path(path: str | Path) -> Path:
     return target.with_name(f"{target.name}.metadata.json")
 
 
-def _coerce_training_arrays(dataset: Any) -> tuple[np.ndarray, np.ndarray, list[str] | None]:
+def _normalize_split_groups(raw_groups: Any, expected_rows: int) -> np.ndarray:
+    groups = np.asarray(raw_groups, dtype=object).reshape(-1)
+    if groups.shape[0] != expected_rows:
+        raise ValueError(f"Split-group count {groups.shape[0]} does not match feature row count {expected_rows}")
+    normalized: list[str] = []
+    for index, value in enumerate(groups):
+        text = "" if value is None else str(value).strip()
+        if not text or text.lower() == "nan":
+            text = f"__row_{index}"
+        normalized.append(text)
+    return np.asarray(normalized, dtype=object)
+
+
+def _coerce_group_split_indices(
+    split_groups: np.ndarray,
+    *,
+    validation_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if split_groups.size < 2:
+        return None
+    unique_groups = np.unique(split_groups)
+    if unique_groups.size < 2:
+        return None
+
+    validation_fraction = min(max(validation_fraction, 0.05), 0.5)
+    target_valid_rows = max(1, min(split_groups.size - 1, int(split_groups.size * validation_fraction)))
+    rng = np.random.default_rng(seed)
+    shuffled_groups = unique_groups.copy()
+    rng.shuffle(shuffled_groups)
+
+    valid_mask = np.zeros(split_groups.shape[0], dtype=bool)
+    for group in shuffled_groups:
+        group_mask = split_groups == group
+        if not group_mask.any():
+            continue
+        candidate_mask = valid_mask | group_mask
+        remaining_rows = (~candidate_mask).sum()
+        if remaining_rows == 0:
+            continue
+        valid_mask = candidate_mask
+        if int(valid_mask.sum()) >= target_valid_rows:
+            break
+
+    valid_idx = np.flatnonzero(valid_mask)
+    train_idx = np.flatnonzero(~valid_mask)
+    if valid_idx.size == 0 or train_idx.size == 0:
+        return None
+    return train_idx.astype(np.int32), valid_idx.astype(np.int32)
+
+
+def _coerce_training_arrays(dataset: Any) -> tuple[np.ndarray, np.ndarray, list[str] | None, np.ndarray | None]:
     """Normalize common training payload shapes into dense arrays."""
 
     feature_names = None
     features = None
     labels = None
+    split_groups = None
 
     if isinstance(dataset, dict):
         features = dataset.get("features", dataset.get("X"))
         labels = dataset.get("labels", dataset.get("y", dataset.get("target")))
+        split_groups = dataset.get("split_groups")
         raw_feature_names = dataset.get("feature_names")
         if raw_feature_names is not None:
             feature_names = [str(name) for name in raw_feature_names]
@@ -59,7 +112,8 @@ def _coerce_training_arrays(dataset: Any) -> tuple[np.ndarray, np.ndarray, list[
         )
     if feature_names is None:
         feature_names = [f"feature_{index}" for index in range(feature_array.shape[1])]
-    return feature_array, label_array, feature_names
+    normalized_groups = None if split_groups is None else _normalize_split_groups(split_groups, feature_array.shape[0])
+    return feature_array, label_array, feature_names, normalized_groups
 
 
 class OptionalMLAdapter:
@@ -136,19 +190,32 @@ class LightGBMAdapter(OptionalMLAdapter):
         metric: str | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        features, labels, feature_names = _coerce_training_arrays(dataset)
+        features, labels, feature_names, split_groups = _coerce_training_arrays(dataset)
         indices = np.arange(features.shape[0], dtype=np.int32)
-        rng = np.random.default_rng(seed)
-        rng.shuffle(indices)
+        split_strategy = "random_row_shuffle"
+        group_count = None
+        validation_group_count = None
 
         if indices.size >= 10 and validation_fraction > 0.0:
-            validation_fraction = min(max(validation_fraction, 0.05), 0.5)
-            split = max(1, min(indices.size - 1, int(indices.size * (1.0 - validation_fraction))))
-            train_idx = indices[:split]
-            valid_idx = indices[split:]
+            grouped_split = None
+            if split_groups is not None:
+                grouped_split = _coerce_group_split_indices(split_groups, validation_fraction=validation_fraction, seed=seed)
+            if grouped_split is not None:
+                train_idx, valid_idx = grouped_split
+                split_strategy = "group_shuffle"
+                group_count = int(np.unique(split_groups).size)
+                validation_group_count = int(np.unique(split_groups[valid_idx]).size)
+            else:
+                rng = np.random.default_rng(seed)
+                rng.shuffle(indices)
+                validation_fraction = min(max(validation_fraction, 0.05), 0.5)
+                split = max(1, min(indices.size - 1, int(indices.size * (1.0 - validation_fraction))))
+                train_idx = indices[:split]
+                valid_idx = indices[split:]
         else:
             train_idx = indices
             valid_idx = np.asarray([], dtype=np.int32)
+            split_strategy = "train_only"
 
         unique_labels = {float(value) for value in np.unique(labels[np.isfinite(labels)])}
         is_binary = unique_labels.issubset({0.0, 1.0}) and len(unique_labels) >= 1
@@ -225,7 +292,12 @@ class LightGBMAdapter(OptionalMLAdapter):
             "train_rows": int(train_idx.size),
             "validation_rows": int(valid_idx.size),
             "validation_metric": validation_metric,
+            "split_strategy": split_strategy,
         }
+        if group_count is not None:
+            training_summary["split_group_count"] = group_count
+        if validation_group_count is not None:
+            training_summary["validation_group_count"] = validation_group_count
         self.metadata.update(
             {
                 "backend": self.backend,

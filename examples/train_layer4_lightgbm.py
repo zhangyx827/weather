@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 import numpy as np
 
 from mazu_saudi.data import read_netcdf_dataset
+from mazu_saudi.data.flash_flood_audit import summarize_flash_flood_supervision_quality
 from mazu_saudi.indicators.physical import (
     compute_cape_placeholder,
     compute_dry_heat_stress_score,
@@ -522,6 +523,21 @@ def summarize_frame_training_targets(table, hazard_type: str) -> dict[str, objec
         if "label_source_mode" in filtered.columns:
             source_counts = filtered["label_source_mode"].astype(str).value_counts(dropna=False).to_dict()
             summary["label_source_mode_counts"] = {str(key): int(value) for key, value in source_counts.items()}
+        if hazard_type == "flash_flood":
+            summary.update(_summarize_flash_flood_group_audit(filtered))
+            label_status_counts = summary.get("label_status_counts", {})
+            summary["supervision_quality"] = summarize_flash_flood_supervision_quality(
+                total_rows=int(summary["rows_after_label_filter"]),
+                positive_rows=int(summary.get("positive_labels", 0)),
+                negative_rows=int(summary.get("negative_labels", 0)),
+                uncertain_rows=int(label_status_counts.get("uncertain", 0)),
+                rows_with_matched_event_ids=int(summary.get("rows_with_matched_event_ids", 0)),
+                geometry_positive_rows=int(summary.get("label_source_mode_counts", {}).get("geometry_wkt", 0)),
+                outside_event_footprint_negative_rows=int(summary.get("label_source_mode_counts", {}).get("outside_event_footprint", 0)),
+                event_group_count=int(summary.get("event_group_count", 0)),
+                fallback_date_group_count=int(summary.get("fallback_date_group_count", 0)),
+                rows_using_fallback_date_groups=int(summary.get("rows_using_fallback_date_groups", 0)),
+            )
     return summary
 
 
@@ -548,6 +564,91 @@ def build_training_table_from_frame(table, hazard_type: str):
     return features, target
 
 
+def _flash_flood_split_groups(table):
+    _require_pandas()
+    if "date" not in table.columns:
+        return None
+    dates = table["date"].astype(str).fillna("")
+    event_ids = table["matched_event_ids"].astype(str).fillna("") if "matched_event_ids" in table.columns else None
+    if event_ids is None:
+        return dates.to_numpy(dtype=object)
+    groups = []
+    for date_value, event_value in zip(dates.tolist(), event_ids.tolist()):
+        event_text = event_value.strip()
+        if event_text:
+            groups.append(event_text)
+        else:
+            groups.append(f"date:{date_value}")
+    return np.asarray(groups, dtype=object)
+
+
+def _summarize_flash_flood_group_audit(table) -> dict[str, int]:
+    _require_pandas()
+    if "date" not in table.columns:
+        return {}
+    dates = table["date"].astype(str).fillna("")
+    if "matched_event_ids" in table.columns:
+        event_ids = table["matched_event_ids"].astype(str).fillna("")
+    else:
+        event_ids = pd.Series([""] * len(table), index=table.index, dtype=object)
+
+    event_group_keys: list[str] = []
+    fallback_date_keys: list[str] = []
+    multi_event_rows = 0
+    for date_value, event_value in zip(dates.tolist(), event_ids.tolist()):
+        event_text = event_value.strip()
+        if event_text and event_text.lower() != "nan":
+            event_group_keys.append(event_text)
+            if "," in event_text:
+                multi_event_rows += 1
+        else:
+            fallback_date_keys.append(f"date:{date_value}")
+
+    return {
+        "split_group_count": int(len(set(event_group_keys) | set(fallback_date_keys))),
+        "event_group_count": int(len(set(event_group_keys))),
+        "fallback_date_group_count": int(len(set(fallback_date_keys))),
+        "rows_with_matched_event_ids": int(len(event_group_keys)),
+        "rows_using_fallback_date_groups": int(len(fallback_date_keys)),
+        "rows_with_multi_event_groups": int(multi_event_rows),
+    }
+
+
+def build_training_payload_from_frame(table, hazard_type: str):
+    _require_pandas()
+    working = build_supervised_feature_frame(table.reset_index(drop=True).copy(), hazard_type)
+    filtered, labels, _ = explicit_target_payload(working, hazard_type)
+    if labels is not None:
+        working = filtered
+
+    frame = prepare_feature_frame(working, hazard_type=hazard_type)
+    names = list(feature_names_for_hazard(hazard_type))
+    features = frame.loc[:, names].to_numpy(dtype=np.float32)
+    required_names = list(required_feature_names_for_hazard(hazard_type))
+    required_indexes = [names.index(name) for name in required_names]
+    valid_mask = np.all(np.isfinite(features[:, required_indexes]), axis=1)
+    features = features[valid_mask]
+    if labels is not None:
+        target = labels.loc[frame.index].to_numpy(dtype=np.float32)[valid_mask]
+    else:
+        target = build_target_from_features(features, hazard_type)
+    if features.size == 0:
+        raise RuntimeError("No valid training features available after sanitization")
+
+    payload = {
+        "features": features,
+        "labels": target,
+        "feature_names": names,
+    }
+    if hazard_type == "flash_flood" and labels is not None:
+        grouped_rows = working.loc[frame.index].reset_index(drop=True)
+        split_groups = _flash_flood_split_groups(grouped_rows)
+        if split_groups is not None:
+            payload["split_groups"] = split_groups[valid_mask]
+            payload["split_group_audit"] = _summarize_flash_flood_group_audit(grouped_rows.loc[valid_mask].reset_index(drop=True))
+    return payload
+
+
 def display_path(path: Path) -> str:
     try:
         return str(path.relative_to(ROOT))
@@ -562,6 +663,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-format", choices=SOURCE_FORMATS, default="auto", help="Input format: daily ERA5-like NetCDF, daily indicator NetCDF, or daily indicator table.")
     parser.add_argument("--hazard-type", choices=HAZARD_TYPES, default="extreme_heat", help="Hazard-specific Layer-4 model to train.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for train/valid split and LightGBM.")
+    parser.add_argument("--validation-fraction", type=float, default=0.1, help="Validation split fraction for LightGBM.")
+    parser.add_argument("--num-boost-round", type=int, default=250, help="Maximum LightGBM boosting rounds.")
+    parser.add_argument("--early-stopping-rounds", type=int, default=20, help="Early stopping patience when validation is enabled.")
     return parser.parse_args()
 
 
@@ -599,23 +703,27 @@ def main() -> int:
 
     dataset, resolved_source_format = load_training_source(source, args.source_format)
     target_summary = None
+    training_payload = None
     if resolved_source_format in {"indicator-parquet", "indicator-csv", "indicator-json"}:
         target_summary = summarize_frame_training_targets(dataset, args.hazard_type)
-        features, target = build_training_table_from_frame(dataset, args.hazard_type)
+        training_payload = build_training_payload_from_frame(dataset, args.hazard_type)
+        features = training_payload["features"]
+        target = training_payload["labels"]
     else:
         features, target = build_training_table(dataset, args.hazard_type)
 
     adapter = LightGBMAdapter()
     training_summary = adapter.train(
-        {
+        training_payload
+        or {
             "features": features,
             "labels": target,
             "feature_names": list(feature_names_for_hazard(args.hazard_type)),
         },
-        validation_fraction=0.1,
+        validation_fraction=args.validation_fraction,
         seed=args.seed,
-        num_boost_round=250,
-        early_stopping_rounds=20,
+        num_boost_round=args.num_boost_round,
+        early_stopping_rounds=args.early_stopping_rounds,
     )
     model_filenames = {
         "extreme_heat": "extreme_heat.txt",
@@ -638,10 +746,19 @@ def main() -> int:
             "metric": training_summary["metric"],
             "validation_metric": training_summary["validation_metric"],
             "best_iteration": training_summary["best_iteration"],
+            "split_strategy": training_summary["split_strategy"],
         },
     }
     if target_summary is not None:
         summary["training_target"] = target_summary
+    if training_payload is not None and "split_group_audit" in training_payload:
+        split_group_audit = dict(training_payload["split_group_audit"])
+        summary["model"].update(split_group_audit)
+        if "training_target" in summary:
+            summary["training_target"]["training_split_group_audit"] = split_group_audit
+            supervision_quality = summary["training_target"].get("supervision_quality")
+            if isinstance(supervision_quality, dict):
+                summary["model"]["supervision_quality"] = dict(supervision_quality)
     (model_dir / "train_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

@@ -89,7 +89,11 @@ def standardize_flash_flood_event_records(
     """Normalize external event rows into the shared FlashFloodEvent contract."""
 
     events: list[FlashFloodEvent] = []
+    normalized_hazard_type = _normalize_slug(hazard_type)
     for index, record in enumerate(_records_from_input(records), start=1):
+        record_hazard_type = _normalize_slug(_coalesce(record, "hazard_type", default=hazard_type))
+        if record_hazard_type and record_hazard_type != normalized_hazard_type:
+            continue
         location_name = _coalesce(record, "location_name", "location", "city", "place_name")
         if not _normalize_text(location_name):
             raise ValueError(f"event record {index} is missing a location field")
@@ -104,7 +108,7 @@ def standardize_flash_flood_event_records(
         events.append(
             FlashFloodEvent(
                 event_id=event_id,
-                hazard_type=hazard_type,
+                hazard_type=normalized_hazard_type,
                 start_date=start_date,
                 end_date=end_date,
                 location_name=_normalize_text(location_name),
