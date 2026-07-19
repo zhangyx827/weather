@@ -1,6 +1,6 @@
 """Configuration defaults and loaders."""
 
-from .labeling import DustStormLabelMappingConfig, FlashFloodLabelMappingConfig
+from .labeling import DustStormLabelMappingConfig, ExtremeHeatLabelMappingConfig, FlashFloodLabelMappingConfig
 from .runtime import BriefingProviderSettings, LLMSettings, StrandsSettings
 
 __all__ = [
@@ -8,5 +8,6 @@ __all__ = [
     "LLMSettings",
     "StrandsSettings",
     "FlashFloodLabelMappingConfig",
+    "ExtremeHeatLabelMappingConfig",
     "DustStormLabelMappingConfig",
 ]

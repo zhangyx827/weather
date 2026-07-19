@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import zipfile
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -272,28 +272,6 @@ class TestBuildInputs:
         assert source_metadata["resolved_sources"]["precip_monthly"]["resolved_source"] == "chirps_monthly"
         assert source_metadata["validation_status"]["precip_monthly"] == "primary_only"
 
-    def test_build_aurora_input_uses_namespaced_variables(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            raw_root = _build_fake_raw_tree(Path(tmp))
-            builder = RawInputBuilder(
-                raw_root=raw_root,
-                aurora_out=Path(tmp) / "aurora",
-                indicator_nc_out=Path(tmp) / "nc",
-                indicator_parquet_out=Path(tmp) / "pq",
-            )
-            try:
-                ds = builder.build_aurora_input(datetime(2025, 1, 1, 6, tzinfo=timezone.utc))
-            finally:
-                builder.close()
-
-        assert "surf_2t" in ds.data_vars
-        assert "static_z" in ds.data_vars
-        assert "atmos_z" in ds.data_vars
-        assert "z" not in ds.data_vars
-        assert ds["surf_2t"].dims == ("time", "lat", "lon")
-        assert ds["atmos_q"].dims == ("time", "level", "lat", "lon")
-        assert list(ds["level"].values) == list(PRESSURE_LEVELS)
-
     def test_build_daily_indicators_uses_primary_sst_and_compares_secondary(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_root = _build_fake_raw_tree(
@@ -510,16 +488,3 @@ class TestBuildInputs:
                 builder.close()
 
             assert "pwat" in ds.data_vars
-            aurora = RawInputBuilder(
-                raw_root=raw_root,
-                aurora_out=Path(tmp) / "aurora",
-                indicator_nc_out=Path(tmp) / "nc",
-                indicator_parquet_out=Path(tmp) / "pq",
-                missing_pressure_dir=raw_root / "era5_pressure_levels_2025_missing",
-            )
-            try:
-                aurora_ds = aurora.build_aurora_input(datetime(2025, 1, 1, 6, tzinfo=timezone.utc))
-            finally:
-                aurora.close()
-
-            assert list(aurora_ds["level"].values) == list(PRESSURE_LEVELS)

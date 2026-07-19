@@ -75,12 +75,34 @@ def test_build_dust_storm_training_labels_can_disable_event_day_negatives():
     assert labeled.loc[0, "label_source_mode"] == "event_day_unresolved"
 
 
+def test_build_dust_storm_training_labels_handles_region_form_province_names():
+    samples = pd.DataFrame([{"date": "2024-03-12", "province_name": "Riyadh region"}])
+    events = pd.DataFrame(
+        [
+            {
+                "event_id": "dust_20240312_riyadh",
+                "hazard_type": "dust_storm",
+                "date": "2024-03-12",
+                "location_name": "Riyadh",
+                "validation_status": "verified",
+            }
+        ]
+    )
+
+    labeled = build_dust_storm_training_labels(samples, events)
+
+    assert labeled.loc[0, "label_status"] == "positive"
+    assert labeled.loc[0, "matched_event_ids"] == "dust_20240312_riyadh"
+    provenance = json.loads(labeled.loc[0, "label_provenance"])
+    assert provenance["sample_region_id"] == "riyadh"
+
+
 def test_build_dust_storm_training_labels_script_exports_csv(tmp_path: Path):
     module = _load_script_module()
     samples = pd.DataFrame(
         [
-            {"date": "2025-05-04", "province_name": "Qassim"},
-            {"date": "2025-05-06", "province_name": "Madinah"},
+            {"date": "2024-03-12", "province_name": "Riyadh"},
+            {"date": "2024-03-13", "province_name": "Madinah"},
         ]
     )
     sample_path = tmp_path / "samples.csv"

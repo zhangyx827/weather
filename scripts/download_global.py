@@ -8,7 +8,12 @@ import xarray as xr
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
-c = cdsapi.Client()
+# 调整底层连接池和重试参数，缩短断流后的等待时间
+c = cdsapi.Client(
+    timeout=60,       # 60秒无响应则超时
+    retry_max=10,     # 内部最大重试次数（不用默认的500次那么夸张）
+    sleep_max=30      # 失败后最多等待30秒就再次尝试，而不是120秒
+)
 
 # ========================================================
 # STCast 官方项目配置 (严格对齐 config/*.yaml)
@@ -22,8 +27,8 @@ PRESSURE_LEVELS = [
 ]
 
 # 目标存储文件夹
-single_dir = './era5_global_single_2015_6h'
-pressure_dir = './era5_global_pressure_2015_6h'
+single_dir = './era5_global_single_2019_6h'
+pressure_dir = './era5_global_pressure_2019_6h'
 
 os.makedirs(single_dir, exist_ok=True)
 os.makedirs(pressure_dir, exist_ok=True)
@@ -114,19 +119,19 @@ def safe_retrieve(dataset_name, request_params, output_path, max_retries=5):
 print(f"====== 开始下载地面数据集 (分辨率: {GRID_RESOLUTION}) ======")
 for month in range(1, 13):
     month_str = f"{month:02d}"
-    output_filename = os.path.join(single_dir, f"era5_global_single_2015_{month_str}.nc")
+    output_filename = os.path.join(single_dir, f"era5_global_single_2019_{month_str}.nc")
     
     if os.path.exists(output_filename):
         print(f"【跳过】地面数据已存在: {output_filename}")
         continue
         
-    print(f"\n>>>> 正在请求 2015年{month_str}月 全球地面变量...")
+    print(f"\n>>>> 正在请求 2019年{month_str}月 全球地面变量...")
     
     params = {
         'product_type': 'reanalysis',
         'data_format': 'netcdf', 
         'variable': SURFACE_VARS,
-        'year': '2015',
+        'year': '2019',
         'month': month_str,
         'day': [f"{d:02d}" for d in range(1, 32)],
         'time': HOURS_6H,
@@ -143,20 +148,20 @@ print(f"\n====== 开始下载高空数据集 (分辨率: {GRID_RESOLUTION}) ====
 for month in range(1, 13):
     month_str = f"{month:02d}"
     for var in ATMOS_VARS:
-        final_filename = os.path.join(pressure_dir, f"era5_global_pl_2015_{month_str}_{var}.nc")
+        final_filename = os.path.join(pressure_dir, f"era5_global_pl_2019_{month_str}_{var}.nc")
         
         # 如果最终文件已存在，跳过
         if os.path.exists(final_filename):
             print(f"【跳过】完整高空文件已存在: {month_str}月 【{var}】")
             continue
             
-        print(f"\n>>>> 正在下载 2015年{month_str}月 【{var}】完整月份...")
+        print(f"\n>>>> 正在下载 2019年{month_str}月 【{var}】完整月份...")
         params = {
             'product_type': 'reanalysis',
             'data_format': 'netcdf',
             'variable': [var],
             'pressure_level': PRESSURE_LEVELS,
-            'year': '2015',
+            'year': '2019',
             'month': month_str,
             'day': [f"{d:02d}" for d in range(1, 32)],   # 一次性请求全部日期
             'time': HOURS_6H,

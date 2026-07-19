@@ -83,6 +83,13 @@ LAYER4_FEATURE_SCHEMAS: dict[str, HazardFeatureSchema] = {
         ),
         evidence_only_features=("daily_precip_anomaly",),
     ),
+    "dust_storm": HazardFeatureSchema(
+        required_core_features=(
+            "dust_aod",
+            "dust_column_mass",
+            "dust_surface_mass",
+        ),
+    ),
 }
 
 LAYER4_FEATURE_NAMES = LAYER4_FEATURE_SCHEMAS[DEFAULT_HAZARD_TYPE].model_feature_names
@@ -110,6 +117,9 @@ _FRAME_ALIASES: dict[str, tuple[str, ...]] = {
     "tmax_anomaly_c": ("tmax_anomaly_c",),
     "heatwave_day_flag": ("heatwave_day_flag",),
     "heatwave_duration_days": ("heatwave_duration_days",),
+    "dust_aod": ("dust_aod", "DUEXTTAU"),
+    "dust_column_mass": ("dust_column_mass", "DUCMASS"),
+    "dust_surface_mass": ("dust_surface_mass", "DUSMASS"),
 }
 
 def feature_schema_for_hazard(hazard_type: str) -> HazardFeatureSchema:

@@ -21,7 +21,7 @@ from mazu_saudi.data.dust_storm_event_sources import (
 
 
 FORMATS = ("csv", "json", "parquet")
-DEFAULT_INPUT = ROOT / "data" / "raw" / "dust_storm_verified" / "user_leads_2025_dust_events.csv"
+DEFAULT_INPUT = ROOT / "data" / "raw" / "verified_dust_storm.csv"
 DEFAULT_OUTPUT = ROOT / "data" / "processed" / "real_dust_storm_chain" / "dust_storm_events_2025_verified.csv"
 DEFAULT_DAILY_OUTPUT = ROOT / "data" / "processed" / "real_dust_storm_chain" / "dust_storm_events_2025_verified_daily.csv"
 DEFAULT_SUMMARY_OUTPUT = ROOT / "data" / "processed" / "real_dust_storm_chain" / "dust_storm_events_2025_verified_summary.json"

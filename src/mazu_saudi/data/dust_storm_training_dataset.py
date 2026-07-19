@@ -1,4 +1,4 @@
-"""Join dust-storm Layer-4 feature tables with event-derived province-day labels."""
+"""Join dust-storm Layer-4 feature tables with event-derived labels."""
 
 from __future__ import annotations
 
@@ -15,20 +15,45 @@ except Exception:  # pragma: no cover - optional dependency
 _LOCATION_COLUMNS = ("region_id", "province_name", "admin1_name", "region_name", "location_name")
 
 
+def _require_pandas() -> None:
+    if pd is None:
+        raise RuntimeError("pandas is required for dust-storm supervised training dataset assembly")
+
+
 def _normalize_text(value: Any) -> str:
     if value is None:
+        return ""
+    if isinstance(value, float) and value != value:
         return ""
     return str(value).strip().lower()
 
 
+def _normalize_location_token(value: Any) -> str:
+    token = _normalize_text(value)
+    token = token.strip("\"'`")
+    token = token.replace("-", " ").replace("_", " ")
+    token = " ".join(token.split())
+    return token
+
+
 def _normalize_date(series: Any):
-    return pd.to_datetime(series, errors="coerce").dt.strftime("%Y-%m-%d")
+    parsed = pd.to_datetime(series, errors="coerce")
+    if parsed.isna().any():
+        raise ValueError("table contains invalid 'date' values")
+    return parsed.dt.strftime("%Y-%m-%d")
+
+
+def _normalize_hazard_type(series: Any):
+    return series.astype(str).str.strip().str.lower().str.replace(" ", "_", regex=False).str.replace("-", "_", regex=False)
 
 
 def _canonical_location(value: Any, config: DustStormLabelMappingConfig) -> str:
-    token = _normalize_text(value).replace("-", " ").replace("_", " ")
-    token = " ".join(token.split())
-    return config.location_aliases.get(token, token.replace(" ", "_"))
+    token = _normalize_location_token(value)
+    mapped = config.location_aliases.get(token)
+    if not mapped:
+        region_ids = config.location_to_region_ids.get(token)
+        mapped = region_ids[0] if region_ids else token.replace(" ", "_")
+    return mapped
 
 
 def _prepare_location_join_keys(table: Any, column: str, config: DustStormLabelMappingConfig) -> Any:
@@ -38,47 +63,63 @@ def _prepare_location_join_keys(table: Any, column: str, config: DustStormLabelM
     return normalized
 
 
+def _prepare_grid_join_keys(table: Any, *, coordinate_precision: int) -> Any:
+    normalized = table.copy()
+    normalized["date"] = _normalize_date(normalized["date"])
+    normalized["latitude"] = pd.to_numeric(normalized["latitude"], errors="coerce").round(coordinate_precision)
+    normalized["longitude"] = pd.to_numeric(normalized["longitude"], errors="coerce").round(coordinate_precision)
+    return normalized
+
+
 def build_dust_storm_supervised_training_dataset(
     feature_table: Any,
     label_table: Any,
     *,
     config: DustStormLabelMappingConfig | None = None,
     drop_uncertain: bool = True,
+    coordinate_precision: int = 4,
 ):
-    """Join dust-storm features with labels using a shared region-day or province-day key."""
+    """Join dust-storm features with labels using a shared grid-day or region-day key."""
 
-    if pd is None:
-        raise RuntimeError("pandas is required for dust-storm supervised training dataset assembly")
+    _require_pandas()
     if not isinstance(feature_table, pd.DataFrame):
         raise TypeError(f"Expected pandas.DataFrame for feature_table, got {type(feature_table)!r}")
     if not isinstance(label_table, pd.DataFrame):
         raise TypeError(f"Expected pandas.DataFrame for label_table, got {type(label_table)!r}")
-    for name, table in (("feature_table", feature_table), ("label_table", label_table)):
-        if "date" not in table.columns:
-            raise KeyError(f"{name} requires a 'date' column")
+    if "date" not in feature_table.columns:
+        raise KeyError("feature_table requires a 'date' column")
+    if "date" not in label_table.columns:
+        raise KeyError("label_table requires a 'date' column")
 
     active_config = config or DustStormLabelMappingConfig()
     feature_frame = feature_table.reset_index(drop=True).copy()
     label_frame = label_table.reset_index(drop=True).copy()
 
     if "hazard_type" in feature_frame.columns:
-        feature_frame = feature_frame[feature_frame["hazard_type"].astype(str).str.lower() == "dust_storm"].copy()
+        feature_frame = feature_frame[_normalize_hazard_type(feature_frame["hazard_type"]) == "dust_storm"].copy()
     if "hazard_type" in label_frame.columns:
-        label_frame = label_frame[label_frame["hazard_type"].astype(str).str.lower() == "dust_storm"].copy()
+        label_frame = label_frame[_normalize_hazard_type(label_frame["hazard_type"]) == "dust_storm"].copy()
     if feature_frame.empty:
         raise ValueError("feature_table has no dust_storm rows to join")
     if label_frame.empty:
         raise ValueError("label_table has no dust_storm rows to join")
 
-    shared_location_columns = [column for column in _LOCATION_COLUMNS if column in feature_frame.columns and column in label_frame.columns]
-    if not shared_location_columns:
-        raise KeyError(f"dust-storm supervised join requires one shared location column from {_LOCATION_COLUMNS}")
-
-    location_column = shared_location_columns[0]
-    left = _prepare_location_join_keys(feature_frame, location_column, active_config)
-    right = _prepare_location_join_keys(label_frame, location_column, active_config)
-    join_columns = ["date", "_dust_location_join_key"]
-    join_mode = f"region_day:{location_column}"
+    feature_has_grid = {"latitude", "longitude"}.issubset(feature_frame.columns)
+    label_has_grid = {"latitude", "longitude"}.issubset(label_frame.columns)
+    if feature_has_grid and label_has_grid:
+        left = _prepare_grid_join_keys(feature_frame, coordinate_precision=coordinate_precision)
+        right = _prepare_grid_join_keys(label_frame, coordinate_precision=coordinate_precision)
+        join_columns = ["date", "latitude", "longitude"]
+        join_mode = "grid_day"
+    else:
+        shared_location_columns = [column for column in _LOCATION_COLUMNS if column in feature_frame.columns and column in label_frame.columns]
+        if not shared_location_columns:
+            raise KeyError(f"dust-storm supervised join requires one shared location column from {_LOCATION_COLUMNS}")
+        location_column = shared_location_columns[0]
+        left = _prepare_location_join_keys(feature_frame, location_column, active_config)
+        right = _prepare_location_join_keys(label_frame, location_column, active_config)
+        join_columns = ["date", "_dust_location_join_key"]
+        join_mode = f"region_day:{location_column}"
 
     label_columns = ["label", "label_status", "label_source_mode", "matched_event_ids", "label_provenance"]
     missing_label_columns = [name for name in label_columns if name not in right.columns]
@@ -92,7 +133,7 @@ def build_dust_storm_supervised_training_dataset(
     merged["training_join_key"] = merged[join_columns].astype(str).agg("|".join, axis=1)
     merged["is_labeled"] = merged["label"].notna()
 
-    if drop_uncertain:
+    if drop_uncertain and "label_status" in merged.columns:
         merged = merged[merged["label_status"].isin(("positive", "negative"))].copy()
         merged["is_labeled"] = True
 

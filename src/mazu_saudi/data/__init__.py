@@ -50,8 +50,10 @@ from .dust_storm_event_sources import (
     expand_dust_storm_events_to_daily_table,
     standardize_dust_storm_event_records,
 )
+from .dust_storm_province_features import build_dust_storm_province_day_feature_table
 from .dust_storm_mapping import build_dust_storm_training_labels
 from .dust_storm_training_dataset import build_dust_storm_supervised_training_dataset
+from .extreme_heat_training_dataset import build_extreme_heat_supervised_training_dataset
 from .flash_flood_mapping import build_flash_flood_training_labels
 from .flash_flood_province_features import (
     aggregate_flash_flood_features_to_province_day,
@@ -113,8 +115,10 @@ __all__ = [
     "expand_dust_storm_events_to_daily_records",
     "expand_dust_storm_events_to_daily_table",
     "standardize_dust_storm_event_records",
+    "build_dust_storm_province_day_feature_table",
     "build_dust_storm_training_labels",
     "build_dust_storm_supervised_training_dataset",
+    "build_extreme_heat_supervised_training_dataset",
     "build_flash_flood_training_labels",
     "enrich_flash_flood_features_with_province",
     "aggregate_flash_flood_features_to_province_day",

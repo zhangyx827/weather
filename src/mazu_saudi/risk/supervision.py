@@ -61,6 +61,19 @@ LAYER4_SUPERVISION_SPECS: dict[str, HazardSupervisionSpec] = {
         ),
         explicit_filter_columns=("label_status",),
     ),
+    "dust_storm": HazardSupervisionSpec(
+        hazard_type="dust_storm",
+        default_sample_unit="region_day",
+        explicit_target_columns=("label",),
+        explicit_metadata_columns=(
+            "date",
+            "region_id",
+            "label_source_mode",
+            "matched_event_ids",
+            "label_provenance",
+        ),
+        explicit_filter_columns=("label_status",),
+    ),
 }
 
 
@@ -87,6 +100,11 @@ def find_explicit_target_column(table, hazard_type: str) -> str | None:
 def infer_sample_unit(table, hazard_type: str) -> str:
     spec = supervision_spec_for_hazard(hazard_type)
     columns = set(table.columns)
+    if "sample_unit" in columns:
+        sample_unit_series = table["sample_unit"].dropna().astype(str).map(str.strip)
+        sample_unit_series = sample_unit_series[sample_unit_series.ne("")]
+        if not sample_unit_series.empty:
+            return str(sample_unit_series.iloc[0])
     if hazard_type == "flash_flood":
         if {"date", "latitude", "longitude"}.issubset(columns):
             return "grid-day"
@@ -95,7 +113,11 @@ def infer_sample_unit(table, hazard_type: str) -> str:
         return spec.default_sample_unit
     if hazard_type == "extreme_heat":
         if {"date", "region_id"}.issubset(columns):
-            return "impact-region-day"
+            return "region_day"
+        return spec.default_sample_unit
+    if hazard_type == "dust_storm":
+        if {"date", "region_id"}.issubset(columns):
+            return "region_day"
         return spec.default_sample_unit
     if hazard_type == "dry_heat_agriculture":
         if {"region_id", "year", "season"}.issubset(columns):

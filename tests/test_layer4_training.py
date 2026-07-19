@@ -16,9 +16,12 @@ import xarray as xr
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "examples" / "train_layer4_lightgbm.py"
 BUILD_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_layer4_training_table.py"
+BUILD_FLASH_FLOOD_LABELS_SCRIPT_PATH = ROOT / "scripts" / "build_flash_flood_training_labels.py"
 BUILD_SUPERVISED_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_flash_flood_supervised_training_table.py"
 BUILD_DRY_HEAT_SUPERVISED_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_dry_heat_agriculture_supervised_training_table.py"
 BUILD_DUST_STORM_SUPERVISED_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_dust_storm_supervised_training_table.py"
+BUILD_EXTREME_HEAT_SUPERVISED_TABLE_SCRIPT_PATH = ROOT / "scripts" / "build_extreme_heat_supervised_training_table.py"
+COMPARE_EXTREME_HEAT_SUPERVISION_VARIANTS_SCRIPT_PATH = ROOT / "scripts" / "compare_extreme_heat_supervision_variants.py"
 DEMO_SUPERVISED_SCRIPT_PATH = ROOT / "examples" / "demo_flash_flood_supervised_training.py"
 
 
@@ -33,6 +36,15 @@ def _load_training_module():
 
 def _load_build_table_module():
     spec = importlib.util.spec_from_file_location("build_layer4_training_table", BUILD_TABLE_SCRIPT_PATH)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_build_flash_flood_labels_module():
+    spec = importlib.util.spec_from_file_location("build_flash_flood_training_labels", BUILD_FLASH_FLOOD_LABELS_SCRIPT_PATH)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -65,6 +77,30 @@ def _load_build_dust_storm_supervised_table_module():
     spec = importlib.util.spec_from_file_location(
         "build_dust_storm_supervised_training_table",
         BUILD_DUST_STORM_SUPERVISED_TABLE_SCRIPT_PATH,
+    )
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_build_extreme_heat_supervised_table_module():
+    spec = importlib.util.spec_from_file_location(
+        "build_extreme_heat_supervised_training_table",
+        BUILD_EXTREME_HEAT_SUPERVISED_TABLE_SCRIPT_PATH,
+    )
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_compare_extreme_heat_supervision_variants_module():
+    spec = importlib.util.spec_from_file_location(
+        "compare_extreme_heat_supervision_variants",
+        COMPARE_EXTREME_HEAT_SUPERVISION_VARIANTS_SCRIPT_PATH,
     )
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
@@ -204,6 +240,54 @@ def _indicator_dataset() -> xr.Dataset:
             "wind_shear_850_200": (("time", "latitude", "longitude"), (18.0 + base)[None, :, :]),
             "flash_flood_risk": (("time", "latitude", "longitude"), np.where(base > 4, 2, 1)[None, :, :]),
             "daily_precip_anomaly": (("time", "latitude", "longitude"), (base - 2.0)[None, :, :]),
+        },
+        coords={"time": time, "latitude": lat, "longitude": lon},
+    )
+
+
+def _extreme_heat_indicator_dataset(date: str, *, heat_index_offset: float) -> xr.Dataset:
+    lat = np.array([21.5, 21.6], dtype=np.float32)
+    lon = np.array([39.1, 39.2], dtype=np.float32)
+    time = np.array([date], dtype="datetime64[ns]")
+    base = np.arange(lat.size * lon.size, dtype=np.float32).reshape(lat.size, lon.size)
+    return xr.Dataset(
+        data_vars={
+            "t2m_c": (("time", "latitude", "longitude"), (40.0 + base)[None, :, :]),
+            "tmax_c": (("time", "latitude", "longitude"), (44.0 + base)[None, :, :]),
+            "tmin_c": (("time", "latitude", "longitude"), (31.0 + base * 0.2)[None, :, :]),
+            "vpd_kpa": (("time", "latitude", "longitude"), (1.7 + base * 0.1)[None, :, :]),
+            "heat_index_c": (("time", "latitude", "longitude"), (43.0 + heat_index_offset + base)[None, :, :]),
+            "wind10_speed": (("time", "latitude", "longitude"), (2.5 + base * 0.2)[None, :, :]),
+            "rh2m": (("time", "latitude", "longitude"), (38.0 + base)[None, :, :]),
+            "sst_celsius": (("time", "latitude", "longitude"), (29.0 + base * 0.05)[None, :, :]),
+            "t2m_anomaly_c": (("time", "latitude", "longitude"), (base * 0.1)[None, :, :]),
+            "tmax_anomaly_c": (("time", "latitude", "longitude"), (base * 0.15)[None, :, :]),
+            "heatwave_day_flag": (("time", "latitude", "longitude"), np.where(base > 1, 1, 0)[None, :, :]),
+            "heatwave_duration_days": (("time", "latitude", "longitude"), (1 + base)[None, :, :]),
+        },
+        coords={"time": time, "latitude": lat, "longitude": lon},
+    )
+
+
+def _extreme_heat_multi_region_indicator_dataset(date: str, *, heat_index_offset: float) -> xr.Dataset:
+    lat = np.array([21.5, 24.7], dtype=np.float32)
+    lon = np.array([39.2, 46.7], dtype=np.float32)
+    time = np.array([date], dtype="datetime64[ns]")
+    base = np.arange(lat.size * lon.size, dtype=np.float32).reshape(lat.size, lon.size)
+    return xr.Dataset(
+        data_vars={
+            "t2m_c": (("time", "latitude", "longitude"), (39.0 + base)[None, :, :]),
+            "tmax_c": (("time", "latitude", "longitude"), (44.0 + base)[None, :, :]),
+            "tmin_c": (("time", "latitude", "longitude"), (30.0 + base * 0.2)[None, :, :]),
+            "vpd_kpa": (("time", "latitude", "longitude"), (1.6 + base * 0.1)[None, :, :]),
+            "heat_index_c": (("time", "latitude", "longitude"), (42.0 + heat_index_offset + base)[None, :, :]),
+            "wind10_speed": (("time", "latitude", "longitude"), (2.0 + base * 0.2)[None, :, :]),
+            "rh2m": (("time", "latitude", "longitude"), (36.0 + base)[None, :, :]),
+            "sst_celsius": (("time", "latitude", "longitude"), (29.0 + base * 0.05)[None, :, :]),
+            "t2m_anomaly_c": (("time", "latitude", "longitude"), (base * 0.08)[None, :, :]),
+            "tmax_anomaly_c": (("time", "latitude", "longitude"), (base * 0.1)[None, :, :]),
+            "heatwave_day_flag": (("time", "latitude", "longitude"), np.where(base >= 1, 1, 0)[None, :, :]),
+            "heatwave_duration_days": (("time", "latitude", "longitude"), (1 + base)[None, :, :]),
         },
         coords={"time": time, "latitude": lat, "longitude": lon},
     )
@@ -854,6 +938,280 @@ def test_build_dry_heat_agriculture_supervised_training_table_script_exports_csv
     assert set(["region_id", "year", "yield_anomaly", "temp_c_mean", "training_join_key"]).issubset(merged.columns)
 
 
+def test_build_extreme_heat_supervised_training_table_script_exports_csv(tmp_path: Path):
+    module = _load_build_extreme_heat_supervised_table_module()
+    input_dir = tmp_path / "indicators"
+    input_dir.mkdir()
+
+    positive_date = "2024-06-14"
+    negative_date = "2024-06-15"
+    positive_ds = _extreme_heat_indicator_dataset(positive_date, heat_index_offset=6.0)
+    negative_ds = _extreme_heat_indicator_dataset(negative_date, heat_index_offset=-2.0)
+    positive_path = input_dir / "saudi_indicators_20240614.nc"
+    negative_path = input_dir / "saudi_indicators_20240615.nc"
+    positive_ds.to_netcdf(positive_path)
+    negative_ds.to_netcdf(negative_path)
+
+    labels = pd.DataFrame(
+        [
+            {
+                "record_id": "Mecca_20240614",
+                "event_id": "SA-HEAT-2024-001",
+                "hazard_type": "Extreme Heat",
+                "start_date": positive_date,
+                "end_date": positive_date,
+                "location_name": "Mecca",
+                "country_code": "SA",
+                "validation_status": "verified",
+                "label_status": "Labeled",
+                "impact_level": "High temperature",
+                "impact_count": "51.8°C",
+                "label": "Maximum temperature in Mecca reached 51.8°C.",
+            }
+        ]
+    )
+    label_path = tmp_path / "verified_extreme_heat.csv"
+    labels.to_csv(label_path, index=False)
+
+    output_path = tmp_path / "extreme_heat_supervised.csv"
+    assert (
+        module.main(
+            [
+                "--input",
+                str(input_dir),
+                "--labels",
+                str(label_path),
+                "--output",
+                str(output_path),
+                "--format",
+                "csv",
+                "--sample-unit",
+                "single_point_day",
+                "--negative-sample-size",
+                "1",
+                "--seed",
+                "7",
+            ]
+        )
+        == 0
+    )
+
+    merged = pd.read_csv(output_path)
+    summary = json.loads(output_path.with_suffix(".summary.json").read_text(encoding="utf-8"))
+    assert merged["label"].tolist() == [1.0, 0.0]
+    assert merged["label_status"].tolist() == ["positive", "negative"]
+    assert merged["hazard_type"].tolist() == ["extreme_heat", "extreme_heat"]
+    assert {"temp_c", "tmax_c", "tmin_c", "heat_index_c", "vpd_kpa", "wind_speed_mps", "relative_humidity_percent"}.issubset(merged.columns)
+    assert summary["positive_rows"] == 1
+    assert summary["negative_rows"] == 1
+
+
+def test_build_extreme_heat_region_day_supervised_training_table_exports_region_rows(tmp_path: Path):
+    module = _load_build_extreme_heat_supervised_table_module()
+    input_dir = tmp_path / "indicators"
+    input_dir.mkdir()
+
+    positive_date = "2024-06-14"
+    negative_date = "2024-06-15"
+    _extreme_heat_multi_region_indicator_dataset(positive_date, heat_index_offset=4.0).to_netcdf(
+        input_dir / "saudi_indicators_20240614.nc"
+    )
+    _extreme_heat_multi_region_indicator_dataset(negative_date, heat_index_offset=-2.0).to_netcdf(
+        input_dir / "saudi_indicators_20240615.nc"
+    )
+
+    labels = pd.DataFrame(
+        [
+            {
+                "record_id": "Mecca_20240614",
+                "event_id": "SA-HEAT-2024-001",
+                "hazard_type": "Extreme Heat",
+                "start_date": positive_date,
+                "end_date": positive_date,
+                "location_name": "Mecca",
+                "country_code": "SA",
+                "validation_status": "verified",
+                "label_status": "Labeled",
+                "impact_level": "High temperature",
+                "impact_count": "51.8°C",
+                "label": "Maximum temperature in Mecca reached 51.8°C.",
+            }
+        ]
+    )
+    label_path = tmp_path / "verified_extreme_heat.csv"
+    labels.to_csv(label_path, index=False)
+
+    output_path = tmp_path / "extreme_heat_region_day.csv"
+    assert (
+        module.main(
+            [
+                "--input",
+                str(input_dir),
+                "--labels",
+                str(label_path),
+                "--output",
+                str(output_path),
+                "--format",
+                "csv",
+                "--sample-unit",
+                "region_day",
+                "--top-k",
+                "2",
+                "--negative-sample-size",
+                "2",
+                "--seed",
+                "11",
+            ]
+        )
+        == 0
+    )
+
+    merged = pd.read_csv(output_path)
+    summary = json.loads(output_path.with_suffix(".summary.json").read_text(encoding="utf-8"))
+    assert "region_id" in merged.columns
+    assert "training_join_key" in merged.columns
+    assert summary["sample_unit"] == "region_day"
+    assert "makkah" in set(merged["region_id"])
+    assert merged.loc[merged["region_id"] == "makkah", "label_status"].iloc[0] == "positive"
+    assert "outside_event_region" in set(merged["label_source_mode"])
+    assert {"grid_cell_count", "pooled_grid_cell_count", "heat_index_c_max", "heat_index_c_p90"}.issubset(merged.columns)
+
+
+def test_extreme_heat_location_resolution_is_conservative():
+    from mazu_saudi.config import ExtremeHeatLabelMappingConfig
+    from mazu_saudi.data.extreme_heat_training_dataset import _resolved_region_ids
+
+    config = ExtremeHeatLabelMappingConfig.from_env()
+    assert config.location_to_region_ids["mecca and hajj sites"] == ("makkah",)
+    assert config.location_to_region_ids["eastern province and riyadh"] == ("eastern_province", "riyadh")
+    assert _resolved_region_ids("Al-Qaisumah") == ["eastern_province"]
+    assert _resolved_region_ids("Mecca and Hajj sites") == ["makkah"]
+    assert _resolved_region_ids("Eastern Province and Riyadh") == ["eastern_province", "riyadh"]
+    assert _resolved_region_ids("Al-Ahsa, Al-Kharj") == ["eastern_province", "riyadh"]
+    assert _resolved_region_ids("Multiple cities") == ["saudi_arabia"]
+
+
+def test_summarize_frame_training_targets_reports_extreme_heat_region_day_sample_unit():
+    module = _load_training_module()
+    frame = pd.DataFrame(
+        [
+            {
+                "date": "2024-06-14",
+                "region_id": "makkah",
+                "sample_unit": "region_day",
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "region_day_overlap",
+                "matched_event_ids": "SA-HEAT-2024-001",
+                "temp_c": 41.0,
+                "tmax_c": 45.0,
+                "heat_index_c": 49.0,
+                "vpd_kpa": 2.2,
+                "wind_speed_mps": 3.5,
+                "relative_humidity_percent": 34.0,
+            },
+            {
+                "date": "2024-06-15",
+                "region_id": "makkah",
+                "sample_unit": "region_day",
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "outside_event_region",
+                "matched_event_ids": "",
+                "temp_c": 38.0,
+                "tmax_c": 42.0,
+                "heat_index_c": 44.0,
+                "vpd_kpa": 1.8,
+                "wind_speed_mps": 3.0,
+                "relative_humidity_percent": 36.0,
+            },
+        ]
+    )
+
+    summary = module.summarize_frame_training_targets(frame, "extreme_heat")
+
+    assert summary["target_source"] == "explicit_label"
+    assert summary["sample_unit"] == "region_day"
+    assert summary["target_column"] == "label"
+
+
+def test_compare_extreme_heat_supervision_variants_script_exports_json(tmp_path: Path):
+    module = _load_compare_extreme_heat_supervision_variants_module()
+    input_dir = tmp_path / "indicators"
+    input_dir.mkdir()
+
+    dates = [
+        "2024-06-01",
+        "2024-06-02",
+        "2024-06-03",
+        "2024-06-04",
+        "2024-06-05",
+        "2024-06-06",
+        "2024-06-07",
+        "2024-06-08",
+        "2024-06-09",
+        "2024-06-10",
+        "2024-06-11",
+        "2024-06-12",
+        "2024-06-13",
+        "2024-06-14",
+    ]
+    positive_dates = {"2024-06-01", "2024-06-03", "2024-06-05", "2024-06-07", "2024-06-09", "2024-06-11"}
+    for index, date in enumerate(dates):
+        ds = _extreme_heat_indicator_dataset(date, heat_index_offset=6.0 if date in positive_dates else -2.0)
+        ds.to_netcdf(input_dir / f"saudi_indicators_{date.replace('-', '')}.nc")
+
+    label_rows = [
+        {
+            "record_id": f"Mecca_{date.replace('-', '')}",
+            "event_id": f"SA-HEAT-{index:03d}",
+            "hazard_type": "Extreme Heat",
+            "start_date": date,
+            "end_date": date,
+            "location_name": "Mecca",
+            "country_code": "SA",
+            "validation_status": "verified",
+            "label_status": "Labeled",
+            "impact_level": "High temperature",
+            "impact_count": "51.8°C",
+            "label": f"Maximum temperature in Mecca reached 51.8°C on {date}.",
+        }
+        for index, date in enumerate(sorted(positive_dates), start=1)
+    ]
+    label_path = tmp_path / "verified_extreme_heat.csv"
+    pd.DataFrame(label_rows).to_csv(label_path, index=False)
+
+    output_path = tmp_path / "comparison.json"
+    assert (
+        module.main(
+            [
+                "--input",
+                str(input_dir),
+                "--labels",
+                str(label_path),
+                "--output",
+                str(output_path),
+                "--num-boost-round",
+                "15",
+                "--early-stopping-rounds",
+                "5",
+            ]
+        )
+        == 0
+    )
+
+    comparison = json.loads(output_path.read_text(encoding="utf-8"))
+    assert comparison["selection"]["selected_positive_dates"] == len(positive_dates)
+    assert comparison["selection"]["selected_negative_dates"] == len(dates) - len(positive_dates)
+    assert comparison["selection"]["sample_unit"] == "region_day"
+    assert comparison["selection"]["top_k_values"] == [1, 3]
+    assert len(comparison["variants"]) == 12
+    assert comparison["best_variant"] in {variant["name"] for variant in comparison["variants"]}
+    assert all("validation_metric" in variant for variant in comparison["variants"])
+    assert all(variant["top_k"] in {1, 3} for variant in comparison["variants"])
+    assert all(variant["name"].startswith("region_day_") for variant in comparison["variants"])
+
+
 def test_build_flash_flood_supervised_training_table_script_exports_csv(tmp_path: Path):
     module = _load_build_supervised_table_module()
     features = pd.DataFrame(
@@ -1081,6 +1439,45 @@ def test_indicator_csv_training_summary_loads_source_label_audit_from_sidecar():
         assert summary["training_target"]["source_label_audit"]["input_event_day_unresolved_rows"] == 1
 
 
+def test_indicator_csv_training_summary_derives_source_audit_without_sidecar():
+    module = _load_training_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        source = _indicator_frame(rows=8)
+        source["hazard_type"] = "flash_flood"
+        source["label"] = np.where(np.arange(len(source)) == 0, 1.0, 0.0)
+        source["label_status"] = np.where(np.arange(len(source)) == 0, "positive", "negative")
+        source["label_source_mode"] = np.where(np.arange(len(source)) == 0, "point_buffer", "no_event_day")
+        source["matched_event_ids"] = np.where(np.arange(len(source)) == 0, "ff_event_a", "")
+        source["label_provenance"] = "{}"
+
+        source_path = tmp_path / "source.csv"
+        model_dir = tmp_path / "models"
+        source.to_csv(source_path, index=False)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "train_layer4_lightgbm.py",
+            "--source",
+            str(source_path),
+            "--source-format",
+            "indicator-csv",
+            "--model-dir",
+            str(model_dir),
+            "--hazard-type",
+            "flash_flood",
+        ]
+        try:
+            assert module.main() == 0
+        finally:
+            sys.argv = old_argv
+
+        summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
+        assert summary["training_target"]["source_label_audit"]["input_rows"] == 8
+        assert summary["training_target"]["source_label_audit"]["input_event_day_unresolved_rows"] == 0
+        assert summary["training_target"]["source_supervision_quality"]["status"] in {"warning", "ok"}
+
+
 def test_build_flash_flood_supervised_training_table_uses_geometry_provenance_for_quality_audit(tmp_path: Path):
     module = _load_build_supervised_table_module()
     features = pd.DataFrame(
@@ -1138,6 +1535,23 @@ def test_build_flash_flood_supervised_training_table_uses_geometry_provenance_fo
     assert "no_geometry_backed_positives" not in summary["supervision_quality"]["warnings"]
     assert summary["supervision_quality"]["geometry_positive_fraction_of_positives"] == 1.0
     assert summary["geometry_positive_source_counts"] == {"derived_point_buffer": 1}
+
+
+def test_build_flash_flood_training_labels_script_writes_summary_sidecar(tmp_path: Path):
+    module = _load_build_flash_flood_labels_module()
+    samples = _indicator_frame(rows=3)
+    sample_path = tmp_path / "samples.csv"
+    output_path = tmp_path / "labels.csv"
+    samples.to_csv(sample_path, index=False)
+
+    result = module.main(["--samples", str(sample_path), "--output", str(output_path)])
+    assert result == 0
+
+    summary_path = output_path.with_suffix(".summary.json")
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["rows"] == 3
+    assert summary["supervision_quality"]["status"] == "insufficient"
 
 
 def test_build_flash_flood_supervised_training_table_rejects_missing_positive_labels(tmp_path: Path):
@@ -1318,6 +1732,200 @@ def test_build_dust_storm_supervised_training_table_script_exports_csv(tmp_path:
     assert merged["label_status"].tolist() == ["positive", "negative", "negative"]
     assert merged["training_join_mode"].nunique() == 1
     assert merged["training_join_mode"].iloc[0] == "region_day:province_name"
+
+
+def test_build_dust_storm_supervised_training_table_script_builds_features_from_processed_indicators(tmp_path: Path):
+    import scripts.build_dust_storm_supervised_training_table as dust_script
+
+    input_dir = tmp_path / "lightgbm_indicators_nc"
+    input_dir.mkdir()
+    valid_path = input_dir / "saudi_indicators_20250504.nc"
+    output_path = tmp_path / "merged.csv"
+
+    ds = xr.Dataset(
+        {
+            "dust_aod": (("time", "latitude", "longitude"), np.array([[[0.1]]], dtype=np.float32)),
+            "dust_column_mass": (("time", "latitude", "longitude"), np.array([[[0.2]]], dtype=np.float32)),
+            "dust_surface_mass": (("time", "latitude", "longitude"), np.array([[[0.3]]], dtype=np.float32)),
+        },
+        coords={
+            "time": np.array(["2025-05-04"], dtype="datetime64[ns]"),
+            "latitude": np.array([24.71]),
+            "longitude": np.array([46.67]),
+        },
+    )
+    ds.to_netcdf(valid_path)
+
+    labels = pd.DataFrame(
+        [
+            {
+                "date": "2025-05-04",
+                "hazard_type": "dust_storm",
+                "province_name": "riyadh",
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "region_day_text",
+                "matched_event_ids": "dust_20250504_riyadh",
+                "label_provenance": "{}",
+            }
+        ]
+    )
+    label_path = tmp_path / "labels.csv"
+    labels.to_csv(label_path, index=False)
+
+    captured: dict[str, object] = {}
+
+    original_build_features = dust_script.build_dust_storm_province_day_feature_table
+
+    def _fake_build(feature_paths, **kwargs):
+        captured["feature_paths"] = [Path(path).name for path in feature_paths]
+        captured["kwargs"] = kwargs
+        return pd.DataFrame(
+            [
+                {
+                    "date": "2025-05-04",
+                    "hazard_type": "dust_storm",
+                    "province_name": "riyadh",
+                    "region_id": "riyadh",
+                    "dust_aod": 0.1,
+                }
+            ]
+        )
+
+    dust_script.build_dust_storm_province_day_feature_table = _fake_build
+    try:
+        assert dust_script.main(["--input", str(input_dir), "--labels", str(label_path), "--output", str(output_path)]) == 0
+    finally:
+        dust_script.build_dust_storm_province_day_feature_table = original_build_features
+
+    assert captured["feature_paths"] == ["saudi_indicators_20250504.nc"]
+    assert captured["kwargs"]["boundary_path"] == dust_script.parse_args(["--labels", str(label_path)]).boundary_path
+    assert output_path.exists()
+
+
+def test_build_dust_storm_province_day_feature_table_script_skips_invalid_inputs(tmp_path: Path):
+    import scripts.build_dust_storm_province_day_feature_table as dust_script
+
+    input_dir = tmp_path / "dust"
+    input_dir.mkdir()
+    valid_path = input_dir / "MERRA2_20250504.nc4"
+    invalid_path = input_dir / "MERRA2_20250505.nc4"
+    output_path = tmp_path / "province_day.csv"
+
+    ds = xr.Dataset(
+        {
+            "DUEXTTAU": (("lat", "lon"), np.array([[0.1]])),
+            "DUCMASS": (("lat", "lon"), np.array([[0.2]])),
+            "DUSMASS": (("lat", "lon"), np.array([[0.3]])),
+        },
+        coords={"lat": np.array([24.71]), "lon": np.array([46.67])},
+    )
+    ds.to_netcdf(valid_path)
+    invalid_path.write_bytes(b"%PDF-1.7\nfake pdf payload\n")
+
+    captured: dict[str, object] = {}
+
+    def _fake_build(feature_paths, **kwargs):
+        captured["feature_paths"] = [Path(path).name for path in feature_paths]
+        return pd.DataFrame([{"date": "2025-05-04", "province_name": "riyadh", "region_id": "riyadh"}])
+
+    original = dust_script.build_dust_storm_province_day_feature_table
+    dust_script.build_dust_storm_province_day_feature_table = _fake_build
+    try:
+        assert (
+            dust_script.main(
+                [
+                    "--input",
+                    str(input_dir),
+                    "--output",
+                    str(output_path),
+                    "--glob",
+                    "MERRA2_*.nc4",
+                ]
+            )
+            == 0
+        )
+    finally:
+        dust_script.build_dust_storm_province_day_feature_table = original
+
+
+def test_build_dust_storm_province_day_feature_table_script_defaults_to_processed_indicators(tmp_path: Path):
+    import scripts.build_dust_storm_province_day_feature_table as dust_script
+
+    input_dir = tmp_path / "lightgbm_indicators_nc"
+    input_dir.mkdir()
+    valid_path = input_dir / "saudi_indicators_20250504.nc"
+    output_path = tmp_path / "province_day.csv"
+
+    ds = xr.Dataset(
+        {
+            "dust_aod": (("time", "latitude", "longitude"), np.array([[[0.1]]], dtype=np.float32)),
+            "dust_column_mass": (("time", "latitude", "longitude"), np.array([[[0.2]]], dtype=np.float32)),
+            "dust_surface_mass": (("time", "latitude", "longitude"), np.array([[[0.3]]], dtype=np.float32)),
+        },
+        coords={
+            "time": np.array(["2025-05-04"], dtype="datetime64[ns]"),
+            "latitude": np.array([24.71]),
+            "longitude": np.array([46.67]),
+        },
+    )
+    ds.to_netcdf(valid_path)
+
+    captured: dict[str, object] = {}
+
+    def _fake_build(feature_paths, **kwargs):
+        captured["feature_paths"] = [Path(path).name for path in feature_paths]
+        return pd.DataFrame([{"date": "2025-05-04", "province_name": "riyadh", "region_id": "riyadh"}])
+
+    original = dust_script.build_dust_storm_province_day_feature_table
+    dust_script.build_dust_storm_province_day_feature_table = _fake_build
+    try:
+        assert dust_script.main(["--output", str(output_path), "--input", str(input_dir)]) == 0
+    finally:
+        dust_script.build_dust_storm_province_day_feature_table = original
+
+    assert captured["feature_paths"] == ["saudi_indicators_20250504.nc"]
+    assert output_path.exists()
+
+
+def test_dust_storm_training_payload_keeps_dust_feature_columns():
+    module = _load_training_module()
+    frame = pd.DataFrame(
+        [
+            {
+                "date": "2025-05-04",
+                "hazard_type": "dust_storm",
+                "province_name": "Qassim",
+                "DUEXTTAU": 0.45,
+                "DUCMASS": 0.12,
+                "DUSMASS": 0.003,
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "region_day_text",
+                "matched_event_ids": "dust_20250504_qassim_riyadh",
+                "label_provenance": "{}",
+            },
+            {
+                "date": "2025-05-06",
+                "hazard_type": "dust_storm",
+                "province_name": "Madinah",
+                "DUEXTTAU": 0.12,
+                "DUCMASS": 0.05,
+                "DUSMASS": 0.001,
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "no_event_day",
+                "matched_event_ids": "",
+                "label_provenance": "{}",
+            },
+        ]
+    )
+
+    payload = module.build_training_payload_from_frame(frame, "dust_storm")
+
+    assert payload["feature_names"] == ["dust_aod", "dust_column_mass", "dust_surface_mass"]
+    assert payload["features"].shape == (2, 3)
+    assert payload["labels"].tolist() == [1.0, 0.0]
 
 
 def test_demo_flash_flood_supervised_training_builds_balanced_dataset(tmp_path: Path):

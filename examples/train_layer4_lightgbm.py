@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover - optional dependency
 DEFAULT_SOURCE = ROOT / "data" / "raw" / "era5_saudi_20250616.nc"
 DEFAULT_MODEL_DIR = ROOT / "models" / "layer4"
 SOURCE_FORMATS = ("auto", "era5", "indicator-netcdf", "indicator-parquet", "indicator-csv", "indicator-json")
-HAZARD_TYPES = ("extreme_heat", "dry_heat_agriculture", "flash_flood")
+HAZARD_TYPES = ("extreme_heat", "dry_heat_agriculture", "flash_flood", "dust_storm")
 
 
 def normalize_dataset(dataset):
@@ -149,6 +149,8 @@ def build_target_from_features(features: np.ndarray, hazard_type: str) -> np.nda
             ]
         )
         return np.clip(target, 0.0, 1.0).astype(np.float32)
+    if hazard_type == "dust_storm":
+        raise ValueError("dust_storm training requires an explicit labeled table")
     raise ValueError(f"Unsupported hazard type: {hazard_type}")
 
 
@@ -466,6 +468,14 @@ def build_daily_feature_frame(table, hazard_type: str):
                 "flash_flood_risk": flash_risk,
             }
         )
+    elif hazard_type == "dust_storm":
+        data.update(
+            {
+                "dust_aod": _numeric_series(working, ("dust_aod", "DUEXTTAU")),
+                "dust_column_mass": _numeric_series(working, ("dust_column_mass", "DUCMASS")),
+                "dust_surface_mass": _numeric_series(working, ("dust_surface_mass", "DUSMASS")),
+            }
+        )
 
     return pd.DataFrame(data)
 
@@ -643,6 +653,78 @@ def _load_source_summary(path: Path) -> dict[str, object] | None:
         return None
 
 
+def _summarize_source_label_audit(table):
+    _require_pandas()
+    if not isinstance(table, pd.DataFrame):
+        return None
+    if "label_status" not in table.columns:
+        return None
+
+    summary = {
+        "input_rows": int(len(table)),
+        "input_rows_with_matched_event_ids": 0,
+        "input_label_status_counts": {},
+        "input_label_source_mode_counts": {},
+        "input_uncertain_rows": 0,
+        "input_event_day_unresolved_rows": 0,
+    }
+    status_counts = table["label_status"].astype(str).value_counts(dropna=False).to_dict()
+    summary["input_label_status_counts"] = {str(key): int(value) for key, value in status_counts.items()}
+    summary["input_uncertain_rows"] = int(status_counts.get("uncertain", 0))
+
+    if "label_source_mode" in table.columns:
+        source_counts = table["label_source_mode"].astype(str).value_counts(dropna=False).to_dict()
+        summary["input_label_source_mode_counts"] = {str(key): int(value) for key, value in source_counts.items()}
+        summary["input_event_day_unresolved_rows"] = int(source_counts.get("event_day_unresolved", 0))
+
+    if "matched_event_ids" in table.columns:
+        summary["input_rows_with_matched_event_ids"] = int(
+            table["matched_event_ids"].fillna("").astype(str).str.strip().ne("").sum()
+        )
+    return summary
+
+
+def _summarize_source_supervision_quality(table, hazard_type: str):
+    if hazard_type != "flash_flood":
+        return None
+    _require_pandas()
+    if not isinstance(table, pd.DataFrame):
+        return None
+    if "label_status" not in table.columns:
+        return None
+
+    label_status_counts = table["label_status"].astype(str).value_counts(dropna=False).to_dict()
+    label_source_mode_counts = {}
+    if "label_source_mode" in table.columns:
+        label_source_mode_counts = {
+            str(key): int(value) for key, value in table["label_source_mode"].astype(str).value_counts(dropna=False).to_dict().items()
+        }
+
+    geometry_positive_rows = count_flash_flood_geometry_backed_positive_rows(table)
+    boundary_grounded_positive_rows = count_flash_flood_boundary_grounded_positive_rows(table)
+    explicit_geometry_positive_rows = count_flash_flood_explicit_geometry_positive_rows(table)
+    group_audit = _summarize_flash_flood_group_audit(table)
+    return summarize_flash_flood_supervision_quality(
+        total_rows=int(len(table)),
+        positive_rows=int(label_status_counts.get("positive", 0)),
+        negative_rows=int(label_status_counts.get("negative", 0)),
+        uncertain_rows=int(label_status_counts.get("uncertain", 0)),
+        rows_with_matched_event_ids=int(table["matched_event_ids"].fillna("").astype(str).str.strip().ne("").sum())
+        if "matched_event_ids" in table.columns
+        else 0,
+        geometry_positive_rows=int(geometry_positive_rows),
+        geometry_positive_source_counts=summarize_flash_flood_geometry_backed_positive_rows(table),
+        boundary_grounded_positive_rows=int(boundary_grounded_positive_rows),
+        explicit_geometry_positive_rows=int(explicit_geometry_positive_rows),
+        outside_event_footprint_negative_rows=int(label_source_mode_counts.get("outside_event_footprint", 0)),
+        event_day_negative_rows=int(label_source_mode_counts.get("outside_event_footprint", 0)),
+        event_day_unresolved_rows=int(label_status_counts.get("uncertain", 0)),
+        event_group_count=int(group_audit.get("event_group_count", 0)),
+        fallback_date_group_count=int(group_audit.get("fallback_date_group_count", 0)),
+        rows_using_fallback_date_groups=int(group_audit.get("rows_using_fallback_date_groups", 0)),
+    )
+
+
 def build_training_payload_from_frame(table, hazard_type: str):
     _require_pandas()
     working = build_supervised_feature_frame(table.reset_index(drop=True).copy(), hazard_type)
@@ -759,6 +841,7 @@ def main() -> int:
         "extreme_heat": "extreme_heat.txt",
         "dry_heat_agriculture": "dry_heat_stress.txt",
         "flash_flood": "flash_flood.txt",
+        "dust_storm": "dust_storm.txt",
     }
     model_path = model_dir / model_filenames[args.hazard_type]
     adapter.save_model(model_path)
@@ -781,12 +864,24 @@ def main() -> int:
     }
     if target_summary is not None:
         summary["training_target"] = target_summary
+        source_label_audit = None
+        source_supervision_quality = None
+        if pd is not None and isinstance(dataset, pd.DataFrame):
+            source_label_audit = _summarize_source_label_audit(dataset)
+            source_supervision_quality = _summarize_source_supervision_quality(dataset, args.hazard_type)
         if source_summary is not None:
-            source_label_audit = source_summary.get("label_input_audit")
+            source_label_audit = source_summary.get("label_input_audit") or source_label_audit
             if source_label_audit is not None:
                 summary["training_target"]["source_label_audit"] = source_label_audit
-            if "supervision_quality" in source_summary and "supervision_quality" not in summary["training_target"]:
+            if "supervision_quality" in source_summary:
                 summary["training_target"]["source_supervision_quality"] = source_summary["supervision_quality"]
+            elif source_supervision_quality is not None:
+                summary["training_target"]["source_supervision_quality"] = source_supervision_quality
+        else:
+            if source_label_audit is not None:
+                summary["training_target"]["source_label_audit"] = source_label_audit
+            if source_supervision_quality is not None:
+                summary["training_target"]["source_supervision_quality"] = source_supervision_quality
     if training_payload is not None and "split_group_audit" in training_payload:
         split_group_audit = dict(training_payload["split_group_audit"])
         summary["model"].update(split_group_audit)

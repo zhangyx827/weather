@@ -56,7 +56,24 @@ def _open_monthly_pressure(pressure_dir: Path, missing_dir: Path, year: int, mon
 
 
 def _sanitize_field(data: xr.DataArray) -> np.ndarray:
-    array = data.squeeze(drop=True).transpose("latitude", "longitude").values.astype(np.float32)
+    array = data.squeeze(drop=True)
+    # Some ERA5 pressure files expose an extra `time` axis with duplicate or
+    # all-NaN fallback slices. Keep the first finite slice so the output stays 2D.
+    for dim in list(array.dims):
+        if dim in ("latitude", "longitude"):
+            continue
+        if array.sizes[dim] == 1:
+            array = array.isel({dim: 0}, drop=True)
+            continue
+        selected = array.isel({dim: 0}, drop=True)
+        if not np.isfinite(selected.values).any():
+            for idx in range(1, array.sizes[dim]):
+                candidate = array.isel({dim: idx}, drop=True)
+                if np.isfinite(candidate.values).any():
+                    selected = candidate
+                    break
+        array = selected
+    array = array.transpose("latitude", "longitude").values.astype(np.float32)
     return np.ascontiguousarray(array)
 
 

@@ -13,7 +13,7 @@ from mazu_saudi.data.dust_storm_event_sources import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "build_dust_storm_event_table.py"
-DEFAULT_INPUT = ROOT / "data" / "raw" / "dust_storm_verified" / "user_leads_2025_dust_events.csv"
+DEFAULT_INPUT = ROOT / "data" / "raw" / "verified_dust_storm.csv"
 
 
 def _load_script_module():
@@ -76,6 +76,9 @@ def test_build_dust_storm_event_table_script_uses_bundled_user_leads_by_default(
     summary_output = tmp_path / "dust_storm_events_summary.json"
 
     assert DEFAULT_INPUT.exists()
+    raw = pd.read_csv(DEFAULT_INPUT)
+    expected_events = standardize_dust_storm_event_records(raw, source_name="user_session_handoff")
+    expected_daily = expand_dust_storm_events_to_daily_records(expected_events)
     assert module.main(
         [
             "--output",
@@ -91,11 +94,12 @@ def test_build_dust_storm_event_table_script_uses_bundled_user_leads_by_default(
     daily = pd.read_csv(daily_output)
     summary = json.loads(summary_output.read_text(encoding="utf-8"))
 
-    assert len(events) == 3
-    assert len(daily) == 12
+    assert len(events) == len(expected_events)
+    assert len(daily) == len(expected_daily)
     assert set(events["validation_status"]) == {"verified"}
-    assert summary["rows"] == 3
-    assert summary["verified_rows"] == 3
-    assert summary["daily_rows"] == 12
-    assert summary["validation_status_counts"] == {"verified": 3}
-    assert summary["source_name_counts"] == {"user_session_handoff": 3}
+    assert len(raw) > len(expected_events)
+    assert summary["rows"] == len(expected_events)
+    assert summary["verified_rows"] == len(expected_events)
+    assert summary["daily_rows"] == len(expected_daily)
+    assert summary["validation_status_counts"] == {"verified": len(expected_events)}
+    assert summary["source_name_counts"] == {"user_session_handoff": len(expected_events)}

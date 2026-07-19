@@ -27,14 +27,27 @@ def _normalize_text(value: Any) -> str:
     return str(value).strip().lower()
 
 
+def _normalize_location_token(value: Any) -> str:
+    token = _normalize_text(value)
+    token = token.strip("\"'`")
+    token = token.replace("-", " ").replace("_", " ")
+    token = " ".join(token.split())
+    return token
+
+
 def _normalize_date_column(series: Any):
     return pd.to_datetime(series, errors="coerce").dt.strftime("%Y-%m-%d")
 
 
 def _canonical_location_token(value: Any, config: DustStormLabelMappingConfig) -> str:
-    token = _normalize_text(value).replace("-", " ").replace("_", " ")
-    token = " ".join(token.split())
-    return config.location_aliases.get(token, token.replace(" ", "_"))
+    token = _normalize_location_token(value)
+    mapped = config.location_aliases.get(token)
+    if mapped:
+        return mapped
+    region_ids = config.location_to_region_ids.get(token)
+    if region_ids:
+        return region_ids[0]
+    return token.replace(" ", "_")
 
 
 def _resolved_sample_location(row: dict[str, Any], config: DustStormLabelMappingConfig) -> tuple[str, str]:

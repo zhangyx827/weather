@@ -178,6 +178,14 @@ def _write_verified_parquet(table, path: Path) -> None:
         raise
 
 
+def _summary_path(output: Path) -> Path:
+    return output.with_suffix(".summary.json")
+
+
+def _write_summary(summary: dict[str, object], output: Path) -> None:
+    _summary_path(output).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _load_default_events_daily():
     if DEFAULT_VERIFIED_DAILY_EVENTS.exists():
         return _read_table(DEFAULT_VERIFIED_DAILY_EVENTS)
@@ -278,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _write_table(labeled, args.output, output_format)
         summary = _finalize_summary(_summarize_labeled_table(labeled, args.output))
+    _write_summary(summary, args.output)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

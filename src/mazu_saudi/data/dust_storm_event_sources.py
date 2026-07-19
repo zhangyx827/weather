@@ -48,6 +48,16 @@ def _float_or_none(value: Any) -> float | None:
     return numeric
 
 
+def _is_embedded_header_row(record: dict[str, Any]) -> bool:
+    return (
+        _normalize_text(record.get("record_id")) == "record_id"
+        and _normalize_text(record.get("event_id")) == "event_id"
+        and _normalize_text(record.get("hazard_type")) == "hazard_type"
+        and _normalize_text(record.get("start_date")) == "start_date"
+        and _normalize_text(record.get("end_date")) == "end_date"
+    )
+
+
 @dataclass(frozen=True)
 class DustStormEvent:
     event_id: str
@@ -93,6 +103,8 @@ def standardize_dust_storm_event_records(
 
     events: list[DustStormEvent] = []
     for index, record in enumerate(source_rows, start=1):
+        if _is_embedded_header_row(record):
+            continue
         location_name = _coalesce(record, "location_name", "location", "city", "place_name")
         if not _normalize_text(location_name):
             raise ValueError(f"dust event record {index} is missing a location field")

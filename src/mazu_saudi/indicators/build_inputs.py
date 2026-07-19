@@ -617,8 +617,6 @@ class RawInputBuilder:
             result = BuildResult()
             self.indicator_nc_out.mkdir(parents=True, exist_ok=True)
             self.indicator_parquet_out.mkdir(parents=True, exist_ok=True)
-            if include_aurora:
-                self.aurora_out.mkdir(parents=True, exist_ok=True)
 
             # =====================================================================
             # 1. 每日指标生成部分 (已改造为安全增量模式)
@@ -670,27 +668,6 @@ class RawInputBuilder:
                     result.add("indicator_table", str(start_date.year), "ok", str(written_path))
                 except Exception as exc:
                     result.add("indicator_table", str(start_date.year), "skipped", str(exc))
-
-            # =====================================================================
-            # 3. Aurora 输入文件生成部分 (顺便也做了增量优化)
-            # =====================================================================
-            if include_aurora:
-                aurora_time = _as_day_start(start_date)
-                final_time = _as_day_start(end_date) + timedelta(hours=18)
-                while aurora_time <= final_time:
-                    try:
-                        path = self.aurora_out / f"aurora_input_{aurora_time:%Y%m%d%H}.nc"
-                        
-                        # ✨ Aurora 文件无下游依赖，可以直接安全跳过
-                        if path.exists():
-                            result.add("aurora", aurora_time.isoformat(), "exists", "skipped")
-                        else:
-                            ds = self.build_aurora_input(aurora_time)
-                            ds.to_netcdf(path)
-                            result.add("aurora", aurora_time.isoformat(), "ok", str(path))
-                    except Exception as exc:
-                        result.add("aurora", aurora_time.isoformat(), "skipped", str(exc))
-                    aurora_time += timedelta(hours=self.aurora_cadence_hours)
 
             result.write(self.aurora_out.parent / "build_manifest.json")
             return result

@@ -22,7 +22,7 @@ from mazu_saudi.data import (
 
 
 FORMATS = ("csv", "json", "parquet")
-DEFAULT_RAW_VERIFIED_INPUT = ROOT / "data" / "raw" / "dust_storm_verified" / "user_leads_2025_dust_events.csv"
+DEFAULT_RAW_VERIFIED_INPUT = ROOT / "data" / "raw" / "verified_dust_storm.csv"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

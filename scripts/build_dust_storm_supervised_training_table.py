@@ -14,7 +14,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from mazu_saudi.config import DustStormLabelMappingConfig
-from mazu_saudi.data import build_dust_storm_supervised_training_dataset
+from mazu_saudi.data import build_dust_storm_province_day_feature_table, build_dust_storm_supervised_training_dataset
+from mazu_saudi.data.io import read_netcdf_dataset
 
 
 FORMATS = ("csv", "json", "parquet")
@@ -22,7 +23,24 @@ FORMATS = ("csv", "json", "parquet")
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a supervised dust-storm Layer-4 training table by joining features with labels.")
-    parser.add_argument("--features", type=Path, required=True, help="Feature table with region-day or province-day samples.")
+    parser.add_argument("--features", type=Path, help="Feature table with region-day or province-day samples.")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=ROOT / "data" / "processed" / "lightgbm_indicators_nc",
+        help="Directory containing daily indicator NetCDF files used to build province-day features when --features is omitted.",
+    )
+    parser.add_argument(
+        "--glob",
+        default="saudi_indicators_*.nc",
+        help="Glob used to discover daily indicator files when --features is omitted.",
+    )
+    parser.add_argument(
+        "--boundary-path",
+        type=Path,
+        default=ROOT / "data" / "raw" / "admin_boundaries" / "geoBoundaries-SAU-ADM1.geojson",
+        help="GeoJSON ADM1 boundary file used to map grid cells into Saudi provinces when --features is omitted.",
+    )
     parser.add_argument("--labels", type=Path, required=True, help="Dust-storm label table produced by build_dust_storm_training_labels.py.")
     parser.add_argument(
         "--output",
@@ -32,6 +50,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--format", choices=FORMATS, help="Output format. Defaults to the output file suffix.")
     parser.add_argument("--keep-uncertain", action="store_true", help="Keep uncertain or unlabeled rows in the merged output.")
+    parser.add_argument(
+        "--province-column",
+        default="province_name",
+        help="Province column to create when building province-day features from daily indicators.",
+    )
+    parser.add_argument(
+        "--coordinate-precision",
+        type=int,
+        default=4,
+        help="Decimal precision used when matching lat/lon grid cells to province lookup rows.",
+    )
     return parser.parse_args(argv)
 
 
@@ -59,6 +88,19 @@ def _read_table(path: Path):
     return pd.read_parquet(path)
 
 
+def _is_readable_dust_file(path: Path) -> bool:
+    try:
+        dataset = read_netcdf_dataset(path)
+    except Exception:
+        return False
+    try:
+        return bool(getattr(dataset, "data_vars", None))
+    finally:
+        close = getattr(dataset, "close", None)
+        if callable(close):
+            close()
+
+
 def _write_table(table, path: Path, fmt: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "csv":
@@ -76,7 +118,18 @@ def _write_table(table, path: Path, fmt: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     output_format = _infer_format(args.output, args.format)
-    features = _read_table(args.features)
+    if args.features is not None:
+        features = _read_table(args.features)
+    else:
+        feature_paths = sorted(path for path in args.input.glob(args.glob) if _is_readable_dust_file(path))
+        if not feature_paths:
+            raise FileNotFoundError(f"No indicator NetCDF files matched {args.input}/{args.glob}")
+        features = build_dust_storm_province_day_feature_table(
+            feature_paths,
+            boundary_path=args.boundary_path,
+            province_column=args.province_column,
+            coordinate_precision=args.coordinate_precision,
+        )
     labels = _read_table(args.labels)
     merged = build_dust_storm_supervised_training_dataset(
         features,
