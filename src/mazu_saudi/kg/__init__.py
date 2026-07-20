@@ -7,6 +7,7 @@ from .graph import (
     SakunaGraphAdapter,
     ShaclValidationService,
     load_hazard_rules,
+    validate_instance_ttl,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "SakunaGraphAdapter",
     "ShaclValidationService",
     "load_hazard_rules",
+    "validate_instance_ttl",
 ]

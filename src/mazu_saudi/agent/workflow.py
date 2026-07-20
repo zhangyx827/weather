@@ -159,6 +159,13 @@ class ForecastNode(WorkflowNode):
         forecast = self.provider.get_forecast(features.valid_time, lead_hours=0)
         context["forecast_fields"] = {key: field.to_dict() for key, field in forecast.items()}
         first_field = next(iter(forecast.values())) if forecast else None
+        field_metadata = dict(getattr(first_field, "metadata", {}) or {}) if first_field is not None else {}
+        source_metadata = field_metadata.get("source_metadata", {})
+        if not isinstance(source_metadata, dict):
+            source_metadata = {}
+        grounding_gap = field_metadata.get("grounding_gap", {})
+        if not isinstance(grounding_gap, dict):
+            grounding_gap = {}
         context["forecast_confidence"] = {
             "status": "ready" if first_field is not None else "unavailable",
             "provider": self.provider.name,
@@ -166,6 +173,8 @@ class ForecastNode(WorkflowNode):
             "provider_status": getattr(first_field, "provider_status", getattr(self.provider, "provider_status", "unknown")),
             "source_status": getattr(first_field, "source_status", getattr(self.provider, "source_status", "unknown")),
             "degradation_metadata": getattr(first_field, "degradation_metadata", {}),
+            "source_metadata": source_metadata,
+            "grounding_gap": grounding_gap,
         }
         context.setdefault("trace", []).append(self.name)
         return context
@@ -231,11 +240,54 @@ class KGReasoningNode(WorkflowNode):
     def run(self, context: Context) -> Context:
         graph = HazardKnowledgeGraph()
         impacts = {}
+        semantic_evidence = {}
+        features = context.get("features")
+        source_metadata = dict(getattr(features, "source_metadata", {}) or {}) if isinstance(features, IndicatorFieldSet) else {}
+        grounding_gap = getattr(features, "grounding_gap", {}) if isinstance(features, IndicatorFieldSet) else {}
+        source_status = getattr(features, "source_status", None) if isinstance(features, IndicatorFieldSet) else None
+        degradation_metadata = dict(getattr(features, "degradation_metadata", {}) or {}) if isinstance(features, IndicatorFieldSet) else {}
+        forecast_confidence = dict(context.get("forecast_confidence") or {})
+        if not source_metadata:
+            forecast_source_metadata = forecast_confidence.get("source_metadata", {})
+            if isinstance(forecast_source_metadata, dict):
+                source_metadata = dict(forecast_source_metadata)
+        if not grounding_gap:
+            forecast_grounding_gap = forecast_confidence.get("grounding_gap", {})
+            if isinstance(forecast_grounding_gap, dict):
+                grounding_gap = dict(forecast_grounding_gap)
+        forecast_degradation = forecast_confidence.get("degradation_metadata")
+        if isinstance(forecast_degradation, dict):
+            degradation_metadata = {**degradation_metadata, **forecast_degradation}
+        if source_status is None:
+            source_status = forecast_confidence.get("source_status")
+        grounding_uris = {}
         for risk in context["risks"]:
             graph.add_risk_evidence(risk)
+            grounding_uris[risk.hazard_type] = graph.add_grounding_gap_evidence(
+                risk,
+                source_metadata=source_metadata,
+                grounding_gap=grounding_gap,
+                source_status=source_status,
+                degradation_metadata=degradation_metadata,
+            )
             impacts[risk.hazard_type] = graph.query_hazard_impacts(risk.hazard_type)
+            semantic_evidence[risk.hazard_type] = graph.semantic_evidence_for_risk(risk)
+        provenance_payload = {
+            **forecast_confidence,
+            "source_metadata": source_metadata,
+            "grounding_gap": grounding_gap,
+            "degradation_metadata": degradation_metadata,
+        }
+        provenance_uri = graph.add_runtime_provenance(provenance_payload)
         context["kg"] = graph
-        context["kg_explanation"] = {"impacts": impacts, "triple_count": len(graph.triples)}
+        context["kg_explanation"] = {
+            "impacts": impacts,
+            "semantic_evidence": semantic_evidence,
+            "triple_count": len(graph.triples),
+            "backend": graph.backend_metadata,
+            "runtime_provenance_uri": provenance_uri,
+            "grounding_gap_uris": grounding_uris,
+        }
         context.setdefault("trace", []).append(self.name)
         return context
 

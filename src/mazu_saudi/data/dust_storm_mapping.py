@@ -24,11 +24,18 @@ _TOKEN_SPLIT_PATTERN = re.compile(r"\s*(?:,|/|;|\band\b|\&)\s*", re.IGNORECASE)
 def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
-    return str(value).strip().lower()
+    if isinstance(value, float) and value != value:
+        return ""
+    text = str(value).strip().lower()
+    if text in {"", "nan", "none", "null"}:
+        return ""
+    return text
 
 
 def _normalize_location_token(value: Any) -> str:
     token = _normalize_text(value)
+    if not token:
+        return ""
     token = token.strip("\"'`")
     token = token.replace("-", " ").replace("_", " ")
     token = " ".join(token.split())
@@ -41,6 +48,8 @@ def _normalize_date_column(series: Any):
 
 def _canonical_location_token(value: Any, config: DustStormLabelMappingConfig) -> str:
     token = _normalize_location_token(value)
+    if not token:
+        return ""
     mapped = config.location_aliases.get(token)
     if mapped:
         return mapped

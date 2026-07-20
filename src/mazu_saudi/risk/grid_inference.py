@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
+import json
 
 import numpy as np
 
@@ -16,15 +16,12 @@ from .layer4_features import (
     feature_names_for_hazard,
     required_feature_names_for_hazard,
 )
+from .model_paths import REPO_ROOT, resolve_layer4_model_path
 
 try:
     import xarray as xr
 except Exception:  # pragma: no cover - optional dependency
     xr = None
-
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_LAYER4_MODEL_DIR = REPO_ROOT / "models" / "layer4"
 
 
 def _levels_from_probability(probability: np.ndarray) -> np.ndarray:
@@ -87,17 +84,19 @@ class LightGBMLayer4Model:
         *,
         allow_missing: bool,
     ) -> Path | None:
-        raw_path = explicit or os.environ.get(env_key) or (DEFAULT_LAYER4_MODEL_DIR / default_name)
-        path = Path(raw_path).expanduser()
-        if not path.is_absolute():
-            path = REPO_ROOT / path
-        if path.exists():
-            return path
-        if allow_missing:
-            return None
-        raise FileNotFoundError(
-            f"Layer-4 LightGBM model file not found: {path}. "
-            f"Set {env_key} to a trained LightGBM booster file."
+        hazard_type = {
+            "MAZU_LAYER4_EXTREME_HEAT_MODEL": "extreme_heat",
+            "MAZU_LAYER4_DRY_HEAT_MODEL": "dry_heat_agriculture",
+            "MAZU_LAYER4_FLASH_FLOOD_MODEL": "flash_flood",
+        }.get(env_key)
+        if hazard_type is None:
+            raise ValueError(f"Unsupported Layer-4 model env key: {env_key}")
+        return resolve_layer4_model_path(
+            hazard_type,
+            explicit=explicit,
+            env_key=env_key,
+            default_name=default_name,
+            allow_missing=allow_missing,
         )
 
     @staticmethod
@@ -183,26 +182,54 @@ class LightGBMLayer4Model:
             raise TypeError(f"Expected xarray.Dataset-like input, got {type(dataset)!r}")
 
         ds = dataset
-        features, shape = self._aligned_feature_matrix(ds, "extreme_heat", self.extreme_heat_model)
         first_var = next(iter(ds.data_vars))
         source_dims = ds[first_var].dims
-        if len(source_dims) != len(shape):
-            dims = tuple(dim for dim in source_dims if ds[first_var].sizes.get(dim) != 1)
-        else:
-            dims = source_dims
+        data_vars: dict[str, Any] = {}
+        shape: tuple[int, ...] | None = None
+        dims: tuple[str, ...] | None = None
+        skipped_hazards: list[dict[str, str]] = []
 
-        extreme_heat_prob = self._predict_probability(self.extreme_heat_model, features, shape)
-        dry_features, dry_shape = self._aligned_feature_matrix(ds, "dry_heat_agriculture", self.dry_heat_model)
-        if dry_shape != shape:
-            raise ValueError(f"Dry-heat feature shape {dry_shape} does not match extreme-heat feature shape {shape}")
-        dry_heat_prob = self._predict_probability(self.dry_heat_model, dry_features, shape)
+        def _dims_for_shape(current_shape: tuple[int, ...]) -> tuple[str, ...]:
+            if len(source_dims) != len(current_shape):
+                return tuple(dim for dim in source_dims if ds[first_var].sizes.get(dim) != 1)
+            return source_dims
 
-        data_vars = {
-            "ExtremeHeat_Risk_Prob": (dims, np.asarray(extreme_heat_prob, dtype=np.float32), {"units": "1"}),
-            "ExtremeHeat_Risk_Level": (dims, _levels_from_probability(extreme_heat_prob), {"units": "class"}),
-            "DryHeatStress_Risk_Prob": (dims, np.asarray(dry_heat_prob, dtype=np.float32), {"units": "1"}),
-            "DryHeatStress_Risk_Level": (dims, _levels_from_probability(dry_heat_prob), {"units": "class"}),
-        }
+        def _predict_hazard(
+            *,
+            hazard_type: str,
+            model: Any,
+            probability_name: str,
+            level_name: str,
+        ) -> None:
+            nonlocal shape, dims
+            try:
+                features, current_shape = self._aligned_feature_matrix(ds, hazard_type, model)
+            except (KeyError, ValueError) as exc:
+                skipped_hazards.append({"hazard_type": hazard_type, "reason": str(exc)})
+                return
+            if shape is None:
+                shape = current_shape
+                dims = _dims_for_shape(current_shape)
+            elif current_shape != shape:
+                raise ValueError(f"{hazard_type} feature shape {current_shape} does not match {shape}")
+            probability = self._predict_probability(model, features, shape)
+            assert dims is not None
+            data_vars[probability_name] = (dims, np.asarray(probability, dtype=np.float32), {"units": "1"})
+            data_vars[level_name] = (dims, _levels_from_probability(probability), {"units": "class"})
+
+        _predict_hazard(
+            hazard_type="extreme_heat",
+            model=self.extreme_heat_model,
+            probability_name="ExtremeHeat_Risk_Prob",
+            level_name="ExtremeHeat_Risk_Level",
+        )
+        _predict_hazard(
+            hazard_type="dry_heat_agriculture",
+            model=self.dry_heat_model,
+            probability_name="DryHeatStress_Risk_Prob",
+            level_name="DryHeatStress_Risk_Level",
+        )
+
         attrs = {
             "model_family": "lightgbm",
             "model_name": "LightGBMLayer4Model",
@@ -220,20 +247,22 @@ class LightGBMLayer4Model:
             "feature_source_contract_version": "layer4_v2",
         }
         if self.flash_flood_model is not None:
-            flood_features, flood_shape = self._aligned_feature_matrix(ds, "flash_flood", self.flash_flood_model)
-            if flood_shape != shape:
-                raise ValueError(f"Flash-flood feature shape {flood_shape} does not match extreme-heat feature shape {shape}")
-            flash_flood_prob = self._predict_probability(self.flash_flood_model, flood_features, shape)
-            data_vars.update(
-                {
-                    "FlashFlood_Risk_Prob": (dims, np.asarray(flash_flood_prob, dtype=np.float32), {"units": "1"}),
-                    "FlashFlood_Risk_Level": (dims, _levels_from_probability(flash_flood_prob), {"units": "class"}),
-                }
+            _predict_hazard(
+                hazard_type="flash_flood",
+                model=self.flash_flood_model,
+                probability_name="FlashFlood_Risk_Prob",
+                level_name="FlashFlood_Risk_Level",
             )
             attrs["feature_names_flash_flood"] = ",".join(feature_names_for_hazard("flash_flood"))
             attrs["required_core_features_flash_flood"] = ",".join(required_feature_names_for_hazard("flash_flood"))
             attrs["optional_enhancement_features_flash_flood"] = ",".join(enhancement_feature_names_for_hazard("flash_flood"))
             attrs["evidence_only_features_flash_flood"] = ",".join(evidence_feature_names_for_hazard("flash_flood"))
+
+        if not data_vars or shape is None or dims is None:
+            reasons = "; ".join(f"{item['hazard_type']}: {item['reason']}" for item in skipped_hazards) or "no supported hazard features"
+            raise ValueError(f"Layer-4 dataset produced no risk fields: {reasons}")
+        if skipped_hazards:
+            attrs["skipped_hazards_json"] = json.dumps(skipped_hazards, ensure_ascii=False, sort_keys=True)
 
         return xr.Dataset(
             data_vars=data_vars,

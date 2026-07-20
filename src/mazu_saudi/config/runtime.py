@@ -40,6 +40,19 @@ class BriefingProviderSettings:
 
 
 @dataclass
+class GroundingPolicySettings:
+    precip_daily_abs_diff_mm_threshold: float = 10.0
+    require_note_on_missing_grounding: bool = True
+
+    @classmethod
+    def from_env(cls) -> "GroundingPolicySettings":
+        return cls(
+            precip_daily_abs_diff_mm_threshold=_env_float("MAZU_GROUNDING_PRECIP_DAILY_ABS_DIFF_MM_THRESHOLD", 10.0),
+            require_note_on_missing_grounding=_env_flag("MAZU_GROUNDING_REQUIRE_NOTE_ON_MISSING", True),
+        )
+
+
+@dataclass
 class LLMSettings:
     base_url: str = ""
     api_key: str = ""

@@ -14,6 +14,31 @@ import numpy as np
 PRESSURE_LEVELS = [1000.0, 925.0, 850.0, 700.0, 600.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0, 100.0, 50.0]
 PRESSURE_VARIABLES = ("z", "q", "u", "v", "t")
 SURFACE_VARIABLES = ("t2m", "u10", "v10", "msl")
+WARNING_LIMIT = 20
+_warning_count = 0
+_skipped_file_count = 0
+_replaced_value_count = 0
+
+
+def _sanitize_array(array: np.ndarray, label: str) -> np.ndarray | None:
+    global _warning_count, _skipped_file_count, _replaced_value_count
+    finite = np.isfinite(array)
+    if finite.all():
+        return array
+    bad_count = int((~finite).sum())
+    if not finite.any():
+        _skipped_file_count += 1
+        if _warning_count < WARNING_LIMIT:
+            print(f"WARNING: skipping file with all non-finite values: {label}")
+            _warning_count += 1
+        return None
+    _replaced_value_count += bad_count
+    if _warning_count < WARNING_LIMIT:
+        print(f"WARNING: replacing {bad_count} non-finite values with NaN in {label}")
+        _warning_count += 1
+    cleaned = array.copy()
+    cleaned[~finite] = np.nan
+    return cleaned
 
 
 def _parse_source_spec(value: str) -> dict[str, object]:
@@ -39,18 +64,47 @@ def _iter_timestamps(start: datetime, end: datetime, step_hours: int) -> list[da
     return values
 
 
-def _mean_std(values: list[np.ndarray]) -> tuple[list[float], float]:
-    stacked = np.concatenate([v.reshape(v.shape[0], -1) for v in values], axis=1)
-    per_channel = stacked.mean(axis=1)
-    overall = float(stacked.mean())
-    return per_channel.astype(float).tolist(), overall
+def _new_running_stats(num_channels: int) -> dict[str, np.ndarray | float]:
+    return {
+        "sum": np.zeros(num_channels, dtype=np.float64),
+        "sumsq": np.zeros(num_channels, dtype=np.float64),
+        "count": np.zeros(num_channels, dtype=np.int64),
+        "total_sum": 0.0,
+        "total_sumsq": 0.0,
+        "total_count": 0,
+    }
 
 
-def _std(values: list[np.ndarray]) -> tuple[list[float], float]:
-    stacked = np.concatenate([v.reshape(v.shape[0], -1) for v in values], axis=1)
-    per_channel = stacked.std(axis=1)
-    overall = float(stacked.std())
-    return per_channel.astype(float).tolist(), overall
+def _update_running_stats(stats: dict[str, np.ndarray | float], sample: np.ndarray) -> None:
+    finite = np.isfinite(sample)
+    if not finite.any():
+        return
+    safe = np.where(finite, sample, 0.0)
+    per_channel = safe.reshape(sample.shape[0], -1)
+    per_channel_finite = finite.reshape(sample.shape[0], -1)
+    stats["sum"] += per_channel.sum(axis=1)
+    stats["sumsq"] += np.square(per_channel).sum(axis=1)
+    stats["count"] += per_channel_finite.sum(axis=1)
+    stats["total_sum"] += float(safe[finite].sum())
+    stats["total_sumsq"] += float(np.square(safe[finite]).sum())
+    stats["total_count"] += int(finite.sum())
+
+
+def _finalize_running_stats(stats: dict[str, np.ndarray | float]) -> tuple[list[float], float, list[float], float]:
+    count = np.asarray(stats["count"], dtype=np.float64)
+    if np.any(count == 0):
+        raise ValueError("No finite values available for one or more channels")
+    mean = np.asarray(stats["sum"], dtype=np.float64) / count
+    variance = np.asarray(stats["sumsq"], dtype=np.float64) / count - np.square(mean)
+    variance = np.maximum(variance, 0.0)
+    std = np.sqrt(variance)
+    total_count = float(stats["total_count"])
+    if total_count <= 0:
+        raise ValueError("No finite values available for aggregate stats")
+    total_mean = float(stats["total_sum"]) / total_count
+    total_variance = float(stats["total_sumsq"]) / total_count - total_mean * total_mean
+    total_std = float(np.sqrt(max(total_variance, 0.0)))
+    return mean.tolist(), total_mean, std.tolist(), total_std
 
 
 def _load_pressure_sample(root: Path, stamp: datetime, var_name: str) -> np.ndarray:
@@ -58,27 +112,44 @@ def _load_pressure_sample(root: Path, stamp: datetime, var_name: str) -> np.ndar
     fields = []
     for level in PRESSURE_LEVELS:
         path = day_dir / f"{stamp:%H}:00:00-{var_name}-{level}.npy"
-        fields.append(np.load(path).astype(np.float64))
+        field = np.load(path).astype(np.float64)
+        field = _sanitize_array(field, str(path))
+        if field is None:
+            return None
+        fields.append(field)
     return np.stack(fields, axis=0)
 
 
 def _load_surface_sample(root: Path, stamp: datetime) -> np.ndarray:
     day_dir = root / "single" / f"{stamp:%Y}" / f"{stamp:%Y-%m-%d}"
-    return np.stack([np.load(day_dir / f"{stamp:%H}:00:00-{name}.npy").astype(np.float64) for name in SURFACE_VARIABLES], axis=0)
+    fields = []
+    for name in SURFACE_VARIABLES:
+        path = day_dir / f"{stamp:%H}:00:00-{name}.npy"
+        field = np.load(path).astype(np.float64)
+        field = _sanitize_array(field, str(path))
+        if field is None:
+            return None
+        fields.append(field)
+    return np.stack(fields, axis=0)
 
 
-def _collect_samples(root: Path, start: datetime, end: datetime, step_hours: int) -> tuple[dict[str, list[np.ndarray]], list[np.ndarray], int]:
+def _collect_samples(root: Path, start: datetime, end: datetime, step_hours: int) -> tuple[dict[str, dict[str, np.ndarray | float]], dict[str, np.ndarray | float], int]:
     timestamps = _iter_timestamps(start, end, step_hours)
     if not timestamps:
         raise ValueError("No timestamps selected for statistics generation")
-    pressure_stats: dict[str, list[np.ndarray]] = {name: [] for name in PRESSURE_VARIABLES}
-    surface_stats: list[np.ndarray] = []
+    pressure_stats: dict[str, dict[str, np.ndarray | float]] = {name: _new_running_stats(len(PRESSURE_LEVELS)) for name in PRESSURE_VARIABLES}
+    surface_stats = _new_running_stats(len(SURFACE_VARIABLES))
     count = 0
 
     for stamp in timestamps:
         for name in PRESSURE_VARIABLES:
-            pressure_stats[name].append(_load_pressure_sample(root, stamp, name))
-        surface_stats.append(_load_surface_sample(root, stamp))
+            sample = _load_pressure_sample(root, stamp, name)
+            if sample is None:
+                continue
+            _update_running_stats(pressure_stats[name], sample)
+        surface_sample = _load_surface_sample(root, stamp)
+        if surface_sample is not None:
+            _update_running_stats(surface_stats, surface_sample)
         count += 1
 
     return pressure_stats, surface_stats, count
@@ -88,8 +159,8 @@ def build_stats(sources: list[dict[str, object]], stats_dir: Path, step_hours: i
     if not sources:
         raise ValueError("At least one source must be provided")
 
-    pressure_stats: dict[str, list[np.ndarray]] = {name: [] for name in PRESSURE_VARIABLES}
-    surface_stats: list[np.ndarray] = []
+    pressure_stats: dict[str, dict[str, np.ndarray | float]] = {name: _new_running_stats(len(PRESSURE_LEVELS)) for name in PRESSURE_VARIABLES}
+    surface_stats = _new_running_stats(len(SURFACE_VARIABLES))
     count = 0
     latest_end: datetime | None = None
 
@@ -101,23 +172,37 @@ def build_stats(sources: list[dict[str, object]], stats_dir: Path, step_hours: i
             raise TypeError("train_start and train_end must be datetime instances")
         source_pressure, source_surface, source_count = _collect_samples(root, start, end, step_hours)
         for name in PRESSURE_VARIABLES:
-            pressure_stats[name].extend(source_pressure[name])
-        surface_stats.extend(source_surface)
+            pressure_stats[name]["sum"] += np.asarray(source_pressure[name]["sum"], dtype=np.float64)
+            pressure_stats[name]["sumsq"] += np.asarray(source_pressure[name]["sumsq"], dtype=np.float64)
+            pressure_stats[name]["count"] += np.asarray(source_pressure[name]["count"], dtype=np.int64)
+            pressure_stats[name]["total_sum"] += float(source_pressure[name]["total_sum"])
+            pressure_stats[name]["total_sumsq"] += float(source_pressure[name]["total_sumsq"])
+            pressure_stats[name]["total_count"] += int(source_pressure[name]["total_count"])
+        surface_stats["sum"] += np.asarray(source_surface["sum"], dtype=np.float64)
+        surface_stats["sumsq"] += np.asarray(source_surface["sumsq"], dtype=np.float64)
+        surface_stats["count"] += np.asarray(source_surface["count"], dtype=np.int64)
+        surface_stats["total_sum"] += float(source_surface["total_sum"])
+        surface_stats["total_sumsq"] += float(source_surface["total_sumsq"])
+        surface_stats["total_count"] += int(source_surface["total_count"])
         count += source_count
         latest_end = end if latest_end is None or end > latest_end else latest_end
 
     mean_payload: dict[str, object] = {}
     std_payload: dict[str, object] = {}
     for name in PRESSURE_VARIABLES:
-        mean_values, mean_overall = _mean_std(pressure_stats[name])
-        std_values, std_overall = _std(pressure_stats[name])
+        mean_values, mean_overall, std_values, std_overall = _finalize_running_stats(pressure_stats[name])
+        if not np.all(np.isfinite(mean_values)) or not np.all(np.isfinite(std_values)):
+            raise ValueError(f"Non-finite aggregate stats found for {name}")
+        if not np.isfinite(mean_overall) or not np.isfinite(std_overall):
+            raise ValueError(f"Non-finite aggregate stats found for {name}")
         mean_payload[name] = mean_values
         mean_payload[f"{name}_overall"] = mean_overall
         std_payload[name] = std_values
         std_payload[f"{name}_overall"] = std_overall
 
-    surface_mean, _ = _mean_std(surface_stats)
-    surface_std, _ = _std(surface_stats)
+    surface_mean, surface_mean_overall, surface_std, surface_std_overall = _finalize_running_stats(surface_stats)
+    if not np.all(np.isfinite(surface_mean)) or not np.all(np.isfinite(surface_std)):
+        raise ValueError("Non-finite aggregate stats found for surface")
     single_mean = {name: float(surface_mean[idx]) for idx, name in enumerate(SURFACE_VARIABLES)}
     single_std = {name: float(surface_std[idx]) for idx, name in enumerate(SURFACE_VARIABLES)}
 
@@ -127,6 +212,13 @@ def build_stats(sources: list[dict[str, object]], stats_dir: Path, step_hours: i
         json.dump({"mean": mean_payload, "std": std_payload, "count": count, "current_date": current_date}, fh)
     with (stats_dir / "mean_std_single.json").open("w", encoding="utf-8") as fh:
         json.dump({"mean": single_mean, "std": single_std, "count": count}, fh)
+    print(
+        "WARNING SUMMARY: "
+        f"skipped_files={_skipped_file_count}, "
+        f"replaced_values={_replaced_value_count}, "
+        f"surface_mean={surface_mean_overall:.6f}, "
+        f"surface_std={surface_std_overall:.6f}"
+    )
 
 
 def main() -> None:

@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from mazu_saudi.config import DustStormLabelMappingConfig
-from mazu_saudi.data import build_dust_storm_training_labels
+from mazu_saudi.data import build_dust_storm_supervised_training_dataset, build_dust_storm_training_labels
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "build_dust_storm_training_labels.py"
@@ -95,6 +95,27 @@ def test_build_dust_storm_training_labels_handles_region_form_province_names():
     assert labeled.loc[0, "matched_event_ids"] == "dust_20240312_riyadh"
     provenance = json.loads(labeled.loc[0, "label_provenance"])
     assert provenance["sample_region_id"] == "riyadh"
+
+
+def test_build_dust_storm_supervised_training_dataset_drops_missing_location_rows():
+    features = pd.DataFrame(
+        [
+            {"date": "2024-03-12", "hazard_type": "dust_storm", "province_name": "Riyadh", "dust_aod": 0.2},
+            {"date": "2024-03-12", "hazard_type": "dust_storm", "province_name": "nan", "dust_aod": 0.3},
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {"date": "2024-03-12", "hazard_type": "dust_storm", "province_name": "Riyadh", "label": 1.0, "label_status": "positive", "label_source_mode": "region_day_text", "matched_event_ids": "dust_1", "label_provenance": "{}"},
+            {"date": "2024-03-12", "hazard_type": "dust_storm", "province_name": "nan", "label": 0.0, "label_status": "negative", "label_source_mode": "no_event_day", "matched_event_ids": "", "label_provenance": "{}"},
+        ]
+    )
+
+    merged = build_dust_storm_supervised_training_dataset(features, labels)
+
+    assert merged["province_name"].tolist() == ["Riyadh"]
+    assert merged["label"].tolist() == [1.0]
+    assert merged["training_join_mode"].tolist() == ["region_day:province_name"]
 
 
 def test_build_dust_storm_training_labels_script_exports_csv(tmp_path: Path):

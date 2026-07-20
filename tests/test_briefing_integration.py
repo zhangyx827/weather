@@ -14,11 +14,12 @@ from mazu_saudi.agent.briefing import (
     BriefingGenerationError,
     OpenAICompatibleBriefingGenerator,
     TemplateBriefingGenerator,
+    _build_generation_payload,
 )
 from mazu_saudi.agent.strands import StrandsError, StrandsWarningAgent, generate_warning_response
 from mazu_saudi.agent.workflow import load_sample_features
-from mazu_saudi.config import LLMSettings, StrandsSettings
-from mazu_saudi.schemas import GridCell, HazardRisk, RiskLevel
+from mazu_saudi.config import GroundingPolicySettings, LLMSettings, StrandsSettings
+from mazu_saudi.schemas import GridCell, HazardRisk, IndicatorFieldSet, RiskLevel
 
 
 def sample_risks() -> list[HazardRisk]:
@@ -56,6 +57,60 @@ class BriefingGeneratorTests(unittest.TestCase):
         result = TemplateBriefingGenerator().generate("Riyadh", sample_risks(), {"impacts": {}})
         self.assertEqual(len(result.briefings), 6)
         self.assertEqual(result.metadata["provider"], "template")
+
+    def test_template_generator_adds_grounding_uncertainty_note(self):
+        features = IndicatorFieldSet(
+            grid=GridCell(id="riyadh-1", lat=24.7, lon=46.7, region="Riyadh"),
+            values={"gpm_era5_precip_diff": 14.5},
+            source_metadata={
+                "grounding_gap": {
+                    "precip_daily": {
+                        "source_pair": ["era5", "gpm"],
+                        "abs_diff_variable": "gpm_era5_precip_diff",
+                        "units": "mm",
+                        "status": "available",
+                    }
+                }
+            },
+            grounding_gap={
+                "precip_daily": {
+                    "source_pair": ["era5", "gpm"],
+                    "abs_diff_variable": "gpm_era5_precip_diff",
+                    "units": "mm",
+                    "status": "available",
+                }
+            },
+        )
+        result = TemplateBriefingGenerator(
+            grounding_settings=GroundingPolicySettings(precip_daily_abs_diff_mm_threshold=10.0)
+        ).generate("Riyadh", sample_risks(), {"impacts": {}}, context={"features": features})
+
+        self.assertTrue(result.metadata["grounding_summary"]["has_material_issue"])
+        self.assertIn("降水主旁路差异偏大", result.briefings[0].zh)
+
+    def test_generation_payload_exposes_grounding_summary(self):
+        features = IndicatorFieldSet(
+            grid=GridCell(id="riyadh-1", lat=24.7, lon=46.7, region="Riyadh"),
+            values={"gpm_era5_precip_diff": 12.0},
+            grounding_gap={
+                "precip_daily": {
+                    "source_pair": ["era5", "gpm"],
+                    "abs_diff_variable": "gpm_era5_precip_diff",
+                    "units": "mm",
+                    "status": "available",
+                }
+            },
+        )
+        payload = _build_generation_payload(
+            "Riyadh",
+            sample_risks(),
+            {"impacts": {}},
+            {"features": features},
+        )
+
+        self.assertTrue(payload["grounding_summary"]["has_material_issue"])
+        self.assertEqual(payload["grounding_summary"]["issues"][0]["family"], "precip_daily")
+        self.assertTrue(payload["instructions"]["must_include_uncertainty_when_grounding_flagged"])
 
     def test_openai_generator_parses_structured_json(self):
         captured = {}

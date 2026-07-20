@@ -29,6 +29,15 @@ def test_standardize_dust_storm_records_preserves_verified_status():
     events = standardize_dust_storm_event_records(
         [
             {
+                "record_id": "record_id",
+                "event_id": "event_id",
+                "hazard_type": "hazard_type",
+                "start_date": "start_date",
+                "end_date": "end_date",
+                "location_name": "location_name",
+                "validation_status": "validation_status",
+            },
+            {
                 "record_id": "lead-001",
                 "start_date": "2025-05-04",
                 "end_date": "2025-05-05",

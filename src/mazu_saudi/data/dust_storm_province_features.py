@@ -41,11 +41,16 @@ def _normalize_text(value: Any) -> str:
         return ""
     if isinstance(value, float) and value != value:
         return ""
-    return str(value).strip().lower()
+    text = str(value).strip().lower()
+    if text in {"", "nan", "none", "null"}:
+        return ""
+    return text
 
 
 def _normalize_location_token(value: Any) -> str:
     token = _normalize_text(value)
+    if not token:
+        return ""
     token = token.strip("\"'`")
     token = token.replace("-", " ").replace("_", " ")
     token = " ".join(token.split())
@@ -165,6 +170,8 @@ def _daily_grid_frame(path: Path) -> Any:
 def _canonical_region_id(value: Any) -> str:
     config = DustStormLabelMappingConfig()
     token = _normalize_location_token(value)
+    if not token:
+        return ""
     mapped = config.location_aliases.get(token)
     if not mapped:
         region_ids = config.location_to_region_ids.get(token)
@@ -224,11 +231,14 @@ def build_dust_storm_province_day_feature_table(
             province_column=province_column,
             lookup_province_column=province_column,
         )
-        enriched = enriched[enriched[province_column].astype(str).str.strip().ne("")].copy()
+        enriched = enriched[enriched[province_column].map(_normalize_text).ne("")].copy()
         if enriched.empty:
             continue
         enriched[province_column] = enriched[province_column].astype(str).str.strip().str.lower()
         enriched["region_id"] = enriched[province_column].map(_canonical_region_id)
+        enriched = enriched[enriched["region_id"].map(_normalize_text).ne("")].copy()
+        if enriched.empty:
+            continue
         numeric_columns = province_day_numeric_feature_columns(enriched)
         if not numeric_columns:
             continue
@@ -253,8 +263,81 @@ def build_dust_storm_province_day_feature_table(
 
     province_day = pd.DataFrame.from_records(records)
     province_day.attrs["skipped_paths"] = skipped_paths
+    province_day.attrs["dust_feature_coverage"] = summarize_dust_storm_feature_coverage(province_day)
     first_columns = ["date", "hazard_type", "sample_unit", province_column, "region_id", "grid_cell_count"]
     if "degraded_grid_cell_count" in province_day.columns:
         first_columns.append("degraded_grid_cell_count")
     ordered_columns = first_columns + [column for column in province_day.columns if column not in first_columns]
     return province_day.loc[:, ordered_columns].reset_index(drop=True)
+
+
+def summarize_dust_storm_feature_coverage(table: Any) -> dict[str, Any]:
+    """Summarize how much of the dust feature table has usable canonical dust values."""
+
+    _require_pandas()
+    if not isinstance(table, pd.DataFrame):
+        raise TypeError(f"Expected pandas.DataFrame, got {type(table)!r}")
+
+    feature_names = ("dust_aod", "dust_column_mass", "dust_surface_mass")
+    summary: dict[str, Any] = {
+        "rows": int(len(table)),
+        "feature_names": list(feature_names),
+    }
+    if table.empty:
+        summary.update(
+            {
+                "finite_rows": 0,
+                "finite_row_fraction": 0.0,
+                "coverage_status": "missing",
+                "rows_with_any_finite_dust_features": 0,
+                "dates_with_any_finite_dust_features": 0,
+                "dates_with_all_finite_dust_features": 0,
+                "finite_rows_by_feature": {name: 0 for name in feature_names},
+            }
+        )
+        return summary
+
+    present_features = [name for name in feature_names if name in table.columns]
+    if not present_features:
+        summary.update(
+            {
+                "finite_rows": 0,
+                "finite_row_fraction": 0.0,
+                "coverage_status": "missing",
+                "rows_with_any_finite_dust_features": 0,
+                "dates_with_any_finite_dust_features": 0,
+                "dates_with_all_finite_dust_features": 0,
+                "finite_rows_by_feature": {name: 0 for name in feature_names},
+            }
+        )
+        return summary
+
+    numeric = table.loc[:, present_features].apply(pd.to_numeric, errors="coerce")
+    finite_by_feature = {name: int(numeric[name].notna().sum()) if name in numeric.columns else 0 for name in feature_names}
+    all_finite_mask = numeric.notna().all(axis=1)
+    finite_rows = int(all_finite_mask.sum())
+    finite_row_fraction = float(finite_rows / len(table)) if len(table) else 0.0
+
+    dates_with_any_finite = 0
+    dates_with_all_finite = 0
+    if "date" in table.columns:
+        dates = pd.to_datetime(table["date"], errors="coerce")
+        valid_dates = dates.notna()
+        any_finite_dates = dates[all_finite_mask & valid_dates].dt.strftime("%Y-%m-%d")
+        dates_with_all_finite = int(any_finite_dates.nunique())
+        any_feature_mask = numeric.notna().any(axis=1)
+        dates_with_any = dates[any_feature_mask & valid_dates].dt.strftime("%Y-%m-%d")
+        dates_with_any_finite = int(dates_with_any.nunique())
+
+    summary.update(
+        {
+            "finite_rows": finite_rows,
+            "finite_row_fraction": finite_row_fraction,
+            "coverage_status": "complete" if finite_rows == len(table) else "partial",
+            "rows_with_any_finite_dust_features": int(numeric.notna().any(axis=1).sum()),
+            "dates_with_any_finite_dust_features": dates_with_any_finite,
+            "dates_with_all_finite_dust_features": dates_with_all_finite,
+            "finite_rows_by_feature": finite_by_feature,
+        }
+    )
+    return summary

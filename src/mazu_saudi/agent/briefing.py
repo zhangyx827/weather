@@ -10,8 +10,8 @@ from typing import Any, Protocol
 
 import httpx
 
-from mazu_saudi.config import BriefingProviderSettings, LLMSettings
-from mazu_saudi.schemas import HazardRisk, IndustryBriefing, WarningProduct
+from mazu_saudi.config import BriefingProviderSettings, GroundingPolicySettings, LLMSettings
+from mazu_saudi.schemas import HazardRisk, IndicatorFieldSet, IndustryBriefing, WarningProduct
 
 INDUSTRIES = ["meteorology", "emergency", "agriculture", "transport", "port", "public_health"]
 
@@ -61,16 +61,93 @@ class BriefingGenerator(Protocol):
         """Generate structured briefings."""
 
 
-def generate_industry_briefings(risks: list[HazardRisk]) -> list[IndustryBriefing]:
+def _grounding_summary(context: dict[str, Any] | None, settings: GroundingPolicySettings | None = None) -> dict[str, Any]:
+    policy = settings or GroundingPolicySettings()
+    if not context:
+        return {"issues": [], "has_material_issue": False}
+    features = context.get("features")
+    if not isinstance(features, IndicatorFieldSet):
+        return {"issues": [], "has_material_issue": False}
+
+    source_metadata = dict(features.source_metadata or {})
+    grounding_gap = dict(features.grounding_gap or source_metadata.get("grounding_gap", {}) or {})
+    issues: list[dict[str, Any]] = []
+
+    precip_daily = grounding_gap.get("precip_daily")
+    if isinstance(precip_daily, dict):
+        status = str(precip_daily.get("status", "")).strip().lower() or "unknown"
+        abs_diff_variable = str(precip_daily.get("abs_diff_variable", "")).strip()
+        abs_diff_value = features.get(abs_diff_variable) if abs_diff_variable else None
+        if abs_diff_value is not None and not isinstance(abs_diff_value, str):
+            try:
+                numeric_abs_diff = abs(float(abs_diff_value))
+            except (TypeError, ValueError):
+                numeric_abs_diff = None
+            else:
+                if numeric_abs_diff >= policy.precip_daily_abs_diff_mm_threshold:
+                    issues.append(
+                        {
+                            "family": "precip_daily",
+                            "status": "threshold_exceeded",
+                            "source_pair": list(precip_daily.get("source_pair", [])),
+                            "units": precip_daily.get("units", "mm"),
+                            "comparison_variable": abs_diff_variable,
+                            "absolute_difference": numeric_abs_diff,
+                            "threshold": policy.precip_daily_abs_diff_mm_threshold,
+                            "message_zh": (
+                                f"降水主旁路差异偏大（{numeric_abs_diff:.1f} mm），"
+                                "建议对强降水判断进行人工复核。"
+                            ),
+                        }
+                    )
+        elif policy.require_note_on_missing_grounding and status in {"missing", "not_run", "unavailable"}:
+            issues.append(
+                {
+                    "family": "precip_daily",
+                    "status": status,
+                    "source_pair": list(precip_daily.get("source_pair", [])),
+                    "message_zh": "降水旁路校验缺失，强降水解释需保守。",
+                }
+            )
+
+    flash_flood_features = grounding_gap.get("flash_flood_features")
+    if isinstance(flash_flood_features, dict):
+        partition = flash_flood_features.get("precipitation_partition", {})
+        if isinstance(partition, dict):
+            partition_status = str(partition.get("status", "")).strip().lower()
+            if partition_status and partition_status not in {"same_source_residual", "available"}:
+                issues.append(
+                    {
+                        "family": "flash_flood_precipitation_partition",
+                        "status": partition_status,
+                        "source_pair": list(partition.get("source_pair", [])),
+                        "fallback_reason": partition.get("fallback_reason"),
+                        "message_zh": "洪涝降水分解未走直接物理路径，相关表述需附带不确定性说明。",
+                    }
+                )
+
+    return {"issues": issues, "has_material_issue": bool(issues)}
+
+
+def generate_industry_briefings(
+    risks: list[HazardRisk],
+    *,
+    context: dict[str, Any] | None = None,
+    grounding_settings: GroundingPolicySettings | None = None,
+) -> list[IndustryBriefing]:
     """Generate deterministic fallback briefings."""
 
     significant = [r for r in risks if r.risk_level.value in {"medium", "high", "extreme"}]
     source = significant or risks
     hazard_summary = "；".join(f"{r.hazard_type}:{r.risk_level.value}({r.risk_probability:.2f})" for r in source)
     max_factors = "；".join({factor for risk in source for factor in risk.contributing_factors[:2]})
+    grounding = _grounding_summary(context, grounding_settings)
     uncertainty_note = ""
     if any(r.source_status == "degraded" or r.inference_mode == "degraded_rule_fallback" for r in source):
         uncertainty_note = " 说明：当前存在数据源或模型降级，建议结合人工复核与后续滚动订正。"
+    elif grounding["has_material_issue"]:
+        note = "；".join(issue["message_zh"] for issue in grounding["issues"] if issue.get("message_zh"))
+        uncertainty_note = f" 说明：{note}"
     briefings = []
     for industry in INDUSTRIES:
         zh = (
@@ -89,6 +166,9 @@ class TemplateBriefingGenerator:
 
     provider_name = "template"
 
+    def __init__(self, grounding_settings: GroundingPolicySettings | None = None):
+        self.grounding_settings = grounding_settings or GroundingPolicySettings.from_env()
+
     def generate(
         self,
         area: str,
@@ -97,10 +177,14 @@ class TemplateBriefingGenerator:
         *,
         context: dict[str, Any] | None = None,
     ) -> BriefingGenerationResult:
-        del area, kg_explanation, context
+        del area, kg_explanation
         return BriefingGenerationResult(
-            briefings=generate_industry_briefings(risks),
-            metadata={"provider": self.provider_name, "status": "ok"},
+            briefings=generate_industry_briefings(risks, context=context, grounding_settings=self.grounding_settings),
+            metadata={
+                "provider": self.provider_name,
+                "status": "ok",
+                "grounding_summary": _grounding_summary(context, self.grounding_settings),
+            },
             raw_response={},
         )
 
@@ -188,9 +272,11 @@ def _build_generation_payload(
         "kg_explanation": kg_explanation,
         "evidence_status": evidence_status,
         "human_review": human_review,
+        "grounding_summary": _grounding_summary(context, GroundingPolicySettings.from_env()),
         "instructions": {
             "language": "zh",
             "must_include_uncertainty_when_degraded": True,
+            "must_include_uncertainty_when_grounding_flagged": True,
             "must_return_json": True,
         },
     }

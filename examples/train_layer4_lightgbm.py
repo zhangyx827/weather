@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 import numpy as np
 
 from mazu_saudi.data import read_netcdf_dataset
+from mazu_saudi.data.dust_storm_province_features import summarize_dust_storm_feature_coverage
 from mazu_saudi.data.flash_flood_audit import summarize_flash_flood_supervision_quality
 from mazu_saudi.data.flash_flood_audit import (
     count_flash_flood_boundary_grounded_positive_rows,
@@ -882,6 +883,19 @@ def main() -> int:
                 summary["training_target"]["source_label_audit"] = source_label_audit
             if source_supervision_quality is not None:
                 summary["training_target"]["source_supervision_quality"] = source_supervision_quality
+    if args.hazard_type == "dust_storm":
+        source_frame = None
+        if pd is not None and isinstance(dataset, pd.DataFrame):
+            source_frame = dataset
+        elif hasattr(dataset, "to_dataframe"):
+            try:
+                source_frame = dataset.to_dataframe().reset_index()
+            except Exception:
+                source_frame = None
+        if source_frame is not None:
+            summary["dust_feature_coverage"] = summarize_dust_storm_feature_coverage(source_frame)
+            if summary["dust_feature_coverage"].get("coverage_status") != "complete":
+                summary["model"]["data_quality_warning"] = "dust_feature_coverage_partial"
     if training_payload is not None and "split_group_audit" in training_payload:
         split_group_audit = dict(training_payload["split_group_audit"])
         summary["model"].update(split_group_audit)

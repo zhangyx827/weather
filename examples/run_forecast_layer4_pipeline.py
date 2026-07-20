@@ -60,6 +60,7 @@ def _metadata_snapshot(ds: Any) -> dict[str, Any]:
         "provider_status",
         "source_status",
         "degradation_metadata_json",
+        "source_metadata_json",
         "ensemble_member_count",
         "benchmark_comparison_json",
     )
@@ -76,6 +77,11 @@ def build_payload(
     gencast_metadata: dict[str, Any] | None,
     aifs_metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    summary = {
+        name: _summary_stats(risk_ds[name])
+        for name in ("ExtremeHeat_Risk_Prob", "DryHeatStress_Risk_Prob", "FlashFlood_Risk_Prob")
+        if name in risk_ds.data_vars
+    }
     return {
         "provider": provider_name,
         "issue_time": issue_time.isoformat(),
@@ -94,10 +100,7 @@ def build_payload(
             "forecast": sorted(forecast_ds.data_vars),
             "risk": sorted(risk_ds.data_vars),
         },
-        "summary": {
-            "ExtremeHeat_Risk_Prob": _summary_stats(risk_ds["ExtremeHeat_Risk_Prob"]),
-            "DryHeatStress_Risk_Prob": _summary_stats(risk_ds["DryHeatStress_Risk_Prob"]),
-        },
+        "summary": summary,
     }
 
 
@@ -112,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-aifs-benchmark", action="store_true", help="Attach AIFS benchmark metadata snapshot.")
     parser.add_argument("--extreme-heat-model-path", help="Override the Extreme Heat LightGBM model path.")
     parser.add_argument("--dry-heat-model-path", help="Override the Dry Heat Stress LightGBM model path.")
+    parser.add_argument("--flash-flood-model-path", help="Override the Flash Flood LightGBM model path.")
     args = parser.parse_args(argv)
 
     issue_time = _parse_issue_time(args.issue_time)
@@ -122,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     risk_model = LightGBMLayer4Model(
         extreme_heat_model_path=args.extreme_heat_model_path,
         dry_heat_model_path=args.dry_heat_model_path,
+        flash_flood_model_path=args.flash_flood_model_path,
     )
     risk_ds = risk_model.predict_fields(forecast_ds)
 
@@ -162,8 +167,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"forecast provider: {args.provider}")
     print(f"risk netcdf: {output_netcdf}")
     print(f"summary json: {output_json}")
-    print(f"ExtremeHeat mean prob: {payload['summary']['ExtremeHeat_Risk_Prob']['mean']:.3f}")
-    print(f"DryHeatStress mean prob: {payload['summary']['DryHeatStress_Risk_Prob']['mean']:.3f}")
+    for name in ("ExtremeHeat_Risk_Prob", "DryHeatStress_Risk_Prob", "FlashFlood_Risk_Prob"):
+        if name in payload["summary"]:
+            print(f"{name} mean prob: {payload['summary'][name]['mean']:.3f}")
     return 0
 
 

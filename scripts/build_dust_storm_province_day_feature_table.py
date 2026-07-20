@@ -13,7 +13,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from mazu_saudi.data.dust_storm_province_features import build_dust_storm_province_day_feature_table
+from mazu_saudi.data.dust_storm_province_features import (
+    build_dust_storm_province_day_feature_table,
+    summarize_dust_storm_feature_coverage,
+)
 from mazu_saudi.data.io import read_netcdf_dataset
 
 
@@ -112,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         "province_rows": int(table[args.province_column].astype(str).str.strip().ne("").sum()) if args.province_column in table.columns else 0,
         "region_rows": int(table["region_id"].astype(str).str.strip().ne("").sum()) if "region_id" in table.columns else 0,
         "feature_files": int(len(feature_paths)),
+        "dust_feature_coverage": summarize_dust_storm_feature_coverage(table),
         "output": str(args.output),
     }
     summary_path = args.output.with_suffix(".summary.json")

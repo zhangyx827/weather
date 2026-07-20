@@ -2,13 +2,16 @@
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
-from mazu_saudi.risk import MLBackedRiskModel, all_default_models, probability_to_level
+from mazu_saudi.risk import FlashFloodRiskModel, MLBackedRiskModel, all_default_models, probability_to_level
 from mazu_saudi.risk.ml import LightGBMAdapter
-from mazu_saudi.schemas import GridCell, MeteorologicalFeatures, RiskLevel
+from mazu_saudi.risk import model_paths
+from mazu_saudi.schemas import GridCell, IndicatorFieldSet, MeteorologicalFeatures, RiskLevel
 
 
 def sample_features():
@@ -70,8 +73,66 @@ class RiskModelTests(unittest.TestCase):
         self.assertEqual(len(risks), 3)
         for risk in risks:
             self.assertEqual(risk.model_family, "lightgbm")
-            self.assertIn(risk.inference_mode, {"degraded_rule_fallback", "rule"})
+            self.assertIn(risk.inference_mode, {"degraded_rule_fallback", "rule", "lightgbm"})
             self.assertIn("degradation_metadata", risk.evidence)
+
+    def test_flash_flood_runtime_model_path_falls_back_to_verified_chain_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            verified_model = repo_root / "data" / "processed" / "models" / "flash_flood_province_day_verified_chain_baseline_quick" / "flash_flood.txt"
+            verified_model.parent.mkdir(parents=True, exist_ok=True)
+            verified_model.write_text("stub", encoding="utf-8")
+            with mock.patch.object(model_paths, "REPO_ROOT", repo_root), mock.patch.object(
+                model_paths,
+                "DEFAULT_LAYER4_MODEL_DIR",
+                repo_root / "models" / "layer4",
+            ):
+                resolved = model_paths.resolve_layer4_model_path(
+                    "flash_flood",
+                    default_name="flash_flood.txt",
+                    allow_missing=True,
+                )
+        self.assertEqual(resolved, verified_model)
+
+    def test_lightgbm_hybrid_success_path_reports_lightgbm_inference_mode(self):
+        class FakeAdapter:
+            metadata = {"feature_names": ["daily_precip_total", "daily_convective_precip", "daily_large_scale_precip", "cape", "pwat", "ivt", "wind850_speed", "wind_shear_850_200", "flash_flood_risk"]}
+
+            def predict_proba(self, features):
+                return 0.8
+
+            def shap_explain(self, features):
+                return {"values": {"daily_precip_total": 0.4, "cape": 0.2}}
+
+        model = next(item for item in all_default_models() if item.hazard_type == "flash_flood")
+        model.adapter = FakeAdapter()
+        features = IndicatorFieldSet(
+            grid=GridCell(id="ff", lat=24.7, lon=46.7, region="Riyadh"),
+            valid_time=datetime(2026, 7, 19, tzinfo=timezone.utc),
+            values={
+                "daily_precip_total": 35.0,
+                "daily_convective_precip": 12.0,
+                "daily_large_scale_precip": 8.0,
+                "cape": 900.0,
+                "pwat": 32.0,
+                "ivt": 280.0,
+                "wind850_speed": 14.0,
+                "wind_shear_850_200": 20.0,
+                "flash_flood_risk": 2.5,
+                "ds10_max_1h": 18.0,
+                "ds10_max_6h": 42.0,
+                "slope_deg": 5.0,
+                "soil_moisture_frac": 0.2,
+                "impervious_frac": 0.15,
+            },
+        )
+
+        risk = model.predict(features)
+
+        self.assertEqual(risk.inference_mode, "lightgbm")
+        self.assertEqual(risk.model_family, "lightgbm")
+        self.assertEqual(risk.degradation_metadata, {})
+        self.assertEqual(risk.evidence["inference_mode"], "lightgbm")
 
     def test_lightgbm_adapter_train_save_load_roundtrip(self):
         adapter = LightGBMAdapter()

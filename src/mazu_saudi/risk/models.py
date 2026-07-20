@@ -28,11 +28,10 @@ from mazu_saudi.utils.math import clamp, is_missing
 from .layer4_features import feature_names_for_hazard, optional_feature_names_for_hazard
 from .levels import RiskThresholdConfig, probability_to_level
 from .ml import OptionalMLAdapter, create_ml_adapter
+from .model_paths import DEFAULT_LAYER4_MODEL_DIR, layer4_model_env_key, resolve_layer4_model_path
 
 
 RiskInput = IndicatorFieldSet | MeteorologicalFeatures
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_LAYER4_MODEL_DIR = REPO_ROOT / "models" / "layer4"
 FEATURE_LABELS = {
     "temp_c": "气温",
     "tmax_c": "最高气温",
@@ -295,6 +294,7 @@ class LightGBMHybridRiskModel(BaseRiskModel):
 
     model_family = "lightgbm"
     model_name = "lightgbm_hybrid_v1"
+    inference_mode = "lightgbm"
 
     def __init__(
         self,
@@ -306,14 +306,28 @@ class LightGBMHybridRiskModel(BaseRiskModel):
         super().__init__(**kwargs)
         self.hazard_type = hazard_type
         self.fallback_model = fallback_model
-        self.model_path = Path(model_path)
+        requested_model_path = Path(model_path)
+        default_requested_path = DEFAULT_LAYER4_MODEL_DIR / requested_model_path.name
+        explicit_override = requested_model_path if requested_model_path != default_requested_path else None
+        self.model_path = resolve_layer4_model_path(
+            hazard_type,
+            explicit=explicit_override,
+            env_key=layer4_model_env_key(hazard_type),
+            default_name=requested_model_path.name,
+            allow_missing=True,
+        )
         self.adapter: OptionalMLAdapter | None = None
-        self.metadata.update({"fallback_model": fallback_model.model_name, "model_path": str(self.model_path)})
+        self.metadata.update(
+            {
+                "fallback_model": fallback_model.model_name,
+                "model_path": str(self.model_path or requested_model_path),
+            }
+        )
 
     def _load_adapter(self) -> OptionalMLAdapter | None:
         if self.adapter is not None:
             return self.adapter
-        if not self.model_path.exists():
+        if self.model_path is None or not self.model_path.exists():
             return None
         try:
             adapter = create_ml_adapter("lightgbm")

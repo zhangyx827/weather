@@ -170,6 +170,8 @@ def _build_variant_table(
     top_k: int,
     region_boundary_path: Path,
     seed: int,
+    precomputed_region_day_table=None,
+    return_un_sampled_region_day: bool = False,
 ):
     return build_extreme_heat_supervised_training_dataset(
         feature_paths,
@@ -180,6 +182,8 @@ def _build_variant_table(
         top_k=top_k,
         region_boundary_path=region_boundary_path,
         seed=seed,
+        precomputed_region_day_table=precomputed_region_day_table,
+        return_un_sampled_region_day=return_un_sampled_region_day,
     )
 
 
@@ -269,7 +273,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     variants: list[dict[str, object]] = []
+    region_day_cache: dict[tuple[str, int], object] = {}
     for spec in variant_specs:
+        cache_key = (str(spec["point_variable"]), int(spec["top_k"]))
+        precomputed_table = None
+        if args.sample_unit == "region_day":
+            precomputed_table = region_day_cache.get(cache_key)
+            if precomputed_table is None:
+                precomputed_table = _build_variant_table(
+                    training_module=training_module,
+                    feature_paths=selected_feature_paths,
+                    labels=labels,
+                    point_variable=cache_key[0],
+                    negative_sample_size=None,
+                    sample_unit=args.sample_unit,
+                    top_k=cache_key[1],
+                    region_boundary_path=args.region_boundary_path,
+                    seed=args.seed,
+                    return_un_sampled_region_day=True,
+                )
+                region_day_cache[cache_key] = precomputed_table
         table = _build_variant_table(
             training_module=training_module,
             feature_paths=selected_feature_paths,
@@ -280,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             top_k=int(spec["top_k"]),
             region_boundary_path=args.region_boundary_path,
             seed=args.seed,
+            precomputed_region_day_table=precomputed_table,
         )
         training_summary, target_summary = _train_variant(
             training_module=training_module,

@@ -556,56 +556,67 @@ def _build_region_day_dataset(
     seed: int,
     top_k: int,
     region_boundary_path: Path,
+    precomputed_table: Any | None = None,
+    return_un_sampled: bool = False,
 ):
-    feature_list = [Path(path) for path in feature_paths]
-    if not feature_list:
-        raise FileNotFoundError("No daily indicator files were provided")
     if top_k <= 0:
         raise ValueError("top_k must be positive")
 
-    boundary_table = _load_boundary_table(region_boundary_path)
-    reference_frame = _dataset_frame(feature_list[0])
-    province_lookup = build_flash_flood_province_lookup(
-        reference_frame,
-        boundary_table,
-        province_column="province_name",
-        boundary_province_column="shapeName",
-        boundary_id_column="shapeID",
-        geometry_column="geometry",
-        geometry_format="geojson",
-    )
-    coordinate_lookup = province_lookup.loc[:, ["latitude", "longitude", "province_name"]].drop_duplicates(
-        subset=["latitude", "longitude"],
-        keep="last",
-    )
-    coordinate_lookup["province_name"] = coordinate_lookup["province_name"].map(_normalize_text)
-    coordinate_lookup["region_id"] = coordinate_lookup["province_name"].map(_canonical_region_id)
-    coordinate_lookup = coordinate_lookup.loc[
-        coordinate_lookup["region_id"].astype(str).str.strip().ne(""),
-        ["latitude", "longitude", "province_name", "region_id"],
-    ].reset_index(drop=True)
+    if precomputed_table is None:
+        feature_list = [Path(path) for path in feature_paths]
+        if not feature_list:
+            raise FileNotFoundError("No daily indicator files were provided")
 
-    aggregated_rows: list[dict[str, Any]] = []
-    for index, path in enumerate(feature_list):
-        frame = reference_frame if index == 0 else _dataset_frame(path)
-        enriched = frame.reset_index(drop=True).merge(
-            coordinate_lookup,
-            on=["latitude", "longitude"],
-            how="left",
-            validate="m:1",
+        boundary_table = _load_boundary_table(region_boundary_path)
+        reference_frame = _dataset_frame(feature_list[0])
+        province_lookup = build_flash_flood_province_lookup(
+            reference_frame,
+            boundary_table,
+            province_column="province_name",
+            boundary_province_column="shapeName",
+            boundary_id_column="shapeID",
+            geometry_column="geometry",
+            geometry_format="geojson",
         )
-        enriched = enriched[enriched["region_id"].astype(str).str.strip().ne("")].copy()
-        if enriched.empty:
-            continue
+        coordinate_lookup = province_lookup.loc[:, ["latitude", "longitude", "province_name"]].drop_duplicates(
+            subset=["latitude", "longitude"],
+            keep="last",
+        )
+        coordinate_lookup["province_name"] = coordinate_lookup["province_name"].map(_normalize_text)
+        coordinate_lookup["region_id"] = coordinate_lookup["province_name"].map(_canonical_region_id)
+        coordinate_lookup = coordinate_lookup.loc[
+            coordinate_lookup["region_id"].astype(str).str.strip().ne(""),
+            ["latitude", "longitude", "province_name", "region_id"],
+        ].reset_index(drop=True)
 
-        for _, group in enriched.groupby(["date", "region_id"], dropna=False, sort=True):
-            aggregated_rows.append(_aggregate_region_day_group(group, point_variable=point_variable, top_k=top_k))
+        aggregated_rows: list[dict[str, Any]] = []
+        for index, path in enumerate(feature_list):
+            frame = reference_frame if index == 0 else _dataset_frame(path)
+            enriched = frame.reset_index(drop=True).merge(
+                coordinate_lookup,
+                on=["latitude", "longitude"],
+                how="left",
+                validate="m:1",
+            )
+            enriched = enriched[enriched["region_id"].astype(str).str.strip().ne("")].copy()
+            if enriched.empty:
+                continue
 
-    if not aggregated_rows:
-        raise ValueError("No daily indicator grid cells could be mapped into a Saudi admin-1 region")
+            for _, group in enriched.groupby(["date", "region_id"], dropna=False, sort=True):
+                aggregated_rows.append(_aggregate_region_day_group(group, point_variable=point_variable, top_k=top_k))
 
-    aggregated = pd.DataFrame(aggregated_rows)
-    labeled = _assign_region_labels(aggregated, label_lookup=_positive_region_lookup(label_table))
+        if not aggregated_rows:
+            raise ValueError("No daily indicator grid cells could be mapped into a Saudi admin-1 region")
+        labeled = _assign_region_labels(
+            pd.DataFrame(aggregated_rows),
+            label_lookup=_positive_region_lookup(label_table),
+        )
+    else:
+        labeled = precomputed_table.copy()
+
+    if return_un_sampled:
+        return labeled.reset_index(drop=True)
+
     selected = _sample_negative_region_rows(labeled, negative_sample_size=negative_sample_size, seed=seed)
     prepared = prepare_feature_frame(selected, hazard_type="extreme_heat")
     selected = selected.loc[prepared.index].reset_index(drop=True)
@@ -626,6 +637,8 @@ def build_extreme_heat_supervised_training_dataset(
     sample_unit: str = "single_point_day",
     top_k: int = 3,
     region_boundary_path: Path | None = None,
+    precomputed_region_day_table: Any | None = None,
+    return_un_sampled_region_day: bool = False,
 ):
     """Build an extreme-heat supervision table from daily indicator files."""
 
@@ -649,4 +662,6 @@ def build_extreme_heat_supervised_training_dataset(
         seed=seed,
         top_k=top_k,
         region_boundary_path=region_boundary_path or DEFAULT_REGION_BOUNDARY_PATH,
+        precomputed_table=precomputed_region_day_table,
+        return_un_sampled=return_un_sampled_region_day,
     )

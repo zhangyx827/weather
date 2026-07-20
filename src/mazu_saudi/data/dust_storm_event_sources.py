@@ -17,7 +17,10 @@ def _normalize_text(value: Any) -> str:
         return ""
     if isinstance(value, float) and value != value:
         return ""
-    return str(value).strip()
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "null"}:
+        return ""
+    return text
 
 
 def _normalize_slug(value: Any) -> str:
@@ -49,13 +52,19 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def _is_embedded_header_row(record: dict[str, Any]) -> bool:
-    return (
-        _normalize_text(record.get("record_id")) == "record_id"
-        and _normalize_text(record.get("event_id")) == "event_id"
-        and _normalize_text(record.get("hazard_type")) == "hazard_type"
-        and _normalize_text(record.get("start_date")) == "start_date"
-        and _normalize_text(record.get("end_date")) == "end_date"
-    )
+    header_fields = {
+        "record_id",
+        "event_id",
+        "hazard_type",
+        "start_date",
+        "end_date",
+        "location_name",
+        "validation_status",
+    }
+    for field in header_fields:
+        if _normalize_text(record.get(field)) == field:
+            return True
+    return False
 
 
 @dataclass(frozen=True)

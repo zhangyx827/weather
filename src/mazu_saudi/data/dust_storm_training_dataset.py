@@ -25,11 +25,16 @@ def _normalize_text(value: Any) -> str:
         return ""
     if isinstance(value, float) and value != value:
         return ""
-    return str(value).strip().lower()
+    text = str(value).strip().lower()
+    if text in {"", "nan", "none", "null"}:
+        return ""
+    return text
 
 
 def _normalize_location_token(value: Any) -> str:
     token = _normalize_text(value)
+    if not token:
+        return ""
     token = token.strip("\"'`")
     token = token.replace("-", " ").replace("_", " ")
     token = " ".join(token.split())
@@ -49,6 +54,8 @@ def _normalize_hazard_type(series: Any):
 
 def _canonical_location(value: Any, config: DustStormLabelMappingConfig) -> str:
     token = _normalize_location_token(value)
+    if not token:
+        return ""
     mapped = config.location_aliases.get(token)
     if not mapped:
         region_ids = config.location_to_region_ids.get(token)
@@ -60,6 +67,7 @@ def _prepare_location_join_keys(table: Any, column: str, config: DustStormLabelM
     normalized = table.copy()
     normalized["date"] = _normalize_date(normalized["date"])
     normalized["_dust_location_join_key"] = normalized[column].map(lambda value: _canonical_location(value, config))
+    normalized = normalized[normalized["_dust_location_join_key"].map(_normalize_text).ne("")].copy()
     return normalized
 
 

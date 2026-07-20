@@ -19,14 +19,14 @@ Current hazards represented:
 - `tropical_cyclone`
 - `snowstorm`
 
-Hazard-specific raw files now exist for the externally cited non-flood rows as well:
+Hazard-specific raw files now exist for the non-flood rows as well:
 
-- `data/raw/dust_storm_verified/web_verified_dust_events_2015_2026-07-16.csv`
+- `data/raw/verified_dust_storm.csv`
 - `data/raw/extreme_heat_verified/web_verified_hajj_heat_events_2023_2024.csv`
 
 Important scope notes:
 
-- This file is an inventory layer, not a replacement for the hazard-specific ingestion paths under `data/raw/flash_flood_verified/` and `data/raw/dust_storm_verified/`.
+- This file is an inventory layer, not a replacement for the hazard-specific ingestion paths under `data/raw/flash_flood_verified/` and `data/raw/verified_dust_storm.csv`.
 - User-provided 2025 rows remain `validation_status=verified`.
 - Web-compiled rows preserve direct source URLs and conservative notes. They should be upgraded later when stronger primary or official citations are available.
 - Rows should stay in this inventory only when the cited source supports the event fact directly enough for `validation_status=verified`. Search phrases and forecast-only mentions are not enough on their own.

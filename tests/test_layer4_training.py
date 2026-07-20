@@ -1212,6 +1212,61 @@ def test_compare_extreme_heat_supervision_variants_script_exports_json(tmp_path:
     assert all(variant["name"].startswith("region_day_") for variant in comparison["variants"])
 
 
+def test_extreme_heat_region_day_reuses_precomputed_labeled_table():
+    from mazu_saudi.data import build_extreme_heat_supervised_training_dataset
+
+    precomputed = pd.DataFrame(
+        [
+            {
+                "date": "2024-06-01",
+                "region_id": "makkah",
+                "sample_unit": "region_day",
+                "label": 1.0,
+                "label_status": "positive",
+                "label_source_mode": "region_day_overlap",
+                "temp_c": 40.0,
+                "tmax_c": 46.0,
+                "tmin_c": 30.0,
+                "heat_index_c": 48.0,
+                "vpd_kpa": 3.0,
+                "wind_speed_mps": 4.0,
+                "relative_humidity_percent": 25.0,
+                "sst_celsius": 29.0,
+            },
+            {
+                "date": "2024-06-02",
+                "region_id": "makkah",
+                "sample_unit": "region_day",
+                "label": 0.0,
+                "label_status": "negative",
+                "label_source_mode": "no_event_day",
+                "temp_c": 32.0,
+                "tmax_c": 38.0,
+                "tmin_c": 24.0,
+                "heat_index_c": 34.0,
+                "vpd_kpa": 1.5,
+                "wind_speed_mps": 3.0,
+                "relative_humidity_percent": 45.0,
+                "sst_celsius": 28.0,
+            },
+        ]
+    )
+
+    result = build_extreme_heat_supervised_training_dataset(
+        [],
+        None,
+        sample_unit="region_day",
+        top_k=3,
+        negative_sample_size=1,
+        precomputed_region_day_table=precomputed,
+    )
+
+    assert len(result) == 2
+    assert result["training_join_key"].tolist() == ["2024-06-01|makkah", "2024-06-02|makkah"]
+    assert result["label"].tolist() == [1.0, 0.0]
+    assert result["hazard_type"].tolist() == ["extreme_heat", "extreme_heat"]
+
+
 def test_build_flash_flood_supervised_training_table_script_exports_csv(tmp_path: Path):
     module = _load_build_supervised_table_module()
     features = pd.DataFrame(
@@ -1926,6 +1981,117 @@ def test_dust_storm_training_payload_keeps_dust_feature_columns():
     assert payload["feature_names"] == ["dust_aod", "dust_column_mass", "dust_surface_mass"]
     assert payload["features"].shape == (2, 3)
     assert payload["labels"].tolist() == [1.0, 0.0]
+
+
+def test_summarize_dust_storm_feature_coverage_reports_partial_state():
+    from mazu_saudi.data.dust_storm_province_features import summarize_dust_storm_feature_coverage
+
+    frame = pd.DataFrame(
+        [
+            {"date": "2025-01-01", "dust_aod": 0.1, "dust_column_mass": 0.2, "dust_surface_mass": 0.3},
+            {"date": "2025-01-01", "dust_aod": np.nan, "dust_column_mass": np.nan, "dust_surface_mass": np.nan},
+            {"date": "2025-01-02", "dust_aod": 0.4, "dust_column_mass": 0.5, "dust_surface_mass": 0.6},
+        ]
+    )
+
+    summary = summarize_dust_storm_feature_coverage(frame)
+
+    assert summary["rows"] == 3
+    assert summary["finite_rows"] == 2
+    assert summary["finite_row_fraction"] == pytest.approx(2 / 3)
+    assert summary["coverage_status"] == "partial"
+    assert summary["rows_with_any_finite_dust_features"] == 2
+    assert summary["dates_with_any_finite_dust_features"] == 2
+    assert summary["dates_with_all_finite_dust_features"] == 2
+    assert summary["finite_rows_by_feature"] == {
+        "dust_aod": 2,
+        "dust_column_mass": 2,
+        "dust_surface_mass": 2,
+    }
+
+
+def test_indicator_parquet_training_smoke_dust_storm_surfaces_coverage_warning():
+    module = _load_training_module()
+
+    class FakeAdapter:
+        def train(self, payload, **kwargs):
+            return {
+                "backend": "lightgbm",
+                "objective": "binary",
+                "metric": "binary_logloss",
+                "validation_metric": 0.0,
+                "best_iteration": 1,
+                "split_strategy": "row_shuffle",
+            }
+
+        def save_model(self, path):
+            path.write_text("fake-model", encoding="utf-8")
+            metadata_path = path.with_suffix(path.suffix + ".metadata.json")
+            metadata_path.write_text("{}", encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        source = tmp_path / "dust_storm_supervised.parquet"
+        model_dir = tmp_path / "models"
+        frame = pd.DataFrame(
+            [
+                {
+                    "date": "2025-01-01",
+                    "hazard_type": "dust_storm",
+                    "province_name": "riyadh",
+                    "dust_aod": 0.45,
+                    "dust_column_mass": 0.12,
+                    "dust_surface_mass": 0.003,
+                    "label": 1.0,
+                    "label_status": "positive",
+                    "label_source_mode": "region_day_text",
+                    "matched_event_ids": "dust_20250101_riyadh",
+                    "label_provenance": "{}",
+                },
+                {
+                    "date": "2025-01-02",
+                    "hazard_type": "dust_storm",
+                    "province_name": "riyadh",
+                    "dust_aod": np.nan,
+                    "dust_column_mass": np.nan,
+                    "dust_surface_mass": np.nan,
+                    "label": 0.0,
+                    "label_status": "negative",
+                    "label_source_mode": "no_event_day",
+                    "matched_event_ids": "",
+                    "label_provenance": "{}",
+                },
+            ]
+        )
+        frame.to_parquet(source, index=False)
+
+        original_adapter = module.LightGBMAdapter
+        module.LightGBMAdapter = FakeAdapter
+        old_argv = sys.argv
+        sys.argv = [
+            "train_layer4_lightgbm.py",
+            "--source",
+            str(source),
+            "--source-format",
+            "indicator-parquet",
+            "--model-dir",
+            str(model_dir),
+            "--hazard-type",
+            "dust_storm",
+        ]
+        try:
+            assert module.main() == 0
+        finally:
+            sys.argv = old_argv
+            module.LightGBMAdapter = original_adapter
+
+        summary = json.loads((model_dir / "train_summary.json").read_text(encoding="utf-8"))
+        assert summary["hazard_type"] == "dust_storm"
+        assert summary["dust_feature_coverage"]["finite_rows"] == 1
+        assert summary["dust_feature_coverage"]["coverage_status"] == "partial"
+        assert summary["model"]["data_quality_warning"] == "dust_feature_coverage_partial"
+        assert (model_dir / "dust_storm.txt").exists()
+        assert (model_dir / "dust_storm.txt.metadata.json").exists()
 
 
 def test_demo_flash_flood_supervised_training_builds_balanced_dataset(tmp_path: Path):
